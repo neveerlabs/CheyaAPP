@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Tooling and OS files
+.vercel/
+.DS_Store
+.directory
+*.log
+coverage/
+__pycache__/
