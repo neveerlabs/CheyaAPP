@@ -99,10 +99,14 @@ of the context used; it does not expose private internal reasoning.
 Edited user messages and regenerated replies keep their earlier versions. Version navigation
 restores the associated conversation branch—including its reply and later messages—and branch
 snapshots are stored in Supabase after new replies, edits, and regenerations. Run the latest
-`supabase/schema.sql` in the shared project's SQL Editor to enable this for an existing project;
-version navigation cannot restore branches that were never previously saved.
+`supabase/schema.sql` in the shared project's SQL Editor to enable this for an existing project.
+If an older version has no snapshot, the app saves a fallback branch using the currently active
+conversation and that selected version.
 Like/dislike feedback is stored per reply version, and regeneration retrieves chat context and
-insights from before the revised message.
+insights from before the revised message. Reports are private per-version feedback stored alongside
+the response (not sent to an administrator); the report details are included as stronger guidance
+for regeneration and relevant future replies. Revising an earlier message keeps the remaining
+conversation visible on that branch, and switching versions restores the complete saved branch.
 
 ## Notes
 

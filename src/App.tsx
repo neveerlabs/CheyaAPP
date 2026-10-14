@@ -140,7 +140,6 @@ export function App() {
   const [reportDetails, setReportDetails] = useState("");
   const [reportError, setReportError] = useState("");
   const [isSavingReport, setIsSavingReport] = useState(false);
-  const [actionNotice, setActionNotice] = useState("");
   const [userEditTarget, setUserEditTarget] = useState<string | null>(null);
   const [userEditText, setUserEditText] = useState("");
   const [activeUserActions, setActiveUserActions] = useState<string | null>(null);
@@ -230,27 +229,28 @@ export function App() {
           chatMessage.id,
           nextVersion.version_number,
         );
-        if (branch.length > 0) {
-          const loadedVersions = await loadMessageVersions(
-            authClient,
-            branch.map((item) => item.id),
-          );
-          setMessages(
-            branch.map(({ id, role, content, version_number, thinking_summary }) => ({
-              id,
-              role,
-              text: content,
-              versionNumber: version_number,
-              thinkingSummary: thinking_summary,
-            })),
-          );
-          setMessageVersions((current) => ({ ...current, ...loadedVersions }));
-          setSelectedMessageVersions(
-            Object.fromEntries(branch.map((item) => [item.id, item.version_number])),
-          );
-          setSendError("");
-          return;
+        if (branch.length === 0) {
+          throw new Error("No saved conversation branch was returned for this message version.");
         }
+        const loadedVersions = await loadMessageVersions(
+          authClient,
+          branch.map((item) => item.id),
+        );
+        setMessages(
+          branch.map(({ id, role, content, version_number, thinking_summary }) => ({
+            id,
+            role,
+            text: content,
+            versionNumber: version_number,
+            thinkingSummary: thinking_summary,
+          })),
+        );
+        setMessageVersions((current) => ({ ...current, ...loadedVersions }));
+        setSelectedMessageVersions(
+          Object.fromEntries(branch.map((item) => [item.id, item.version_number])),
+        );
+        setSendError("");
+        return;
       } catch (error) {
         setSendError(
           error instanceof Error ? error.message : "Could not restore this conversation branch.",
@@ -729,7 +729,6 @@ export function App() {
     }
 
     setSendError("");
-    setActionNotice("");
     setIsSending(true);
     const showThinking = isThinkMode;
     setThinkingSteps(showThinking ? ["Membaca pesan dan konteks percakapan…"] : []);
@@ -801,9 +800,10 @@ export function App() {
       if (showThinking) setThinkingSteps(["Memuat riwayat dan preferensi percakapan…"]);
       const history = await loadRecentChatMessages(client, 20);
       let recentFeedback: Array<{
-        rating: AssistantRating;
+        rating: AssistantRating | "report";
         response: string;
         versionNumber: number;
+        details: string | null;
       }> = [];
       try {
         recentFeedback = await loadRecentAssistantFeedback(
@@ -1202,7 +1202,6 @@ export function App() {
         else delete updated[ratingKey];
         return updated;
       });
-      setActionNotice(nextRating ? "Thanks for the feedback." : "Feedback removed.");
     } catch (error) {
       setSendError(error instanceof Error ? error.message : "Could not save feedback.");
     }
@@ -1235,7 +1234,6 @@ export function App() {
       setReportTarget(null);
       setReportDetails("");
       setReportError("");
-      setActionNotice("Report saved. Thanks for letting us know.");
     } catch (error) {
       setReportError(error instanceof Error ? error.message : "Could not save this report.");
     } finally {
@@ -1286,7 +1284,6 @@ export function App() {
 
     setIsSending(true);
     setSendError("");
-    setActionNotice("");
     const showThinking = isThinkMode;
     setThinkingSteps(showThinking ? ["Mencari konteks untuk menyusun ulang jawaban…"] : []);
     try {
@@ -1366,8 +1363,10 @@ export function App() {
           history.filter((item) => item.role === "assistant").map((item) => item.id),
         ),
       ]);
-      const previousRating =
-        feedbackResult.status === "fulfilled" ? feedbackResult.value : null;
+      const previousFeedback =
+        feedbackResult.status === "fulfilled"
+          ? feedbackResult.value
+          : { rating: null, reports: [] };
       if (feedbackResult.status === "rejected") {
         regenerationWarnings.push(
           `Feedback for the previous answer could not be loaded: ${
@@ -1439,7 +1438,11 @@ export function App() {
           memories: relevantContext.memories,
           insights,
           feedback: recentFeedback,
-          replacedResponse: { content: previousAnswer, feedback: previousRating },
+          replacedResponse: {
+            content: previousAnswer,
+            feedback: previousFeedback.rating,
+            reports: previousFeedback.reports,
+          },
           executeTool: (name, input, apiKey) =>
             executeChatDataTool(client, apiKey, name, input, requestDeleteConfirmation),
         },
@@ -1456,7 +1459,11 @@ export function App() {
               relevantMessages: relevantContext.messages,
               memories: relevantContext.memories,
               insights,
-              replacedResponse: { content: previousAnswer, feedback: previousRating },
+              replacedResponse: {
+                content: previousAnswer,
+                feedback: previousFeedback.rating,
+                reports: previousFeedback.reports,
+              },
             },
             result.keyIndex,
           );
@@ -1521,15 +1528,18 @@ export function App() {
         ...current,
         [messageId]: updatedMessage.version_number,
       }));
-      setMessages((current) => [
-        ...current.slice(0, assistantIndex),
-        {
-          ...current[assistantIndex],
-          text: updatedMessage.content,
-          versionNumber: updatedMessage.version_number,
-          thinkingSummary: updatedMessage.thinking_summary,
-        },
-      ]);
+      setMessages((current) =>
+        current.map((item) =>
+          item.id === messageId
+            ? {
+                ...item,
+                text: updatedMessage.content,
+                versionNumber: updatedMessage.version_number,
+                thinkingSummary: updatedMessage.thinking_summary,
+              }
+            : item,
+        ),
+      );
       nextApiIndexRef.current = (result.keyIndex + 1) % keys.length;
       await Promise.all(
         result.attempts.map((attempt) =>
@@ -1542,11 +1552,9 @@ export function App() {
           }),
         ),
       );
-      setActionNotice(
-        regenerationWarnings.length > 0
-          ? `Reply regenerated. ${regenerationWarnings.join(" ")}`
-          : "Reply regenerated.",
-      );
+      if (regenerationWarnings.length > 0) {
+        setSendError(regenerationWarnings.join("\n"));
+      }
     } catch (error) {
       setSendError(error instanceof Error ? error.message : "Could not regenerate this reply.");
     } finally {
@@ -1571,7 +1579,6 @@ export function App() {
 
     setIsSending(true);
     setSendError("");
-    setActionNotice("");
     try {
       const [
         { createSupabaseClient, ensureSupabaseSession, loadDatabaseConfig },
@@ -1641,13 +1648,10 @@ export function App() {
       setActiveUserActions(null);
       const nextAssistant = messages[messageIndex + 1];
       if (nextAssistant?.role === "assistant") {
-        setActionNotice("Pesan diperbarui. Cheya sedang membuat balasan baru…");
         await regenerateAssistantMessage(nextAssistant.id, {
           text: updatedMessage.content,
           versionNumber: updatedMessage.version_number,
         });
-      } else {
-        setActionNotice("Pesan diperbarui. Tidak ditemukan balasan AI untuk dibuat ulang.");
       }
     } catch (error) {
       setSendError(error instanceof Error ? error.message : "Could not edit this message.");
@@ -2087,11 +2091,6 @@ export function App() {
                 {isThinkMode && thinkingSteps.map((step) => <p key={step}>{step}</p>)}
               </div>
             )}
-            {actionNotice && (
-              <p role="status" className="text-xs text-[#43834c]">
-                {actionNotice}
-              </p>
-            )}
             {!hasGeminiApiKey && !isLoadingHistory && (
               <div className="flex items-center justify-between gap-3 rounded-2xl border border-[#e6e8eb] bg-white px-3.5 py-3 text-sm text-[#686b72]">
                 <span>Add a Gemini API key to start chatting.</span>
@@ -2392,11 +2391,15 @@ export function App() {
             role="dialog"
             aria-modal="true"
             aria-labelledby="report-response-title"
-            className="w-full max-w-sm rounded-3xl bg-white p-5 shadow-xl"
+            className="w-full max-w-sm rounded-3xl border border-[#e2e4e8] bg-white p-5 shadow-xl"
           >
             <h2 id="report-response-title" className="text-base font-semibold text-[#22242a]">
               Report this response
             </h2>
+            <p className="mt-1 text-xs leading-5 text-[#747780]">
+              Your report is saved with this response to guide future replies in your chat. It is
+              not sent to an administrator or anyone else.
+            </p>
             <p className="mt-2 max-h-20 overflow-y-auto whitespace-pre-wrap rounded-xl bg-[#f5f6f8] p-3 text-xs leading-5 text-[#64666d]">
               {reportTarget.text.slice(0, 400)}
             </p>

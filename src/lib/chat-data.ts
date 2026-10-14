@@ -343,34 +343,59 @@ export async function loadMessageFeedback(
   client: AppSupabaseClient,
   messageId: string,
   versionNumber: number,
-): Promise<"like" | "dislike" | null> {
+): Promise<{ rating: "like" | "dislike" | null; reports: string[] }> {
   const { data, error } = await client
     .from("message_feedback")
-    .select("kind")
+    .select("kind, details")
     .eq("message_id", messageId)
     .eq("version_number", versionNumber)
-    .in("kind", ["like", "dislike"])
-    .maybeSingle();
+    .order("created_at", { ascending: true });
   if (error) throw new Error(`Could not load message feedback: ${error.message}`);
-  return data?.kind === "like" || data?.kind === "dislike" ? data.kind : null;
+  const rating = data.find((item) => item.kind === "like" || item.kind === "dislike")?.kind;
+  return {
+    rating: rating === "like" || rating === "dislike" ? rating : null,
+    reports: data.flatMap((item) =>
+      item.kind === "report" && item.details ? [item.details] : [],
+    ),
+  };
 }
 
 export async function loadRecentAssistantFeedback(
   client: AppSupabaseClient,
   messageIds: string[],
   limit = 8,
-): Promise<Array<{ rating: "like" | "dislike"; response: string; versionNumber: number }>> {
+): Promise<
+  Array<{
+    rating: "like" | "dislike" | "report";
+    response: string;
+    versionNumber: number;
+    details: string | null;
+  }>
+> {
   if (messageIds.length === 0) return [];
-  const { data: feedback, error: feedbackError } = await client
-    .from("message_feedback")
-    .select("message_id, version_number, kind, created_at")
-    .in("message_id", messageIds)
-    .in("kind", ["like", "dislike"])
-    .order("created_at", { ascending: false })
-    .limit(limit);
-  if (feedbackError) {
-    throw new Error(`Could not load recent response feedback: ${feedbackError.message}`);
+  const [ratingsResult, reportsResult] = await Promise.all([
+    client
+      .from("message_feedback")
+      .select("message_id, version_number, kind, details, created_at")
+      .in("message_id", messageIds)
+      .in("kind", ["like", "dislike"])
+      .order("created_at", { ascending: false })
+      .limit(limit),
+    client
+      .from("message_feedback")
+      .select("message_id, version_number, kind, details, created_at")
+      .in("message_id", messageIds)
+      .eq("kind", "report")
+      .order("created_at", { ascending: false })
+      .limit(limit),
+  ]);
+  if (ratingsResult.error) {
+    throw new Error(`Could not load recent response ratings: ${ratingsResult.error.message}`);
   }
+  if (reportsResult.error) {
+    throw new Error(`Could not load recent response reports: ${reportsResult.error.message}`);
+  }
+  const feedback = [...ratingsResult.data, ...reportsResult.data];
   if (feedback.length === 0) return [];
   const { data: versions, error: versionsError } = await client
     .from("chat_message_versions")
@@ -384,16 +409,14 @@ export async function loadRecentAssistantFeedback(
   );
   return feedback.flatMap((item) => {
     const content = contentById.get(`${item.message_id}:${item.version_number}`);
-    if (
-      (item.kind !== "like" && item.kind !== "dislike") ||
-      !content
-    ) {
+    if (!content || (item.kind !== "like" && item.kind !== "dislike" && item.kind !== "report")) {
       return [];
     }
     return [{
       rating: item.kind,
       response: content,
       versionNumber: item.version_number,
+      details: item.kind === "report" ? item.details : null,
     }];
   });
 }

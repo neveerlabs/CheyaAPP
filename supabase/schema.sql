@@ -337,12 +337,6 @@ begin
         and messages.is_active
       on conflict (user_id, anchor_message_id, anchor_version_number) do update
         set messages = excluded.messages;
-
-      update public.chat_messages
-      set is_active = false
-      where user_id = auth.uid()
-        and is_active
-        and (created_at, id) > (target.created_at, target.id);
     end if;
   end if;
 
@@ -381,7 +375,49 @@ begin
     and anchor_message_id = p_anchor_message_id
     and anchor_version_number = p_anchor_version_number;
   if not found then
-    return;
+    if not exists (
+      select 1
+      from public.chat_message_versions
+      where user_id = auth.uid()
+        and message_id = p_anchor_message_id
+        and version_number = p_anchor_version_number
+    ) then
+      raise exception 'The requested message version was not found.';
+    end if;
+
+    insert into public.chat_conversation_branches (
+      user_id,
+      anchor_message_id,
+      anchor_version_number,
+      messages
+    )
+    select
+      auth.uid(),
+      p_anchor_message_id,
+      p_anchor_version_number,
+      coalesce(
+        jsonb_agg(
+          jsonb_build_object(
+            'message_id', messages.id,
+            'version_number',
+              case
+                when messages.id = p_anchor_message_id then p_anchor_version_number
+                else messages.version_number
+              end
+          )
+          order by messages.created_at, messages.id
+        ),
+        '[]'::jsonb
+      )
+    from public.chat_messages as messages
+    where messages.user_id = auth.uid()
+      and (messages.is_active or messages.id = p_anchor_message_id);
+
+    select * into branch_snapshot
+    from public.chat_conversation_branches
+    where user_id = auth.uid()
+      and anchor_message_id = p_anchor_message_id
+      and anchor_version_number = p_anchor_version_number;
   end if;
 
   perform set_config('cheyaverse.restore_chat_branch', 'on', true);
