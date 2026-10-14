@@ -1,6 +1,8 @@
 import {
   ArrowLeft,
+  Brain,
   Check,
+  ChevronRight,
   CircleAlert,
   CircleHelp,
   Copy,
@@ -11,13 +13,16 @@ import {
   KeyRound,
   LoaderCircle,
   Plus,
+  SlidersHorizontal,
   Trash2,
+  UserRound,
 } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import schemaSql from "../supabase/schema.sql?raw";
 import { generateGeminiReply, GeminiFailoverError } from "./lib/gemini";
 import {
   createSupabaseClient,
+  DEFAULT_PERSONALIZATION,
   ensureSupabaseSession,
   GEMINI_MODELS,
   loadDatabaseConfig,
@@ -28,9 +33,12 @@ import {
   type DatabaseConfig,
   type GeminiApiKey,
   type GeminiModel,
+  type PersonalizationSettings,
 } from "./lib/supabase";
 
 interface SettingsPageProps {
+  pathname: string;
+  onNavigate: (path: string) => void;
   onBack: () => void;
 }
 
@@ -94,7 +102,43 @@ function highlightSql(source: string) {
   });
 }
 
-export function SettingsPage({ onBack }: SettingsPageProps) {
+type SettingsSection = "home" | "personal" | "configure" | "memory";
+
+const settingsSections: Array<{
+  id: Exclude<SettingsSection, "home">;
+  label: string;
+  description: string;
+  icon: typeof UserRound;
+}> = [
+  {
+    id: "personal",
+    label: "Personal",
+    description: "Your name, instructions, and conversation style",
+    icon: UserRound,
+  },
+  {
+    id: "configure",
+    label: "Configure",
+    description: "Supabase database and Gemini API keys",
+    icon: SlidersHorizontal,
+  },
+  {
+    id: "memory",
+    label: "Memory",
+    description: "Memory settings will be available here later",
+    icon: Brain,
+  },
+];
+
+function sectionFromPath(pathname: string): SettingsSection {
+  const section = pathname.split("/")[2];
+  return section === "personal" || section === "configure" || section === "memory"
+    ? section
+    : "home";
+}
+
+export function SettingsPage({ pathname, onNavigate, onBack }: SettingsPageProps) {
+  const [activeSection, setActiveSection] = useState(() => sectionFromPath(pathname));
   const [databaseUrl, setDatabaseUrl] = useState("");
   const [publishableKey, setPublishableKey] = useState("");
   const [config, setConfig] = useState<DatabaseConfig | null>(null);
@@ -102,11 +146,16 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
   const [isDatabaseReady, setIsDatabaseReady] = useState(false);
   const [databaseSessionError, setDatabaseSessionError] = useState("");
   const [apiKeys, setApiKeys] = useState<GeminiApiKey[]>([]);
+  const [personalization, setPersonalization] =
+    useState<PersonalizationSettings>(DEFAULT_PERSONALIZATION);
+  const [personalizationError, setPersonalizationError] = useState("");
   const [selectedModel, setSelectedModel] = useState<GeminiModel>(GEMINI_MODELS[0]);
   const [newApiKey, setNewApiKey] = useState("");
   const [isHelpOpen, setIsHelpOpen] = useState(false);
   const [isSavingDatabase, setIsSavingDatabase] = useState(false);
+  const [isSavingPersonalization, setIsSavingPersonalization] = useState(false);
   const [isLoadingKeys, setIsLoadingKeys] = useState(false);
+  const [isLoadingPersonalization, setIsLoadingPersonalization] = useState(false);
   const [isAddingKey, setIsAddingKey] = useState(false);
   const [busyKeyId, setBusyKeyId] = useState<string | null>(null);
   const [showPublishableKey, setShowPublishableKey] = useState(false);
@@ -115,6 +164,27 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
   const [errorMessage, setErrorMessage] = useState("");
   const [notice, setNotice] = useState("");
   const settingsContentRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setActiveSection(sectionFromPath(pathname));
+    setErrorMessage("");
+    setNotice("");
+    if (settingsContentRef.current) settingsContentRef.current.scrollTop = 0;
+  }, [pathname]);
+
+  function openSection(section: Exclude<SettingsSection, "home">) {
+    onNavigate(`/settings/${section}`);
+    setActiveSection(section);
+    clearMessages();
+  }
+
+  function goBack() {
+    if (activeSection !== "home") {
+      window.history.back();
+      return;
+    }
+    onBack();
+  }
 
   useEffect(() => {
     try {
@@ -207,9 +277,6 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
           { onConflict: "user_id" },
         );
         if (saveError) throw saveError;
-        if (isMounted) {
-          setNotice("Supabase connection and Gemini settings are saved to your database.");
-        }
       } catch (error) {
         if (isMounted) {
           setErrorMessage(`Database settings could not be saved: ${getErrorMessage(error)}`);
@@ -221,6 +288,51 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
       isMounted = false;
     };
   }, [client, config, isDatabaseReady]);
+
+  useEffect(() => {
+    if (!client || !isDatabaseReady) return;
+
+    let isMounted = true;
+    setPersonalizationError("");
+    setIsLoadingPersonalization(true);
+    void (async () => {
+      try {
+        const { data: userData, error: userError } = await client.auth.getUser();
+        if (userError) throw userError;
+        if (!userData.user) throw new Error("The private Supabase session has no user ID.");
+
+        const { data, error } = await client
+          .from("user_settings")
+          .select("display_name, custom_prompt, chat_style")
+          .eq("user_id", userData.user.id)
+          .maybeSingle();
+        if (error) {
+          throw new Error(
+            `Could not load Personal settings. Run the latest supabase/schema.sql in your project. ${error.message}`,
+          );
+        }
+        if (isMounted && data) {
+          setPersonalization({
+            display_name: data.display_name,
+            custom_prompt: data.custom_prompt,
+            chat_style: data.chat_style,
+          });
+        }
+      } catch (error) {
+        if (isMounted) {
+          const detail = getErrorMessage(error);
+          setPersonalizationError(detail);
+          setErrorMessage(detail);
+        }
+      } finally {
+        if (isMounted) setIsLoadingPersonalization(false);
+      }
+    })();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [client, isDatabaseReady]);
 
   useEffect(() => {
     if (!isHelpOpen) return;
@@ -294,6 +406,46 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
       setErrorMessage(getErrorMessage(error));
     } finally {
       setIsSavingDatabase(false);
+    }
+  }
+
+  async function savePersonalization(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    clearMessages();
+    setPersonalizationError("");
+    if (!client || !isDatabaseReady || !config) {
+      setErrorMessage("Connect your Supabase database in Configure before saving Personal settings.");
+      return;
+    }
+
+    setIsSavingPersonalization(true);
+    try {
+      const { data, error: userError } = await client.auth.getUser();
+      if (userError) throw userError;
+      if (!data.user) throw new Error("The private Supabase session has no user ID.");
+
+      const { error } = await client.from("user_settings").upsert(
+        {
+          user_id: data.user.id,
+          supabase_url: config.url,
+          publishable_key: config.publishableKey,
+          ...personalization,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "user_id" },
+      );
+      if (error) {
+        throw new Error(
+          `Could not save Personal settings. Run the latest supabase/schema.sql in your project. ${error.message}`,
+        );
+      }
+      setNotice("Personal settings saved to your Supabase database.");
+    } catch (error) {
+      const detail = getErrorMessage(error);
+      setPersonalizationError(detail);
+      setErrorMessage(detail);
+    } finally {
+      setIsSavingPersonalization(false);
     }
   }
 
@@ -446,23 +598,25 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
     <main className="fixed inset-0 flex justify-center bg-white">
       <section
         aria-label="Settings"
-        className="flex h-full w-full max-w-[680px] flex-col overflow-hidden bg-transparent sm:my-5 sm:h-[calc(100%-40px)] sm:rounded-[30px]"
+        className="relative h-full w-full max-w-[680px] overflow-hidden bg-white sm:my-5 sm:h-[calc(100%-40px)] sm:rounded-[30px]"
       >
-        <header className="relative z-10 mb-3 flex h-[68px] shrink-0 items-center gap-2 border-0 bg-transparent px-1 shadow-none sm:px-4">
+        <header className="absolute inset-x-0 top-0 z-20 flex h-[68px] items-center gap-2 border-0 bg-transparent px-1 shadow-none sm:px-4">
           <button
             type="button"
-            aria-label="Back to chat"
-            onClick={onBack}
-            className="flex size-11 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] text-[#34363b] transition hover:bg-[#f7f8fa]"
+            aria-label={activeSection === "home" ? "Back to chat" : "Back to settings"}
+            onClick={goBack}
+            className="flex size-11 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] transition hover:bg-[#f7f8fa]"
           >
             <ArrowLeft aria-hidden="true" className="size-[21px]" />
           </button>
-          <h1 className="flex h-11 min-w-0 flex-1 items-center rounded-full border border-[#e5e6e9] px-4 text-lg font-semibold text-[#17181b]">
-            Settings
+          <h1 className="flex h-11 min-w-0 flex-1 items-center rounded-full border border-[#e5e6e9] bg-white px-4 text-lg font-semibold text-[#17181b]">
+            {activeSection === "home"
+              ? "Settings"
+              : settingsSections.find((section) => section.id === activeSection)?.label}
           </h1>
           <nav
             aria-label="Settings actions"
-            className="flex h-11 shrink-0 items-center gap-0.5 rounded-full border border-[#e5e6e9] bg-transparent p-0.5"
+            className="flex h-11 shrink-0 items-center gap-0.5 rounded-full border border-[#e5e6e9] bg-white p-0.5"
           >
             <button
               type="button"
@@ -472,22 +626,156 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
             >
               <Bug aria-hidden="true" className="size-[21px]" strokeWidth={1.8} />
             </button>
-            <button
-              type="button"
-              aria-label="Setup help"
-              title="Setup help"
-              onClick={() => setIsHelpOpen(true)}
-              className="flex size-9 items-center justify-center rounded-full text-[#34363b] transition hover:bg-[#f7f8fa]"
-            >
-              <CircleHelp aria-hidden="true" className="size-[21px]" />
-            </button>
+            {activeSection === "configure" && (
+              <button
+                type="button"
+                aria-label="Setup help"
+                title="Setup help"
+                onClick={() => setIsHelpOpen(true)}
+                className="flex size-9 items-center justify-center rounded-full text-[#34363b] transition hover:bg-[#f7f8fa]"
+              >
+                <CircleHelp aria-hidden="true" className="size-[21px]" />
+              </button>
+            )}
           </nav>
         </header>
 
         <div
           ref={settingsContentRef}
-          className="min-h-0 flex-1 space-y-5 overflow-y-auto overscroll-contain bg-white px-4 py-5 sm:rounded-b-[24px] sm:px-6 sm:py-6"
+          className="absolute inset-0 overflow-y-auto overscroll-contain bg-transparent px-4 pb-6 pt-[88px] sm:px-6 sm:pb-8"
         >
+          {activeSection === "home" && (
+            <nav aria-label="Settings pages" className="space-y-3">
+              {settingsSections.map(({ id, label, description, icon: Icon }) => (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => openSection(id)}
+                  className="flex w-full items-center gap-3 rounded-[22px] border border-[#e6e8eb] bg-white p-4 text-left transition hover:bg-[#f8f9fb] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#9380dc] sm:p-5"
+                >
+                  <span className="flex size-11 shrink-0 items-center justify-center rounded-2xl bg-[#f3efff] text-[#7754ce]">
+                    <Icon aria-hidden="true" className="size-5" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block font-semibold text-[#202126]">{label}</span>
+                    <span className="mt-1 block text-sm leading-5 text-[#777a81]">
+                      {description}
+                    </span>
+                  </span>
+                  <ChevronRight aria-hidden="true" className="size-5 shrink-0 text-[#96989d]" />
+                </button>
+              ))}
+            </nav>
+          )}
+
+          {activeSection === "personal" && (
+            <section
+              aria-labelledby="personal-settings-title"
+              className="rounded-[24px] border border-[#e6e8eb] p-4 sm:p-5"
+            >
+              <div className="mb-4">
+                <h2 id="personal-settings-title" className="font-semibold text-[#202126]">
+                  Personal
+                </h2>
+                <p className="mt-1 text-sm leading-5 text-[#777a81]">
+                  Set how CheyaVerse addresses you and responds in chat.
+                </p>
+              </div>
+              {(personalizationError || errorMessage) && (
+                <div
+                  role="alert"
+                  className="mb-4 flex items-start gap-2 rounded-2xl border border-red-100 bg-red-50 px-3.5 py-3 text-sm text-red-800"
+                >
+                  <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+                  <p className="whitespace-pre-line">{personalizationError || errorMessage}</p>
+                </div>
+              )}
+              {notice && (
+                <div
+                  role="status"
+                  className="mb-4 flex items-start gap-2 rounded-2xl border border-emerald-100 bg-emerald-50 px-3.5 py-3 text-sm text-emerald-800"
+                >
+                  <Check aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+                  <p>{notice}</p>
+                </div>
+              )}
+              {isLoadingPersonalization ? (
+                <p className="flex items-center gap-2 py-4 text-sm text-[#777a81]">
+                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                  Loading personal settings…
+                </p>
+              ) : (
+                <form className="space-y-4" onSubmit={savePersonalization}>
+                  <label className="block text-xs font-medium text-[#656870]">
+                    Name
+                    <input
+                      value={personalization.display_name}
+                      onChange={(event) =>
+                        setPersonalization((current) => ({
+                          ...current,
+                          display_name: event.target.value,
+                        }))
+                      }
+                      maxLength={80}
+                      placeholder="What should CheyaVerse call you?"
+                      className="mt-1.5 h-11 w-full rounded-xl border border-[#e1e3e7] bg-white px-3 text-sm text-[#26272c] outline-none focus:border-[#9380dc]"
+                    />
+                  </label>
+                  <label className="block text-xs font-medium text-[#656870]">
+                    Custom prompt
+                    <textarea
+                      value={personalization.custom_prompt}
+                      onChange={(event) =>
+                        setPersonalization((current) => ({
+                          ...current,
+                          custom_prompt: event.target.value,
+                        }))
+                      }
+                      maxLength={4000}
+                      rows={5}
+                      placeholder="Tell CheyaVerse what to keep in mind when responding."
+                      className="mt-1.5 w-full resize-y rounded-xl border border-[#e1e3e7] bg-white px-3 py-2.5 text-sm leading-5 text-[#26272c] outline-none focus:border-[#9380dc]"
+                    />
+                  </label>
+                  <label className="block text-xs font-medium text-[#656870]">
+                    Conversation style
+                    <input
+                      value={personalization.chat_style}
+                      onChange={(event) =>
+                        setPersonalization((current) => ({
+                          ...current,
+                          chat_style: event.target.value,
+                        }))
+                      }
+                      maxLength={120}
+                      placeholder="For example: friendly, concise, and casual"
+                      className="mt-1.5 h-11 w-full rounded-xl border border-[#e1e3e7] bg-white px-3 text-sm text-[#26272c] outline-none focus:border-[#9380dc]"
+                    />
+                  </label>
+                  {!isDatabaseReady && (
+                    <p className="text-xs leading-5 text-[#858890]">
+                      Connect Supabase in Configure to load and save these settings.
+                    </p>
+                  )}
+                  <button
+                    type="submit"
+                    disabled={
+                      !isDatabaseReady || isLoadingPersonalization || !!personalizationError || isSavingPersonalization
+                    }
+                    className="flex h-10 w-full items-center justify-center gap-2 rounded-xl bg-[#26272c] px-4 text-sm font-medium text-white transition hover:bg-[#3a3b41] disabled:opacity-60"
+                  >
+                    {isSavingPersonalization && (
+                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                    )}
+                    Save personal settings
+                  </button>
+                </form>
+              )}
+            </section>
+          )}
+
+          {activeSection === "configure" && (
+            <>
           {errorMessage && (
             <div
               role="alert"
@@ -754,6 +1042,8 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
               key in a browser app.
             </p>
           </section>
+            </>
+          )}
         </div>
       </section>
 
@@ -848,7 +1138,8 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
                 </div>
                 <p className="mt-2 text-xs leading-5 text-[#858890]">
                   If you already ran an older version of this script, run this updated script again
-                  so new Gemini API rows get the current session&apos;s user ID automatically.
+                  to add the Personal settings columns and keep Gemini API rows assigned to the
+                  current session.
                 </p>
               </li>
               <li>

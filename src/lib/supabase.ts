@@ -14,6 +14,18 @@ export interface DatabaseConfig {
   publishableKey: string;
 }
 
+export interface PersonalizationSettings {
+  display_name: string;
+  custom_prompt: string;
+  chat_style: string;
+}
+
+export const DEFAULT_PERSONALIZATION: PersonalizationSettings = {
+  display_name: "",
+  custom_prompt: "",
+  chat_style: "",
+};
+
 export type GeminiApiKey = {
   id: string;
   model: GeminiModel;
@@ -55,17 +67,26 @@ type Database = {
           user_id: string;
           supabase_url: string;
           publishable_key: string;
+          display_name: string;
+          custom_prompt: string;
+          chat_style: string;
           updated_at: string;
         };
         Insert: {
           user_id?: string;
           supabase_url: string;
           publishable_key: string;
+          display_name?: string;
+          custom_prompt?: string;
+          chat_style?: string;
           updated_at?: string;
         };
         Update: Partial<{
           supabase_url: string;
           publishable_key: string;
+          display_name: string;
+          custom_prompt: string;
+          chat_style: string;
           updated_at: string;
         }>;
         Relationships: never[];

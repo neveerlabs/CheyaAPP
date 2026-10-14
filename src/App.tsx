@@ -160,22 +160,35 @@ export function App() {
   }, [attachmentView]);
 
   useEffect(() => {
-    if (window.location.pathname === "/settings") {
+    if (window.location.pathname.startsWith("/settings/")) {
+      const sectionPath = window.location.pathname;
+      window.history.replaceState({ appRoute: "settings" }, "", "/settings");
+      window.history.pushState({ appRoute: "settings-subpage" }, "", sectionPath);
+    } else if (window.location.pathname === "/settings") {
       window.history.pushState({ appRoute: "settings-direct-back-guard" }, "", "/settings");
     }
 
     const handlePopState = () => {
-      if (wasSettingsRef.current) {
-        if (window.location.pathname === "/settings") {
+      const nextPath = window.location.pathname;
+      if (nextPath.startsWith("/settings")) {
+        if (
+          nextPath === "/settings" &&
+          wasSettingsRef.current &&
+          !window.history.state?.appRoute
+        ) {
           window.location.replace("/");
-        } else {
-          window.location.reload();
+          return;
         }
+        wasSettingsRef.current = true;
+        setPathname(nextPath);
         return;
       }
 
-      const nextPath = window.location.pathname;
-      wasSettingsRef.current = nextPath === "/settings";
+      if (wasSettingsRef.current) {
+        window.location.replace("/");
+        return;
+      }
+
       setPathname(nextPath);
     };
     window.addEventListener("popstate", handlePopState);
@@ -183,14 +196,17 @@ export function App() {
   }, []);
 
   function navigate(path: string) {
-    if (path === "/settings") {
-      window.history.pushState({ appRoute: "settings" }, "", path);
+    if (path.startsWith("/settings")) {
+      window.history.pushState(
+        { appRoute: path === "/settings" ? "settings" : "settings-subpage" },
+        "",
+        path,
+      );
       wasSettingsRef.current = true;
+      setPathname(path);
     } else {
       window.location.replace(path);
-      return;
     }
-    setPathname(path);
   }
 
   function addPickedFiles(fileList: FileList | null) {
@@ -348,6 +364,7 @@ export function App() {
     try {
       const {
         createSupabaseClient,
+        DEFAULT_PERSONALIZATION,
         ensureSupabaseSession,
         loadDatabaseConfig,
         saveApiStatus,
@@ -370,7 +387,30 @@ export function App() {
         throw new Error("Add at least one Gemini API key in Settings before sending a message.");
       }
 
-      const result = await generateGeminiReply(keys, prompt, nextApiIndexRef.current);
+      const {
+        data: { user },
+        error: userError,
+      } = await client.auth.getUser();
+      if (userError) throw userError;
+      if (!user) throw new Error("The private Supabase session has no user ID.");
+
+      const { data: profile, error: profileError } = await client
+        .from("user_settings")
+        .select("display_name, custom_prompt, chat_style")
+        .eq("user_id", user.id)
+        .maybeSingle();
+      if (profileError) {
+        throw new Error(
+          `Could not load Personal settings. Run the latest supabase/schema.sql in your project. ${profileError.message}`,
+        );
+      }
+
+      const result = await generateGeminiReply(
+        keys,
+        prompt,
+        nextApiIndexRef.current,
+        profile ?? DEFAULT_PERSONALIZATION,
+      );
       nextApiIndexRef.current = (result.keyIndex + 1) % keys.length;
       const statusErrors: string[] = [];
       for (const attempt of result.attempts) {
@@ -417,7 +457,7 @@ export function App() {
     }
   }
 
-  if (pathname === "/settings") {
+  if (pathname.startsWith("/settings")) {
     return (
       <Suspense
         fallback={
@@ -426,7 +466,11 @@ export function App() {
           </main>
         }
       >
-        <SettingsPage onBack={() => navigate("/")} />
+        <SettingsPage
+          pathname={pathname}
+          onNavigate={navigate}
+          onBack={() => navigate("/")}
+        />
       </Suspense>
     );
   }
@@ -541,9 +585,9 @@ export function App() {
     >
       <section
         aria-label="CheyaVerse chat"
-        className="flex h-full w-full flex-col overflow-hidden border-[#e7e8eb] bg-white sm:max-w-[580px] sm:rounded-[34px] sm:border"
+        className="relative h-full w-full overflow-hidden border-[#e7e8eb] bg-white sm:max-w-[580px] sm:rounded-[34px] sm:border"
       >
-        <header className="flex h-[64px] shrink-0 items-center justify-between gap-2 px-2 py-1 sm:gap-3 sm:px-5">
+        <header className="absolute inset-x-0 top-0 z-20 flex h-[64px] items-center justify-between gap-2 px-2 py-1 sm:gap-3 sm:px-5">
           <div className="flex h-12 min-w-0 flex-1 items-center gap-2 rounded-full border border-[#e8e9ec] bg-white py-1 pl-1 pr-2 sm:gap-2.5 sm:pr-2">
             <img
               src={avatarUrl}
@@ -599,8 +643,9 @@ export function App() {
         <div
           aria-label="Conversation"
           aria-live="polite"
-          className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain px-4 py-4 sm:px-6"
+          className="absolute inset-0 overflow-y-auto overscroll-contain px-4 pb-28 pt-20 sm:px-6"
         >
+          <div className="space-y-4">
           {messages.map((chatMessage) => (
             <div
               key={chatMessage.id}
@@ -630,9 +675,10 @@ export function App() {
               {sendError}
             </p>
           )}
+          </div>
         </div>
 
-        <footer className="shrink-0 bg-white px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-1.5 sm:px-5 sm:pb-5">
+        <footer className="absolute inset-x-0 bottom-0 z-20 bg-white px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-1.5 sm:px-5 sm:pb-5">
           {attachedMedia.length > 0 && (
             <div
               aria-label="Files ready to upload"

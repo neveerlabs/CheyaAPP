@@ -2,8 +2,16 @@ create table if not exists public.user_settings (
   user_id uuid primary key references auth.users (id) on delete cascade,
   supabase_url text not null,
   publishable_key text not null,
+  display_name text not null default '',
+  custom_prompt text not null default '',
+  chat_style text not null default '',
   updated_at timestamptz not null default now()
 );
+
+alter table public.user_settings
+  add column if not exists display_name text not null default '',
+  add column if not exists custom_prompt text not null default '',
+  add column if not exists chat_style text not null default '';
 
 alter table public.user_settings enable row level security;
 

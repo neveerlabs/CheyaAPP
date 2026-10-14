@@ -1,4 +1,4 @@
-import type { GeminiApiKey } from "./supabase";
+import type { GeminiApiKey, PersonalizationSettings } from "./supabase";
 
 interface GeminiResponse {
   candidates?: Array<{
@@ -24,6 +24,12 @@ export interface GeminiReply {
   attempts: GeminiAttempt[];
 }
 
+const emptyPersonalization: PersonalizationSettings = {
+  display_name: "",
+  custom_prompt: "",
+  chat_style: "",
+};
+
 export class GeminiFailoverError extends Error {
   constructor(
     message: string,
@@ -42,6 +48,7 @@ export async function generateGeminiReply(
   keys: GeminiApiKey[],
   prompt: string,
   startingIndex: number,
+  personalization: PersonalizationSettings = emptyPersonalization,
 ): Promise<GeminiReply> {
   if (keys.length === 0) {
     throw new Error("Add at least one Gemini API key in Settings before sending a message.");
@@ -49,6 +56,20 @@ export async function generateGeminiReply(
 
   const attempts: GeminiAttempt[] = [];
   const firstIndex = ((startingIndex % keys.length) + keys.length) % keys.length;
+  const instructions = [
+    personalization.display_name.trim()
+      ? `The user's preferred name is ${personalization.display_name.trim()}. Use it naturally when appropriate.`
+      : "",
+    personalization.chat_style.trim()
+      ? `Conversation style: ${personalization.chat_style.trim()}.`
+      : "",
+    personalization.custom_prompt.trim()
+      ? `Additional user instructions: ${personalization.custom_prompt.trim()}`
+      : "",
+  ].filter(Boolean);
+  const requestPrompt = instructions.length
+    ? `${instructions.join("\n")}\n\nUser message:\n${prompt}`
+    : prompt;
 
   for (let offset = 0; offset < keys.length; offset += 1) {
     const keyIndex = (firstIndex + offset) % keys.length;
@@ -64,7 +85,7 @@ export async function generateGeminiReply(
             "x-goog-api-key": key.api_key,
           },
           body: JSON.stringify({
-            contents: [{ role: "user", parts: [{ text: prompt }] }],
+            contents: [{ role: "user", parts: [{ text: requestPrompt }] }],
           }),
         },
       );

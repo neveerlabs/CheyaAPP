@@ -34,7 +34,10 @@ email/password account is needed. Before connecting:
 2. In Settings, enter the Supabase Project URL and publishable (or legacy anon) key.
 3. The app creates a Supabase session automatically. Row Level Security limits settings and Gemini
    API keys to that browser session.
-4. Add one or more Gemini API keys and select `gemini-3.1-flash-lite` or `gemini-3.5-flash-lite`.
+4. In **Personal**, set a name, custom prompt, and conversation style. In **Configure**, add one
+   or more Gemini API keys using `gemini-3.1-flash-lite` or `gemini-3.5-flash-lite`.
+5. If the project already has the previous schema, run the updated `supabase/schema.sql` again to
+   add the Personal settings columns.
 
 The Supabase URL and publishable key are retained in the browser as bootstrap settings and copied
 to that session's database. Gemini API keys are stored in the session's Supabase rows and sent from
