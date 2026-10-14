@@ -102,10 +102,15 @@ database infrastructure are managed by the operator.
 Text chat messages, per-message conversation insights, semantic embeddings, and job status are
 stored in the connected Supabase project and protected by row-level security. A server-side Vercel
 Workflow processes each queued chat job, so refreshing the browser does not cancel generation.
-Supabase Realtime keeps chat and settings data in sync across tabs and signed-in devices. Gemini
-analyzes each user message for tentative, non-clinical conversation insights and uses relevant past
-messages, saved memories, recent insights, and Personal settings as context. Its database tools are
-limited to the current user's chat, memories, and insights.
+Supabase Realtime keeps chat and settings data in sync across tabs and signed-in devices. Cheya's
+primary role is a personal friend and listening companion; database and web tools are secondary and
+used when useful or requested. Gemini analyzes every incoming message in recent context for tentative,
+non-clinical conversation insight, but routine messages do not create a saved insight. Cheya may
+silently listen when the user asks for quiet or clearly closes the conversation. It uses relevant
+past messages, saved memories, recent insights, and Personal settings as context. Its database tools
+are limited to the current user's chat, memories, and insights. Exact duplicate saved memories can be
+cleaned up on an explicit request with confirmation; repeated chat messages are preserved because
+they may be intentional.
 
 Assistant and user messages support GitHub-Flavored Markdown, including tables such as
 `| Key | Title |` followed by `|--|--|`, fenced code blocks, and `_underlined text_` (single

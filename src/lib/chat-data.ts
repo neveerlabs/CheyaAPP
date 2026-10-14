@@ -677,6 +677,72 @@ async function searchUserData(
   return Promise.all(searches);
 }
 
+async function deduplicateUserMemories(
+  client: AppSupabaseClient,
+  confirmDelete: (label: string, preview: string) => boolean | Promise<boolean>,
+  userId?: string,
+): Promise<unknown> {
+  const pageSize = 500;
+  const memories: Array<{
+    id: string;
+    category: string;
+    content: string;
+    updated_at: string;
+  }> = [];
+
+  for (let offset = 0; ; offset += pageSize) {
+    let query = client
+      .from("user_memories")
+      .select("id, category, content, updated_at")
+      .order("updated_at", { ascending: false })
+      .order("id", { ascending: false })
+      .range(offset, offset + pageSize - 1);
+    if (userId) query = query.eq("user_id", userId);
+    const { data, error } = await query;
+    if (error) throw new Error(`Could not load memories for duplicate check: ${error.message}`);
+    memories.push(...data);
+    if (data.length < pageSize) break;
+  }
+
+  const groups = new Map<string, typeof memories>();
+  for (const memory of memories) {
+    const normalized = memory.content.normalize("NFKC").trim().replace(/\s+/g, " ").toLowerCase();
+    if (!normalized) continue;
+    const matching = groups.get(normalized) ?? [];
+    matching.push(memory);
+    groups.set(normalized, matching);
+  }
+  const duplicateGroups = [...groups.values()].filter((group) => group.length > 1);
+  const duplicateIds = duplicateGroups.flatMap((group) => group.slice(1).map((memory) => memory.id));
+  if (duplicateIds.length === 0) {
+    return { duplicateGroups: 0, deletedCount: 0, message: "No exact duplicate memories found." };
+  }
+
+  const preview = duplicateGroups
+    .slice(0, 10)
+    .map((group) => `Keep "${group[0].content.slice(0, 180)}"; remove ${group.length - 1} duplicate(s).`)
+    .join("\n");
+  if (!(await confirmDelete("duplicate saved memories", preview))) {
+    return { duplicateGroups: duplicateGroups.length, deletedCount: 0, cancelled: true };
+  }
+
+  let deletedCount = 0;
+  for (let offset = 0; offset < duplicateIds.length; offset += 100) {
+    const batch = duplicateIds.slice(offset, offset + 100);
+    let remove = client.from("user_memories").delete().in("id", batch);
+    if (userId) remove = remove.eq("user_id", userId);
+    const { data, error } = await remove.select("id");
+    if (error) throw new Error(`Could not remove duplicate memories: ${error.message}`);
+    deletedCount += data.length;
+  }
+
+  return {
+    duplicateGroups: duplicateGroups.length,
+    deletedCount,
+    keptMostRecentlyUpdated: true,
+  };
+}
+
 export async function executeChatDataTool(
   client: AppSupabaseClient,
   apiKey: string,
@@ -692,6 +758,9 @@ export async function executeChatDataTool(
   const args = input as Record<string, unknown>;
 
   if (name === "search_user_data") return searchUserData(client, args, userId);
+  if (name === "deduplicate_memories") {
+    return deduplicateUserMemories(client, confirmDelete, userId);
+  }
 
   if (name === "create_memory") {
     const category =

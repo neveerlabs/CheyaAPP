@@ -28,11 +28,13 @@ import {
 } from "../src/lib/supabase";
 
 function hasExplicitDeleteIntent(message: string, label: string): boolean {
-  if (!/\b(delete|remove|forget|erase|hapus|buang|lupakan)\b/i.test(message)) return false;
+  if (!/\b(delete|remove|forget|erase|hapus|buang|lupakan|clean|cleanup|deduplicate|duplicates?|bersihkan|duplikat)\b/i.test(message)) {
+    return false;
+  }
   const targetPattern =
-    label === "memory"
+    /\bmemory\b/i.test(label)
       ? /\b(memory|memories|memori|ingatan)\b/i
-      : label === "insight"
+      : /\binsight\b/i.test(label)
         ? /\b(insight|insights|analisis|catatan)\b/i
         : /\b(message|chat|conversation|pesan|obrolan)\b/i;
   return (
@@ -193,7 +195,12 @@ async function processChatJob(jobId: string) {
   let memoryCandidate: Awaited<ReturnType<typeof analyzeGeminiMessage>>["memory"] = null;
   let insightKeyIndex = 0;
   try {
-    const analysis = await analyzeGeminiMessage(typedKeys, userMessage.content, 0);
+    const analysis = await analyzeGeminiMessage(
+      typedKeys,
+      userMessage.content,
+      0,
+      history.map(({ role, content }) => ({ role, content })),
+    );
     currentInsight = analysis.insight;
     memoryCandidate = analysis.memory;
     insightKeyIndex = analysis.keyIndex;
@@ -206,7 +213,7 @@ async function processChatJob(jobId: string) {
       }`,
     );
   }
-  if (currentInsight) {
+  if (currentInsight?.summary.trim()) {
     try {
       await saveMessageInsight(client, userMessage.id, currentInsight, job.user_id);
       insights = [...insights, currentInsight];
@@ -271,6 +278,7 @@ async function processChatJob(jobId: string) {
     personalization,
     {
       thinkingMode: job.thinking_mode,
+      allowSilence: true,
       history: history.map(({ role, content }) => ({ role, content })),
       relevantMessages,
       memories,
@@ -300,6 +308,45 @@ async function processChatJob(jobId: string) {
     },
   );
   attempts.push(...result.attempts);
+
+  if (result.silent) {
+    for (const attempt of attempts) {
+      try {
+        await saveApiStatus(client, attempt, job.user_id);
+      } catch (error) {
+        warnings.push(
+          `Gemini API status could not be updated: ${
+            error instanceof Error ? error.message : "Unknown database error."
+          }`,
+        );
+      }
+    }
+    try {
+      await saveChatBranch(client, userMessage.id, userMessage.version_number, job.user_id);
+    } catch (error) {
+      warnings.push(
+        `The message was saved, but conversation history could not be snapshotted: ${
+          error instanceof Error ? error.message : "Unknown database error."
+        }`,
+      );
+    }
+    const { error: completionError } = await client
+      .from("chat_message_jobs")
+      .update({
+        status: "completed",
+        progress: "Cheya is listening.",
+        error: warnings.length > 0 ? warnings.join("\n").slice(0, 2000) : null,
+        updated_at: new Date().toISOString(),
+        completed_at: new Date().toISOString(),
+      })
+      .eq("id", jobId)
+      .eq("user_id", job.user_id)
+      .neq("status", "completed");
+    if (completionError) {
+      throw new Error(`Could not complete the silent chat job: ${completionError.message}`);
+    }
+    return;
+  }
 
   let thinkingSummary: string | null = null;
   if (job.thinking_mode) {
