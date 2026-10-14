@@ -1,5 +1,7 @@
 import {
   AudioLines,
+  ArrowLeft,
+  ArrowRight,
   BadgeCheck,
   Bell,
   Brain,
@@ -13,6 +15,7 @@ import {
   Image,
   LoaderCircle,
   Mic,
+  Pencil,
   Plus,
   RotateCw,
   X,
@@ -23,13 +26,15 @@ import {
 } from "lucide-react";
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import avatarUrl from "../assets/cheyaverse.jpg";
+import { AccountLogin } from "./AccountLogin";
 import {
   analyzeGeminiMessage,
+  generateThinkingSummary,
   generateGeminiConversation,
   GeminiFailoverError,
   type GeminiAttempt,
 } from "./lib/gemini";
-import type { AppSupabaseClient } from "./lib/supabase";
+import type { AppSupabaseClient, ChatMessageVersion } from "./lib/supabase";
 
 const SettingsPage = lazy(() =>
   import("./SettingsPage").then((module) => ({ default: module.SettingsPage })),
@@ -50,7 +55,8 @@ interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   text: string;
-  thinkingSummary?: string[];
+  versionNumber: number;
+  thinkingSummary: string | null;
 }
 
 interface AttachmentView {
@@ -65,6 +71,7 @@ interface DeleteConfirmation {
 
 interface ReportTarget {
   id: string;
+  versionNumber: number;
   text: string;
 }
 
@@ -111,10 +118,17 @@ const binaryFileExtensions = new Set(["7z", "doc", "docx", "gz", "pdf", "rar", "
 
 export function App() {
   const [pathname, setPathname] = useState(window.location.pathname);
+  const [authClient, setAuthClient] = useState<AppSupabaseClient | null>(null);
+  const [authUser, setAuthUser] = useState<{ id: string; email: string | null } | null>(null);
+  const [isAuthLoading, setIsAuthLoading] = useState(true);
+  const [authError, setAuthError] = useState("");
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messageVersions, setMessageVersions] = useState<Record<string, ChatMessageVersion[]>>({});
+  const [selectedMessageVersions, setSelectedMessageVersions] = useState<Record<string, number>>({});
   const [isSending, setIsSending] = useState(false);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const [hasGeminiApiKey, setHasGeminiApiKey] = useState(false);
   const [isThinkMode, setIsThinkMode] = useState(false);
   const [thinkingSteps, setThinkingSteps] = useState<string[]>([]);
   const [expandedThinkingIds, setExpandedThinkingIds] = useState<Set<string>>(() => new Set());
@@ -125,6 +139,9 @@ export function App() {
   const [reportError, setReportError] = useState("");
   const [isSavingReport, setIsSavingReport] = useState(false);
   const [actionNotice, setActionNotice] = useState("");
+  const [userEditTarget, setUserEditTarget] = useState<string | null>(null);
+  const [userEditText, setUserEditText] = useState("");
+  const [activeUserActions, setActiveUserActions] = useState<string | null>(null);
   const [deleteConfirmation, setDeleteConfirmation] = useState<DeleteConfirmation | null>(null);
   const [sendError, setSendError] = useState("");
   const [isMediaMenuOpen, setIsMediaMenuOpen] = useState(false);
@@ -141,6 +158,7 @@ export function App() {
   const nextApiIndexRef = useRef(0);
   const attachmentViewRequestRef = useRef(0);
   const deleteConfirmationResolverRef = useRef<((approved: boolean) => void) | null>(null);
+  const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wasSettingsRef = useRef(window.location.pathname === "/settings");
   const hasMessage = message.trim().length > 0 || attachedMedia.length > 0;
   const mediaPreviews = useMemo(
@@ -165,6 +183,47 @@ export function App() {
     deleteConfirmationResolverRef.current?.(approved);
     deleteConfirmationResolverRef.current = null;
     setDeleteConfirmation(null);
+  }
+
+  function displayedVersionNumber(chatMessage: ChatMessage): number {
+    return selectedMessageVersions[chatMessage.id] ?? chatMessage.versionNumber;
+  }
+
+  function displayedMessageText(chatMessage: ChatMessage): string {
+    const versionNumber = displayedVersionNumber(chatMessage);
+    return (
+      messageVersions[chatMessage.id]?.find((item) => item.version_number === versionNumber)
+        ?.content ?? chatMessage.text
+    );
+  }
+
+  function displayedThinkingSummary(chatMessage: ChatMessage): string | null {
+    const versionNumber = displayedVersionNumber(chatMessage);
+    return (
+      messageVersions[chatMessage.id]?.find((item) => item.version_number === versionNumber)
+        ?.thinking_summary ?? chatMessage.thinkingSummary
+    );
+  }
+
+  function setMessageVersion(chatMessage: ChatMessage, direction: -1 | 1) {
+    const versions = messageVersions[chatMessage.id] ?? [];
+    if (versions.length < 2) return;
+    const currentNumber = displayedVersionNumber(chatMessage);
+    const currentIndex = versions.findIndex((item) => item.version_number === currentNumber);
+    const nextVersion = versions[currentIndex + direction];
+    if (nextVersion) {
+      setSelectedMessageVersions((current) => ({
+        ...current,
+        [chatMessage.id]: nextVersion.version_number,
+      }));
+    }
+  }
+
+  function clearLongPressTimer() {
+    if (longPressTimerRef.current) {
+      clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
   }
 
   useEffect(
@@ -196,47 +255,139 @@ export function App() {
 
   useEffect(() => {
     let isMounted = true;
+    let unsubscribe: (() => void) | null = null;
+    void (async () => {
+      let client: AppSupabaseClient;
+      try {
+        const { createSupabaseClient, loadDatabaseConfig } = await import("./lib/supabase");
+        const config = loadDatabaseConfig();
+        if (!config) {
+          setAuthError(
+            "The shared CheyaVerse database is not configured. The administrator must add its public connection settings to Vercel.",
+          );
+          setIsAuthLoading(false);
+          return;
+        }
+        client = createSupabaseClient(config);
+        setAuthClient(client);
+      } catch (error) {
+        setAuthError(error instanceof Error ? error.message : "Could not configure account sign-in.");
+        setIsAuthLoading(false);
+        return;
+      }
+
+      const activateSession = async (
+      session: Awaited<ReturnType<typeof client.auth.getSession>>["data"]["session"],
+    ) => {
+      if (!isMounted) return;
+      if (!session?.user || session.user.is_anonymous) {
+        setAuthUser(null);
+        setIsAuthLoading(false);
+        setMessages([]);
+        setHasGeminiApiKey(false);
+        return;
+      }
+
+      setIsAuthLoading(true);
+      try {
+        const { ensureSupabaseSession } = await import("./lib/supabase");
+        await ensureSupabaseSession(client);
+        if (!isMounted) return;
+        setAuthError("");
+        setAuthUser({ id: session.user.id, email: session.user.email ?? null });
+      } catch (error) {
+        if (!isMounted) return;
+        setAuthUser(null);
+        setAuthError(error instanceof Error ? error.message : "Could not prepare account data.");
+      } finally {
+        if (isMounted) setIsAuthLoading(false);
+      }
+    };
+
+      const {
+        data: { subscription },
+      } = client.auth.onAuthStateChange((_event, session) => {
+        window.setTimeout(() => void activateSession(session), 0);
+      });
+      unsubscribe = () => subscription.unsubscribe();
+      void client.auth.getSession().then(({ data, error }) => {
+        if (error) {
+          setAuthError(`Could not restore your account session: ${error.message}`);
+          setIsAuthLoading(false);
+          return;
+        }
+        void activateSession(data.session);
+      });
+    })();
+
+    return () => {
+      isMounted = false;
+      unsubscribe?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!authClient || !authUser) {
+      setIsLoadingHistory(false);
+      setMessages([]);
+      setMessageVersions({});
+      setSelectedMessageVersions({});
+      setRatings({});
+      setHasGeminiApiKey(false);
+      return;
+    }
+
+    let isMounted = true;
+    setIsLoadingHistory(true);
     void (async () => {
       try {
-        const {
-          createSupabaseClient,
-          ensureSupabaseSession,
-          loadDatabaseConfig,
-        } = await import("./lib/supabase");
-        const config = loadDatabaseConfig();
-        if (!config) return;
-        setIsLoadingHistory(true);
-        const client = createSupabaseClient(config);
-        await ensureSupabaseSession(client);
-        const { loadRecentChatMessages } = await import("./lib/chat-data");
-        const savedMessages = await loadRecentChatMessages(client);
+        const { loadMessageVersions, loadRecentChatMessages } = await import("./lib/chat-data");
+        const [savedMessages, keyResult] = await Promise.all([
+          loadRecentChatMessages(authClient),
+          authClient
+            .from("ai_api_keys")
+            .select("id")
+            .order("created_at", { ascending: true })
+            .limit(1),
+        ]);
+        if (keyResult.error) throw keyResult.error;
+        const loadedVersions = await loadMessageVersions(
+          authClient,
+          savedMessages.map((item) => item.id),
+        );
         const assistantMessages = savedMessages.filter((item) => item.role === "assistant");
         const loadedRatings: Record<string, AssistantRating> = {};
         if (assistantMessages.length > 0) {
-          const { data: feedback, error: feedbackError } = await client
+          const { data: feedback, error: feedbackError } = await authClient
             .from("message_feedback")
-            .select("message_id, kind")
+            .select("message_id, version_number, kind")
             .in("message_id", assistantMessages.map((item) => item.id))
             .in("kind", ["like", "dislike"]);
           if (feedbackError) {
-            setSendError(
-              `Could not load saved response feedback. Run the latest supabase/schema.sql. ${feedbackError.message}`,
+            throw new Error(
+              `Could not load saved response feedback. Run the latest server schema. ${feedbackError.message}`,
             );
-          } else {
-            feedback.forEach((item) => {
-              if (item.kind === "like" || item.kind === "dislike") {
-                loadedRatings[item.message_id] = item.kind;
-              }
-            });
           }
+          feedback.forEach((item) => {
+            if (item.kind === "like" || item.kind === "dislike") {
+              loadedRatings[`${item.message_id}:${item.version_number}`] = item.kind;
+            }
+          });
         }
         if (isMounted) {
+          setHasGeminiApiKey(keyResult.data.length > 0);
           setRatings(loadedRatings);
+          setMessageVersions(loadedVersions);
+          setSelectedMessageVersions(
+            Object.fromEntries(savedMessages.map((item) => [item.id, item.version_number])),
+          );
           setMessages(
-            savedMessages.map(({ id, role, content }) => ({
+            savedMessages.map(({ id, role, content, version_number, thinking_summary }) => ({
               id,
               role,
               text: content,
+              versionNumber: version_number,
+              thinkingSummary: thinking_summary,
             })),
           );
         }
@@ -254,7 +405,7 @@ export function App() {
     return () => {
       isMounted = false;
     };
-  }, []);
+  }, [authClient, authUser]);
 
   useEffect(() => {
     if (!attachmentView) return;
@@ -468,6 +619,14 @@ export function App() {
   }
 
   async function sendMessage() {
+    if (!authUser) {
+      setSendError("Sign in with Google before starting a chat.");
+      return;
+    }
+    if (!hasGeminiApiKey) {
+      setSendError("Add a Gemini API key in Settings → Configure before using chat.");
+      return;
+    }
     const prompt = message.trim();
     if (!prompt) {
       setSendError("Write a message before sending it.");
@@ -501,6 +660,8 @@ export function App() {
         createEmbedding,
         executeChatDataTool,
         findRelevantContext,
+        loadMessageVersions,
+        loadRecentAssistantFeedback,
         loadRecentChatMessages,
         loadRecentInsights,
         saveChatMessage,
@@ -509,7 +670,7 @@ export function App() {
       saveStatus = saveApiStatus;
       const config = loadDatabaseConfig();
       if (!config) {
-        throw new Error("Connect your own Supabase project in Settings before using chat.");
+        throw new Error("The CheyaVerse account service is not configured for this deployment.");
       }
       client = createSupabaseClient(config);
       await ensureSupabaseSession(client);
@@ -538,7 +699,7 @@ export function App() {
         .maybeSingle();
       if (profileError) {
         throw new Error(
-          `Could not load Personal settings. Run the latest supabase/schema.sql in your project. ${profileError.message}`,
+          `Could not load Personal settings. The CheyaVerse database may need the latest supabase/schema.sql. ${profileError.message}`,
         );
       }
 
@@ -546,6 +707,23 @@ export function App() {
       const selectedKey = keys[selectedIndex];
       if (showThinking) setThinkingSteps(["Memuat riwayat dan preferensi percakapan…"]);
       const history = await loadRecentChatMessages(client, 20);
+      let recentFeedback: Array<{
+        rating: AssistantRating;
+        response: string;
+        versionNumber: number;
+      }> = [];
+      try {
+        recentFeedback = await loadRecentAssistantFeedback(
+          client,
+          history.filter((item) => item.role === "assistant").map((item) => item.id),
+        );
+      } catch (error) {
+        warnings.push(
+          `Saved response feedback could not be loaded: ${
+            error instanceof Error ? error.message : "Unknown database error."
+          }`,
+        );
+      }
       let userEmbedding: number[] | null = null;
       try {
         userEmbedding = await createEmbedding(selectedKey.api_key, prompt, "RETRIEVAL_DOCUMENT");
@@ -562,7 +740,29 @@ export function App() {
         id: persistedUserMessage.id,
         role: persistedUserMessage.role,
         text: persistedUserMessage.content,
+        versionNumber: persistedUserMessage.version_number,
+        thinkingSummary: persistedUserMessage.thinking_summary,
       };
+      setMessageVersions((current) => ({
+        ...current,
+        [persistedUserMessage.id]: [
+          {
+            id: "",
+            user_id: persistedUserMessage.user_id,
+            message_id: persistedUserMessage.id,
+            version_number: persistedUserMessage.version_number,
+            content: persistedUserMessage.content,
+            embedding: null,
+            thinking_summary: persistedUserMessage.thinking_summary,
+            revision_reason: "initial",
+            created_at: persistedUserMessage.created_at,
+          },
+        ],
+      }));
+      setSelectedMessageVersions((current) => ({
+        ...current,
+        [persistedUserMessage.id]: persistedUserMessage.version_number,
+      }));
       savedUserMessage = newUserMessage;
       setMessages((current) => [...current, newUserMessage]);
       setMessage("");
@@ -669,10 +869,12 @@ export function App() {
         nextApiIndexRef.current,
         profile ?? DEFAULT_PERSONALIZATION,
         {
+          thinkingMode: showThinking,
           history: history.slice(-12),
           relevantMessages,
           memories,
           insights: insights.slice(-12),
+          feedback: recentFeedback,
           executeTool: (name, input, apiKey) =>
             executeChatDataTool(client!, apiKey, name, input, requestDeleteConfirmation),
         },
@@ -680,6 +882,33 @@ export function App() {
       attempts.push(...result.attempts);
       nextApiIndexRef.current = (result.keyIndex + 1) % keys.length;
 
+      let thinkingSummary: string | null = null;
+      if (showThinking) {
+        try {
+          const summary = await generateThinkingSummary(
+            keys,
+            prompt,
+            result.text,
+            {
+              history: history.slice(-12).map(({ role, content }) => ({ role, content })),
+              relevantMessages,
+              memories,
+              insights,
+              feedback: recentFeedback,
+            },
+            result.keyIndex,
+          );
+          thinkingSummary = summary.summary;
+          attempts.push(...summary.attempts);
+        } catch (error) {
+          if (error instanceof GeminiFailoverError) attempts.push(...error.attempts);
+          warnings.push(
+            `The answer is ready, but the Thinking mode explanation could not be created: ${
+              error instanceof Error ? error.message : "Unknown Gemini error."
+            }`,
+          );
+        }
+      }
       let assistantEmbedding: number[] | null = null;
       try {
         assistantEmbedding = await createEmbedding(
@@ -701,32 +930,48 @@ export function App() {
           "assistant",
           result.text,
           assistantEmbedding,
+          thinkingSummary,
         );
+        const initialVersion = {
+          id: "",
+          user_id: persistedReply.user_id,
+          message_id: persistedReply.id,
+          version_number: persistedReply.version_number,
+          content: persistedReply.content,
+          embedding: null,
+          thinking_summary: persistedReply.thinking_summary,
+          revision_reason: "initial" as const,
+          created_at: persistedReply.created_at,
+        };
+        setMessageVersions((current) => ({
+          ...current,
+          [persistedReply.id]: [initialVersion],
+        }));
+        setSelectedMessageVersions((current) => ({
+          ...current,
+          [persistedReply.id]: persistedReply.version_number,
+        }));
         setMessages((current) => [
           ...current,
           {
             id: persistedReply.id,
             role: persistedReply.role,
             text: persistedReply.content,
-            ...(showThinking
-              ? {
-                  thinkingSummary: [
-                    "Memahami inti pesan dan konteks percakapan.",
-                    ...(history.length > 0 ? ["Mempertimbangkan riwayat chat terbaru."] : []),
-                    ...(relevantMessages.length > 0 || memories.length > 0
-                      ? ["Memakai konteks relevan yang tersimpan."]
-                      : []),
-                    "Menyusun jawaban ringkas sesuai gaya obrolan yang dipilih.",
-                  ],
-                }
-              : {}),
+            versionNumber: persistedReply.version_number,
+            thinkingSummary: persistedReply.thinking_summary,
           },
         ]);
         assistantSaved = true;
       } catch (error) {
         setMessages((current) => [
           ...current,
-          { id: `unsaved-${Date.now()}`, role: "assistant", text: result.text },
+          {
+            id: `unsaved-${Date.now()}`,
+            role: "assistant",
+            text: result.text,
+            versionNumber: 1,
+            thinkingSummary,
+          },
         ]);
         warnings.push(
           `The reply arrived but was not saved to the database: ${
@@ -737,9 +982,36 @@ export function App() {
 
       try {
         const refreshedHistory = await loadRecentChatMessages(client);
+        const refreshedVersions = await loadMessageVersions(
+          client,
+          refreshedHistory.map((item) => item.id),
+        );
+        setMessageVersions(refreshedVersions);
+        setSelectedMessageVersions((current) => ({
+          ...current,
+          ...Object.fromEntries(
+            refreshedHistory.map((item) => [item.id, item.version_number]),
+          ),
+        }));
         setMessages([
-          ...refreshedHistory.map(({ id, role, content }) => ({ id, role, text: content })),
-          ...(!assistantSaved ? [{ id: `unsaved-${Date.now()}`, role: "assistant" as const, text: result.text }] : []),
+          ...refreshedHistory.map(
+            ({ id, role, content, version_number, thinking_summary }) => ({
+              id,
+              role,
+              text: content,
+              versionNumber: version_number,
+              thinkingSummary: thinking_summary,
+            }),
+          ),
+          ...(!assistantSaved
+            ? [{
+                id: `unsaved-${Date.now()}`,
+                role: "assistant" as const,
+                text: result.text,
+                versionNumber: 1,
+                thinkingSummary,
+              }]
+            : []),
         ]);
       } catch (error) {
         warnings.push(
@@ -794,22 +1066,27 @@ export function App() {
     }
   }
 
-  async function handleAssistantRating(messageId: string, rating: AssistantRating) {
-    const nextRating = ratings[messageId] === rating ? null : rating;
+  async function handleAssistantRating(
+    messageId: string,
+    versionNumber: number,
+    rating: AssistantRating,
+  ) {
+    const ratingKey = `${messageId}:${versionNumber}`;
+    const nextRating = ratings[ratingKey] === rating ? null : rating;
     try {
       const [
         { createSupabaseClient, ensureSupabaseSession, loadDatabaseConfig },
         { saveAssistantRating },
       ] = await Promise.all([import("./lib/supabase"), import("./lib/chat-data")]);
       const config = loadDatabaseConfig();
-      if (!config) throw new Error("Connect your Supabase database before rating a reply.");
+      if (!config) throw new Error("The CheyaVerse account service is not configured.");
       const client = createSupabaseClient(config);
       await ensureSupabaseSession(client);
-      await saveAssistantRating(client, messageId, nextRating);
+      await saveAssistantRating(client, messageId, versionNumber, nextRating);
       setRatings((current) => {
         const updated = { ...current };
-        if (nextRating) updated[messageId] = nextRating;
-        else delete updated[messageId];
+        if (nextRating) updated[ratingKey] = nextRating;
+        else delete updated[ratingKey];
         return updated;
       });
       setActionNotice(nextRating ? "Thanks for the feedback." : "Feedback removed.");
@@ -833,10 +1110,15 @@ export function App() {
         { saveAssistantReport },
       ] = await Promise.all([import("./lib/supabase"), import("./lib/chat-data")]);
       const config = loadDatabaseConfig();
-      if (!config) throw new Error("Connect your Supabase database before reporting a reply.");
+      if (!config) throw new Error("The CheyaVerse account service is not configured.");
       const client = createSupabaseClient(config);
       await ensureSupabaseSession(client);
-      await saveAssistantReport(client, reportTarget.id, details);
+      await saveAssistantReport(
+        client,
+        reportTarget.id,
+        reportTarget.versionNumber,
+        details,
+      );
       setReportTarget(null);
       setReportDetails("");
       setReportError("");
@@ -848,12 +1130,12 @@ export function App() {
     }
   }
 
-  async function copyAssistantMessage(chatMessage: ChatMessage) {
+  async function copyMessageText(messageId: string, text: string) {
     try {
-      await navigator.clipboard.writeText(chatMessage.text);
-      setCopiedMessageId(chatMessage.id);
+      await navigator.clipboard.writeText(text);
+      setCopiedMessageId(messageId);
       window.setTimeout(() => {
-        setCopiedMessageId((current) => (current === chatMessage.id ? null : current));
+        setCopiedMessageId((current) => (current === messageId ? null : current));
       }, 1800);
     } catch (error) {
       setSendError(
@@ -862,6 +1144,10 @@ export function App() {
           : "Could not copy this reply.",
       );
     }
+  }
+
+  async function copyAssistantMessage(chatMessage: ChatMessage) {
+    await copyMessageText(chatMessage.id, displayedMessageText(chatMessage));
   }
 
   async function regenerateAssistantMessage(messageId: string) {
@@ -878,6 +1164,9 @@ export function App() {
       setSendError("Could not find the user message for this reply.");
       return;
     }
+    const sourceText = displayedMessageText(sourceMessage);
+    const previousAnswer = displayedMessageText(messages[assistantIndex]);
+    const previousVersionNumber = displayedVersionNumber(messages[assistantIndex]);
 
     setIsSending(true);
     setSendError("");
@@ -897,12 +1186,16 @@ export function App() {
           createEmbedding,
           executeChatDataTool,
           findRelevantContext,
+          loadMessageCreatedAt,
+          loadMessageFeedback,
+          loadMessageVersions,
+          loadRecentAssistantFeedback,
           loadRecentInsights,
           updateChatMessage,
         },
       ] = await Promise.all([import("./lib/supabase"), import("./lib/chat-data")]);
       const config = loadDatabaseConfig();
-      if (!config) throw new Error("Connect your Supabase database before regenerating a reply.");
+      if (!config) throw new Error("The CheyaVerse account service is not configured.");
       const client = createSupabaseClient(config);
       await ensureSupabaseSession(client);
       const [{ data: keys, error: keysError }, { data: profile, error: profileError }] =
@@ -924,8 +1217,8 @@ export function App() {
       const startIndex = ((nextApiIndexRef.current % keys.length) + keys.length) % keys.length;
       const selectedKey = keys[startIndex];
       const [queryResult, insightsResult] = await Promise.allSettled([
-        createEmbedding(selectedKey.api_key, sourceMessage.text, "RETRIEVAL_QUERY"),
-        loadRecentInsights(client, 12, sourceMessage.id),
+        createEmbedding(selectedKey.api_key, sourceText, "RETRIEVAL_QUERY"),
+        loadMessageCreatedAt(client, sourceMessage.id),
       ]);
       const regenerationWarnings: string[] = [];
       if (queryResult.status === "rejected") {
@@ -937,9 +1230,11 @@ export function App() {
           }`,
         );
       }
+      const targetCreatedAt =
+        insightsResult.status === "fulfilled" ? insightsResult.value : undefined;
       if (insightsResult.status === "rejected") {
         regenerationWarnings.push(
-          `Recent insights could not be loaded: ${
+          `The message timestamp could not be loaded: ${
             insightsResult.reason instanceof Error
               ? insightsResult.reason.message
               : "Unknown database error."
@@ -947,27 +1242,117 @@ export function App() {
         );
       }
       const history = messages.slice(0, sourceIndex).slice(-12);
+      const [feedbackResult, recentFeedbackResult] = await Promise.allSettled([
+        loadMessageFeedback(client, messageId, previousVersionNumber),
+        loadRecentAssistantFeedback(
+          client,
+          history.filter((item) => item.role === "assistant").map((item) => item.id),
+        ),
+      ]);
+      const previousRating =
+        feedbackResult.status === "fulfilled" ? feedbackResult.value : null;
+      if (feedbackResult.status === "rejected") {
+        regenerationWarnings.push(
+          `Feedback for the previous answer could not be loaded: ${
+            feedbackResult.reason instanceof Error
+              ? feedbackResult.reason.message
+              : "Unknown database error."
+          }`,
+        );
+      }
+      const recentFeedback =
+        recentFeedbackResult.status === "fulfilled" ? recentFeedbackResult.value : [];
+      if (recentFeedbackResult.status === "rejected") {
+        regenerationWarnings.push(
+          `Other saved response feedback could not be loaded: ${
+            recentFeedbackResult.reason instanceof Error
+              ? recentFeedbackResult.reason.message
+              : "Unknown database error."
+          }`,
+        );
+      }
+      const [contextResult, insightsContextResult] = await Promise.allSettled([
+        queryResult.status === "fulfilled" && targetCreatedAt
+          ? findRelevantContext(
+              client,
+              queryResult.value,
+              sourceMessage.id,
+              targetCreatedAt,
+            )
+          : Promise.resolve({ messages: [], memories: [] }),
+        targetCreatedAt
+          ? loadRecentInsights(client, 12, sourceMessage.id, targetCreatedAt)
+          : Promise.resolve([]),
+      ]);
+      if (contextResult.status === "rejected") {
+        regenerationWarnings.push(
+          `Related context could not be loaded: ${
+            contextResult.reason instanceof Error
+              ? contextResult.reason.message
+              : "Unknown database error."
+          }`,
+        );
+      }
+      if (insightsContextResult.status === "rejected") {
+        regenerationWarnings.push(
+          `Recent insights could not be loaded: ${
+            insightsContextResult.reason instanceof Error
+              ? insightsContextResult.reason.message
+              : "Unknown database error."
+          }`,
+        );
+      }
       const relevantContext =
-        queryResult.status === "fulfilled"
-          ? await findRelevantContext(client, queryResult.value, sourceMessage.id)
+        contextResult.status === "fulfilled"
+          ? contextResult.value
           : { messages: [], memories: [] };
-      const insights = insightsResult.status === "fulfilled" ? insightsResult.value : [];
+      const insights =
+        insightsContextResult.status === "fulfilled" ? insightsContextResult.value : [];
       if (showThinking) setThinkingSteps(["Meninjau riwayat dan konteks tersimpan…"]);
 
       const result = await generateGeminiConversation(
         keys,
-        sourceMessage.text,
+        sourceText,
         startIndex,
         profile ?? DEFAULT_PERSONALIZATION,
         {
+          thinkingMode: showThinking,
           history: history.map(({ role, text }) => ({ role, content: text })),
           relevantMessages: relevantContext.messages,
           memories: relevantContext.memories,
           insights,
+          feedback: recentFeedback,
+          replacedResponse: { content: previousAnswer, feedback: previousRating },
           executeTool: (name, input, apiKey) =>
             executeChatDataTool(client, apiKey, name, input, requestDeleteConfirmation),
         },
       );
+      let thinkingSummary: string | null = null;
+      if (showThinking) {
+        try {
+          const summary = await generateThinkingSummary(
+            keys,
+            sourceText,
+            result.text,
+            {
+              history: history.map(({ role, text }) => ({ role, content: text })),
+              relevantMessages: relevantContext.messages,
+              memories: relevantContext.memories,
+              insights,
+              replacedResponse: { content: previousAnswer, feedback: previousRating },
+            },
+            result.keyIndex,
+          );
+          thinkingSummary = summary.summary;
+          result.attempts.push(...summary.attempts);
+        } catch (error) {
+          regenerationWarnings.push(
+            `The answer is ready, but its Thinking mode explanation could not be created: ${
+              error instanceof Error ? error.message : "Unknown Gemini error."
+            }`,
+          );
+        }
+      }
       let embedding: number[] | null = null;
       try {
         embedding = await createEmbedding(
@@ -987,28 +1372,27 @@ export function App() {
         messageId,
         result.text,
         embedding,
+        thinkingSummary,
+        "regenerate",
+        true,
       );
       if (!updatedMessage) throw new Error("This reply could not be found in the database.");
 
-      setMessages((current) =>
-        current.map((item) =>
-          item.id === messageId
-            ? {
-                ...item,
-                text: updatedMessage.content,
-                thinkingSummary: showThinking
-                  ? [
-                      "Meninjau kembali pesan dan riwayat percakapan.",
-                      ...(relevantContext.messages.length > 0 || relevantContext.memories.length > 0
-                        ? ["Memakai konteks relevan yang tersimpan."]
-                        : []),
-                      "Menyusun versi jawaban yang baru.",
-                    ]
-                  : undefined,
-              }
-            : item,
-        ),
-      );
+      const updatedVersions = await loadMessageVersions(client, [messageId]);
+      setMessageVersions((current) => ({ ...current, ...updatedVersions }));
+      setSelectedMessageVersions((current) => ({
+        ...current,
+        [messageId]: updatedMessage.version_number,
+      }));
+      setMessages((current) => [
+        ...current.slice(0, assistantIndex),
+        {
+          ...current[assistantIndex],
+          text: updatedMessage.content,
+          versionNumber: updatedMessage.version_number,
+          thinkingSummary: updatedMessage.thinking_summary,
+        },
+      ]);
       nextApiIndexRef.current = (result.keyIndex + 1) % keys.length;
       await Promise.all(
         result.attempts.map((attempt) =>
@@ -1034,7 +1418,99 @@ export function App() {
     }
   }
 
-  if (pathname.startsWith("/settings")) {
+  async function saveUserMessageEdit() {
+    if (!userEditTarget) return;
+    const nextText = userEditText.trim();
+    if (!nextText || nextText.length > 50000) {
+      setSendError("Edited messages must contain 1–50,000 characters.");
+      return;
+    }
+    const messageIndex = messages.findIndex((item) => item.id === userEditTarget);
+    const originalMessage = messages[messageIndex];
+    if (!originalMessage || originalMessage.role !== "user") {
+      setSendError("Could not find the user message to edit.");
+      return;
+    }
+
+    setIsSending(true);
+    setSendError("");
+    setActionNotice("");
+    try {
+      const [
+        { createSupabaseClient, ensureSupabaseSession, loadDatabaseConfig },
+        { createEmbedding, loadMessageVersions, updateChatMessage },
+      ] = await Promise.all([import("./lib/supabase"), import("./lib/chat-data")]);
+      const config = loadDatabaseConfig();
+      if (!config) throw new Error("The CheyaVerse account service is not configured.");
+      const client = createSupabaseClient(config);
+      await ensureSupabaseSession(client);
+      const { data: keys, error: keysError } = await client
+        .from("ai_api_keys")
+        .select("id, model, api_key, status, last_error, created_at")
+        .order("created_at", { ascending: true })
+        .order("id", { ascending: true });
+      if (keysError) throw keysError;
+      if (keys.length === 0) throw new Error("Add a Gemini API key in Settings first.");
+
+      let embedding: number[] | null = null;
+      try {
+        embedding = await createEmbedding(keys[0].api_key, nextText, "RETRIEVAL_DOCUMENT");
+      } catch (error) {
+        throw new Error(
+          `Could not prepare the edited message for semantic search: ${
+            error instanceof Error ? error.message : "Unknown embedding error."
+          }`,
+        );
+      }
+      const updatedMessage = await updateChatMessage(
+        client,
+        userEditTarget,
+        nextText,
+        embedding,
+        null,
+        "user_edit",
+        true,
+      );
+      if (!updatedMessage) throw new Error("The edited message was not found.");
+      const versions = await loadMessageVersions(client, [userEditTarget]);
+      setMessageVersions((current) => ({ ...current, ...versions }));
+      setSelectedMessageVersions((current) => ({
+        ...current,
+        [userEditTarget]: updatedMessage.version_number,
+      }));
+      setMessages((current) => [
+        ...current.slice(0, messageIndex),
+        {
+          ...originalMessage,
+          text: updatedMessage.content,
+          versionNumber: updatedMessage.version_number,
+          thinkingSummary: null,
+        },
+      ]);
+      setUserEditTarget(null);
+      setUserEditText("");
+      setActiveUserActions(null);
+      setActionNotice("Pesan diperbarui. Percakapan setelah pesan ini tetap tersimpan sebagai riwayat lama.");
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : "Could not edit this message.");
+    } finally {
+      setIsSending(false);
+    }
+  }
+
+  if (isAuthLoading) {
+    return (
+      <main className="fixed inset-0 flex items-center justify-center bg-white text-sm text-[#777a81]">
+        Loading your CheyaVerse account…
+      </main>
+    );
+  }
+
+  if (!authUser) {
+    return <AccountLogin client={authClient} error={authError} />;
+  }
+
+  if (pathname.startsWith("/settings") && authClient) {
     return (
       <Suspense
         fallback={
@@ -1047,6 +1523,9 @@ export function App() {
           pathname={pathname}
           onNavigate={navigate}
           onBack={() => navigate("/")}
+          client={authClient}
+          accountEmail={authUser.email}
+          onGeminiKeyChange={setHasGeminiApiKey}
         />
       </Suspense>
     );
@@ -1223,62 +1702,150 @@ export function App() {
           className="absolute inset-0 overflow-y-auto overscroll-contain px-4 pb-28 pt-20 sm:px-6"
         >
           <div className="space-y-4">
-            {messages.map((chatMessage) =>
-              chatMessage.role === "user" ? (
-                <div key={chatMessage.id} className="flex justify-end">
-                  <p className="max-w-[76%] whitespace-pre-wrap rounded-[18px] rounded-br-md bg-[#28292e] px-3 py-2 text-[13px] leading-5 text-white sm:max-w-[70%]">
-                    {chatMessage.text}
-                  </p>
+            {messages.map((chatMessage) => {
+              const versionNumber = displayedVersionNumber(chatMessage);
+              const versions = messageVersions[chatMessage.id] ?? [];
+              const versionIndex = versions.findIndex(
+                (item) => item.version_number === versionNumber,
+              );
+              const visibleText = displayedMessageText(chatMessage);
+              const visibleThinkingSummary = displayedThinkingSummary(chatMessage);
+              const ratingKey = `${chatMessage.id}:${versionNumber}`;
+              const versionControls = versions.length > 1 ? (
+                <div className="flex items-center gap-0.5 text-[11px] text-[#777a82]">
+                  <button
+                    type="button"
+                    aria-label="Show previous message version"
+                    disabled={versionIndex <= 0}
+                    onClick={() => setMessageVersion(chatMessage, -1)}
+                    className="flex size-7 items-center justify-center rounded-md hover:bg-[#f1f2f4] disabled:opacity-30"
+                  >
+                    <ArrowLeft aria-hidden="true" className="size-3.5" />
+                  </button>
+                  <span>{Math.max(versionIndex + 1, 1)}/{versions.length}</span>
+                  <button
+                    type="button"
+                    aria-label="Show newer message version"
+                    disabled={versionIndex < 0 || versionIndex >= versions.length - 1}
+                    onClick={() => setMessageVersion(chatMessage, 1)}
+                    className="flex size-7 items-center justify-center rounded-md hover:bg-[#f1f2f4] disabled:opacity-30"
+                  >
+                    <ArrowRight aria-hidden="true" className="size-3.5" />
+                  </button>
                 </div>
-              ) : (
+              ) : null;
+
+              if (chatMessage.role === "user") {
+                return (
+                  <article key={chatMessage.id} className="group flex flex-col items-end">
+                    <p
+                      onTouchStart={() => {
+                        clearLongPressTimer();
+                        longPressTimerRef.current = setTimeout(
+                          () => setActiveUserActions(chatMessage.id),
+                          550,
+                        );
+                      }}
+                      onTouchMove={clearLongPressTimer}
+                      onTouchEnd={clearLongPressTimer}
+                      onContextMenu={(event) => {
+                        event.preventDefault();
+                        setActiveUserActions(chatMessage.id);
+                      }}
+                      className="max-w-[76%] whitespace-pre-wrap rounded-[18px] rounded-br-md bg-[#28292e] px-3 py-2 text-[13px] leading-5 text-white sm:max-w-[70%]"
+                    >
+                      {visibleText}
+                    </p>
+                    <div className="mt-1 flex min-h-7 items-center gap-1">
+                      {versionControls}
+                      <div
+                        aria-label="User message actions"
+                        className={`flex items-center gap-0.5 transition-opacity sm:pointer-events-auto sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100 ${
+                          activeUserActions === chatMessage.id
+                            ? "pointer-events-auto opacity-100"
+                            : "pointer-events-none opacity-0"
+                        }`}
+                      >
+                        <button
+                          type="button"
+                          aria-label="Copy user message"
+                          onClick={() => void copyMessageText(chatMessage.id, visibleText)}
+                          className="flex size-7 items-center justify-center rounded-md text-[#777a82] hover:bg-[#f1f2f4]"
+                        >
+                          {copiedMessageId === chatMessage.id ? (
+                            <Check aria-hidden="true" className="size-3.5 text-[#398650]" />
+                          ) : (
+                            <Copy aria-hidden="true" className="size-3.5" />
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          aria-label="Edit user message"
+                          onClick={() => {
+                            setUserEditTarget(chatMessage.id);
+                            setUserEditText(visibleText);
+                            setSendError("");
+                          }}
+                          className="flex size-7 items-center justify-center rounded-md text-[#777a82] hover:bg-[#f1f2f4]"
+                        >
+                          <Pencil aria-hidden="true" className="size-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                  </article>
+                );
+              }
+
+              return (
                 <article key={chatMessage.id} className="w-full min-w-0 text-[#27282d]">
-                  <div className="max-w-full break-words text-[14px] leading-6 sm:text-[15px]">
-                    <Suspense fallback={<p className="whitespace-pre-wrap">{chatMessage.text}</p>}>
-                      <AssistantMarkdown content={chatMessage.text} />
-                    </Suspense>
-                  </div>
-                  {chatMessage.thinkingSummary && (
-                    <div className="mt-2">
+                  {visibleThinkingSummary && (
+                    <div className="mb-2">
                       <button
                         type="button"
-                        aria-expanded={expandedThinkingIds.has(chatMessage.id)}
+                        aria-expanded={expandedThinkingIds.has(ratingKey)}
                         onClick={() =>
                           setExpandedThinkingIds((current) => {
                             const next = new Set(current);
-                            if (next.has(chatMessage.id)) next.delete(chatMessage.id);
-                            else next.add(chatMessage.id);
+                            if (next.has(ratingKey)) next.delete(ratingKey);
+                            else next.add(ratingKey);
                             return next;
                           })
                         }
                         className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-xs text-[#747780] hover:bg-[#f5f6f8]"
                       >
-                        {expandedThinkingIds.has(chatMessage.id) ? (
+                        {expandedThinkingIds.has(ratingKey) ? (
                           <ChevronUp aria-hidden="true" className="size-3.5" />
                         ) : (
                           <ChevronDown aria-hidden="true" className="size-3.5" />
                         )}
-                        Ringkasan proses
+                        Thinking mode
                       </button>
-                      {expandedThinkingIds.has(chatMessage.id) && (
-                        <ul className="mt-1 space-y-1 border-l border-[#e4e5e8] pl-3 text-xs leading-5 text-[#747780]">
-                          {chatMessage.thinkingSummary.map((item, index) => (
-                            <li key={`${chatMessage.id}-thinking-${index}`}>{item}</li>
-                          ))}
-                        </ul>
+                      {expandedThinkingIds.has(ratingKey) && (
+                        <p className="mt-1 border-l border-[#e4e5e8] pl-3 text-xs leading-5 text-[#747780]">
+                          {visibleThinkingSummary}
+                        </p>
                       )}
                     </div>
                   )}
+                  <div className="max-w-full break-words text-[14px] leading-6 sm:text-[15px]">
+                    <Suspense fallback={<p className="whitespace-pre-wrap">{visibleText}</p>}>
+                      <AssistantMarkdown content={visibleText} />
+                    </Suspense>
+                  </div>
                   <div
                     aria-label="Assistant message actions"
-                    className="mt-2 flex flex-wrap items-center gap-1"
+                    className="mt-1 flex flex-wrap items-center gap-1"
                   >
+                    {versionControls}
                     <button
                       type="button"
                       aria-label="Like response"
-                      aria-pressed={ratings[chatMessage.id] === "like"}
-                      onClick={() => void handleAssistantRating(chatMessage.id, "like")}
+                      aria-pressed={ratings[ratingKey] === "like"}
+                      onClick={() =>
+                        void handleAssistantRating(chatMessage.id, versionNumber, "like")
+                      }
                       className={`flex size-8 items-center justify-center rounded-lg transition hover:bg-[#f1f2f4] ${
-                        ratings[chatMessage.id] === "like" ? "text-[#2088bf]" : "text-[#777a82]"
+                        ratings[ratingKey] === "like" ? "text-[#2088bf]" : "text-[#777a82]"
                       }`}
                     >
                       <ThumbsUp aria-hidden="true" className="size-4" />
@@ -1286,10 +1853,12 @@ export function App() {
                     <button
                       type="button"
                       aria-label="Dislike response"
-                      aria-pressed={ratings[chatMessage.id] === "dislike"}
-                      onClick={() => void handleAssistantRating(chatMessage.id, "dislike")}
+                      aria-pressed={ratings[ratingKey] === "dislike"}
+                      onClick={() =>
+                        void handleAssistantRating(chatMessage.id, versionNumber, "dislike")
+                      }
                       className={`flex size-8 items-center justify-center rounded-lg transition hover:bg-[#f1f2f4] ${
-                        ratings[chatMessage.id] === "dislike" ? "text-[#bd4a4a]" : "text-[#777a82]"
+                        ratings[ratingKey] === "dislike" ? "text-[#bd4a4a]" : "text-[#777a82]"
                       }`}
                     >
                       <ThumbsDown aria-hidden="true" className="size-4" />
@@ -1307,7 +1876,11 @@ export function App() {
                       type="button"
                       aria-label="Report response"
                       onClick={() => {
-                        setReportTarget({ id: chatMessage.id, text: chatMessage.text });
+                        setReportTarget({
+                          id: chatMessage.id,
+                          versionNumber,
+                          text: visibleText,
+                        });
                         setReportDetails("");
                         setReportError("");
                         setSendError("");
@@ -1330,8 +1903,8 @@ export function App() {
                     </button>
                   </div>
                 </article>
-              ),
-            )}
+              );
+            })}
             {isLoadingHistory && (
               <p role="status" className="text-sm text-[#858890]">
                 Loading saved chat…
@@ -1347,6 +1920,18 @@ export function App() {
               <p role="status" className="text-xs text-[#43834c]">
                 {actionNotice}
               </p>
+            )}
+            {!hasGeminiApiKey && !isLoadingHistory && (
+              <div className="flex items-center justify-between gap-3 rounded-2xl border border-[#e6e8eb] bg-white px-3.5 py-3 text-sm text-[#686b72]">
+                <span>Add a Gemini API key to start chatting.</span>
+                <button
+                  type="button"
+                  onClick={() => navigate("/settings/configure")}
+                  className="shrink-0 font-medium text-[#5c45a4] underline underline-offset-2"
+                >
+                  Configure
+                </button>
+              </div>
             )}
             {sendError && (
               <p
@@ -1441,9 +2026,12 @@ export function App() {
                 ref={messageInputRef}
                 aria-label="Message"
                 name="message"
-                placeholder="Ask anything..."
+                placeholder={
+                  hasGeminiApiKey ? "Ask anything..." : "Add a Gemini API key in Settings first"
+                }
                 rows={1}
                 value={message}
+                disabled={!hasGeminiApiKey || isLoadingHistory}
                 inputMode="text"
                 enterKeyHint="enter"
                 onChange={(event) => {
@@ -1460,10 +2048,11 @@ export function App() {
                 <button
                   type="button"
                   aria-label="Add media"
+                  disabled={!hasGeminiApiKey || isLoadingHistory}
                   aria-expanded={isMediaMenuOpen}
                   aria-haspopup="menu"
                   onClick={() => setIsMediaMenuOpen((open) => !open)}
-                  className="flex size-10 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
+                  className="flex size-10 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   <Plus aria-hidden="true" className="size-[21px]" strokeWidth={1.8} />
                 </button>
@@ -1526,8 +2115,9 @@ export function App() {
                   aria-label="Think"
                   aria-pressed={isThinkMode}
                   title={isThinkMode ? "Turn off thinking summary" : "Turn on thinking summary"}
+                  disabled={!hasGeminiApiKey || isLoadingHistory}
                   onClick={() => setIsThinkMode((enabled) => !enabled)}
-                  className={`flex h-10 items-center gap-2 rounded-full border px-3.5 text-sm font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] ${
+                  className={`flex h-10 items-center gap-2 rounded-full border px-3.5 text-sm font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] disabled:cursor-not-allowed disabled:opacity-40 ${
                     isThinkMode
                       ? "border-[#b9dff2] bg-[#edf8fd] text-[#1678a8]"
                       : "border-[#e5e6e9] bg-white text-[#34363b] hover:bg-[#f7f8fa]"
@@ -1541,7 +2131,7 @@ export function App() {
                     type="button"
                     aria-label="Send message"
                     onClick={sendMessage}
-                    disabled={isSending || isLoadingHistory}
+                    disabled={isSending || isLoadingHistory || !hasGeminiApiKey}
                     className="flex size-10 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
                   >
                     {isSending ? (
@@ -1573,6 +2163,51 @@ export function App() {
           </form>
         </footer>
       </section>
+
+      {userEditTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-5 py-8">
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="edit-user-message-title"
+            className="w-full max-w-lg rounded-3xl bg-white p-5 shadow-xl"
+          >
+            <h2 id="edit-user-message-title" className="text-base font-semibold text-[#22242a]">
+              Edit message
+            </h2>
+            <textarea
+              aria-label="Edit user message"
+              maxLength={50000}
+              rows={5}
+              value={userEditText}
+              onChange={(event) => setUserEditText(event.target.value)}
+              className="mt-3 w-full resize-y rounded-xl border border-[#e5e6e9] p-3 text-sm leading-6 outline-none focus:border-[#229fe3]"
+            />
+            <p className="mt-2 text-xs text-[#777a82]">
+              Pesan setelah ini akan disimpan sebagai riwayat lama dan disembunyikan dari percakapan aktif.
+            </p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={isSending}
+                onClick={() => setUserEditTarget(null)}
+                className="h-10 rounded-full border border-[#e5e6e9] px-4 text-sm font-medium text-[#34363b] hover:bg-[#f7f8fa] disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isSending}
+                onClick={() => void saveUserMessageEdit()}
+                className="flex h-10 items-center gap-2 rounded-full bg-[#28292e] px-4 text-sm font-medium text-white hover:bg-[#3b3d43] disabled:opacity-50"
+              >
+                {isSending && <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />}
+                Save edit
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
 
       {reportTarget && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-5 py-8">

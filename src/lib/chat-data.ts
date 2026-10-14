@@ -1,5 +1,6 @@
 import type {
   AppSupabaseClient,
+  ChatMessageVersion,
   MessageInsight,
   StoredChatMessage,
   UserMemory,
@@ -87,11 +88,18 @@ export async function saveChatMessage(
   role: StoredChatMessage["role"],
   content: string,
   embedding: number[] | null,
+  thinkingSummary: string | null = null,
 ): Promise<StoredChatMessage> {
   const { data, error } = await client
     .from("chat_messages")
-    .insert({ role, content, embedding: embedding ? serializeEmbedding(embedding) : null })
-    .select("id, user_id, role, content, created_at")
+    .insert({
+      role,
+      content,
+      embedding: embedding ? serializeEmbedding(embedding) : null,
+      thinking_summary: thinkingSummary,
+      revision_reason: "initial",
+    })
+    .select("id, user_id, role, content, embedding, created_at, version_number, thinking_summary, is_active, revision_reason")
     .single();
   if (error) {
     throw new Error(
@@ -107,7 +115,8 @@ export async function loadRecentChatMessages(
 ): Promise<StoredChatMessage[]> {
   const { data, error } = await client
     .from("chat_messages")
-    .select("id, user_id, role, content, created_at")
+    .select("id, user_id, role, content, embedding, created_at, version_number, thinking_summary, is_active, revision_reason")
+    .eq("is_active", true)
     .order("created_at", { ascending: false })
     .limit(limit);
   if (error) {
@@ -118,18 +127,60 @@ export async function loadRecentChatMessages(
   return data.reverse();
 }
 
+export async function loadMessageCreatedAt(
+  client: AppSupabaseClient,
+  messageId: string,
+): Promise<string> {
+  const { data, error } = await client
+    .from("chat_messages")
+    .select("created_at")
+    .eq("id", messageId)
+    .single();
+  if (error) {
+    throw new Error(`Could not load message timestamp: ${error.message}`);
+  }
+  return data.created_at;
+}
+
+export async function loadMessageVersions(
+  client: AppSupabaseClient,
+  messageIds: string[],
+): Promise<Record<string, ChatMessageVersion[]>> {
+  if (messageIds.length === 0) return {};
+  const { data, error } = await client
+    .from("chat_message_versions")
+    .select("id, user_id, message_id, version_number, content, embedding, thinking_summary, revision_reason, created_at")
+    .in("message_id", messageIds)
+    .order("version_number", { ascending: true });
+  if (error) {
+    throw new Error(`Could not load message versions: ${error.message}`);
+  }
+  return data.reduce<Record<string, ChatMessageVersion[]>>((versions, item) => {
+    (versions[item.message_id] ??= []).push(item);
+    return versions;
+  }, {});
+}
+
 export async function findRelevantContext(
   client: AppSupabaseClient,
   embedding: number[],
   excludeMessageId: string,
+  beforeCreatedAt?: string,
 ): Promise<{ messages: RetrievedChatMessage[]; memories: RetrievedMemory[] }> {
   const queryEmbedding = serializeEmbedding(embedding);
   const [messageResult, memoryResult] = await Promise.all([
-    client.rpc("match_chat_messages", {
-      query_embedding: queryEmbedding,
-      result_limit: SEARCH_RESULT_LIMIT,
-      exclude_message_id: excludeMessageId,
-    }),
+    beforeCreatedAt
+      ? client.rpc("match_chat_messages_before", {
+          query_embedding: queryEmbedding,
+          max_created_at: beforeCreatedAt,
+          result_limit: SEARCH_RESULT_LIMIT,
+          exclude_message_id: excludeMessageId,
+        })
+      : client.rpc("match_chat_messages", {
+          query_embedding: queryEmbedding,
+          result_limit: SEARCH_RESULT_LIMIT,
+          exclude_message_id: excludeMessageId,
+        }),
     client.rpc("match_user_memories", {
       query_embedding: queryEmbedding,
       result_limit: SEARCH_RESULT_LIMIT,
@@ -156,10 +207,27 @@ export async function loadRecentInsights(
   client: AppSupabaseClient,
   limit = 12,
   excludeMessageId?: string,
+  beforeCreatedAt?: string,
 ): Promise<Array<Pick<MessageInsight, "mood" | "communication_style" | "situation" | "topics" | "support_needs" | "summary">>> {
+  const { data: activeMessages, error: messageError } = await client
+    .from("chat_messages")
+    .select("id")
+    .eq("is_active", true)
+    .lt("created_at", beforeCreatedAt ?? new Date().toISOString())
+    .order("created_at", { ascending: false })
+    .limit(200);
+  if (messageError) {
+    throw new Error(`Could not load active messages for insight context: ${messageError.message}`);
+  }
+  const messageIds = activeMessages
+    .map((item) => item.id)
+    .filter((id) => id !== excludeMessageId);
+  if (messageIds.length === 0) return [];
+
   let query = client
     .from("message_insights")
     .select("mood, communication_style, situation, topics, support_needs, summary")
+    .in("message_id", messageIds)
     .order("created_at", { ascending: false })
     .limit(limit);
   if (excludeMessageId) query = query.neq("message_id", excludeMessageId);
@@ -187,21 +255,13 @@ export async function saveMessageInsight(
 export async function saveAssistantRating(
   client: AppSupabaseClient,
   messageId: string,
+  versionNumber: number,
   rating: "like" | "dislike" | null,
 ): Promise<void> {
-  const { error: clearError } = await client
-    .from("message_feedback")
-    .delete()
-    .eq("message_id", messageId)
-    .in("kind", ["like", "dislike"]);
-  if (clearError) {
-    throw new Error(`Could not update message feedback: ${clearError.message}`);
-  }
-  if (!rating) return;
-
-  const { error } = await client.from("message_feedback").insert({
-    message_id: messageId,
-    kind: rating,
+  const { error } = await client.rpc("set_message_rating", {
+    p_message_id: messageId,
+    p_version_number: versionNumber,
+    p_rating: rating,
   });
   if (error) throw new Error(`Could not save message feedback: ${error.message}`);
 }
@@ -209,10 +269,12 @@ export async function saveAssistantRating(
 export async function saveAssistantReport(
   client: AppSupabaseClient,
   messageId: string,
+  versionNumber: number,
   details: string,
 ): Promise<void> {
   const { error } = await client.from("message_feedback").insert({
     message_id: messageId,
+    version_number: versionNumber,
     kind: "report",
     details,
   });
@@ -224,20 +286,80 @@ export async function updateChatMessage(
   messageId: string,
   content: string,
   embedding: number[] | null,
+  thinkingSummary: string | null,
+  revisionReason: "user_edit" | "regenerate" | "ai_update",
+  branch = true,
 ): Promise<StoredChatMessage | null> {
-  const { data, error } = await client
-    .from("chat_messages")
-    .update({
-      content,
-      embedding: embedding ? serializeEmbedding(embedding) : null,
-    })
-    .eq("id", messageId)
-    .select("id, user_id, role, content, created_at")
-    .maybeSingle();
+  const { data, error } = await client.rpc("revise_chat_message", {
+    p_message_id: messageId,
+    p_content: content,
+    p_embedding: embedding ? serializeEmbedding(embedding) : null,
+    p_thinking_summary: thinkingSummary,
+    p_revision_reason: revisionReason,
+    p_branch: branch,
+  });
   if (error) throw new Error(`Could not save the regenerated reply: ${error.message}`);
-  return data;
+  return data[0] ?? null;
 }
 
+export async function loadMessageFeedback(
+  client: AppSupabaseClient,
+  messageId: string,
+  versionNumber: number,
+): Promise<"like" | "dislike" | null> {
+  const { data, error } = await client
+    .from("message_feedback")
+    .select("kind")
+    .eq("message_id", messageId)
+    .eq("version_number", versionNumber)
+    .in("kind", ["like", "dislike"])
+    .maybeSingle();
+  if (error) throw new Error(`Could not load message feedback: ${error.message}`);
+  return data?.kind === "like" || data?.kind === "dislike" ? data.kind : null;
+}
+
+export async function loadRecentAssistantFeedback(
+  client: AppSupabaseClient,
+  messageIds: string[],
+  limit = 8,
+): Promise<Array<{ rating: "like" | "dislike"; response: string; versionNumber: number }>> {
+  if (messageIds.length === 0) return [];
+  const { data: feedback, error: feedbackError } = await client
+    .from("message_feedback")
+    .select("message_id, version_number, kind, created_at")
+    .in("message_id", messageIds)
+    .in("kind", ["like", "dislike"])
+    .order("created_at", { ascending: false })
+    .limit(limit);
+  if (feedbackError) {
+    throw new Error(`Could not load recent response feedback: ${feedbackError.message}`);
+  }
+  if (feedback.length === 0) return [];
+  const { data: versions, error: versionsError } = await client
+    .from("chat_message_versions")
+    .select("message_id, version_number, content")
+    .in("message_id", [...new Set(feedback.map((item) => item.message_id))]);
+  if (versionsError) {
+    throw new Error(`Could not load rated response versions: ${versionsError.message}`);
+  }
+  const contentById = new Map(
+    versions.map((item) => [`${item.message_id}:${item.version_number}`, item.content]),
+  );
+  return feedback.flatMap((item) => {
+    const content = contentById.get(`${item.message_id}:${item.version_number}`);
+    if (
+      (item.kind !== "like" && item.kind !== "dislike") ||
+      !content
+    ) {
+      return [];
+    }
+    return [{
+      rating: item.kind,
+      response: content,
+      versionNumber: item.version_number,
+    }];
+  });
+}
 function requiredString(value: unknown, field: string, maxLength: number): string {
   if (typeof value !== "string" || !value.trim()) {
     throw new Error(`The database action requires a non-empty ${field}.`);
@@ -406,7 +528,7 @@ export async function executeChatDataTool(
     const embedding = serializeEmbedding(await createEmbedding(apiKey, content, "RETRIEVAL_DOCUMENT"));
     const { data, error } = await client
       .from("chat_messages")
-      .update({ content, embedding })
+      .update({ content, embedding, revision_reason: "ai_update" })
       .eq("id", id)
       .select("id, role, content, created_at")
       .maybeSingle();

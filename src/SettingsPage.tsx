@@ -5,32 +5,25 @@ import {
   ChevronRight,
   CircleAlert,
   CircleHelp,
-  Copy,
-  Database,
   Bug,
   Eye,
   EyeOff,
-  KeyRound,
   LoaderCircle,
+  KeyRound,
   Plus,
   SlidersHorizontal,
   Trash2,
   UserRound,
 } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import schemaSql from "../supabase/schema.sql?raw";
 import { generateGeminiReply, GeminiFailoverError } from "./lib/gemini";
 import {
-  createSupabaseClient,
   DEFAULT_PERSONALIZATION,
   ensureSupabaseSession,
   GEMINI_MODELS,
-  loadDatabaseConfig,
   saveApiStatus,
-  saveDatabaseConfig,
   type ApiStatus,
   type AppSupabaseClient,
-  type DatabaseConfig,
   type GeminiApiKey,
   type GeminiModel,
   type PersonalizationSettings,
@@ -40,6 +33,9 @@ interface SettingsPageProps {
   pathname: string;
   onNavigate: (path: string) => void;
   onBack: () => void;
+  client: AppSupabaseClient;
+  accountEmail: string | null;
+  onGeminiKeyChange: (isConfigured: boolean) => void;
 }
 
 function getErrorMessage(error: unknown): string {
@@ -56,50 +52,6 @@ function statusStyle(status: ApiStatus): string {
   if (status === "active") return "bg-emerald-50 text-emerald-700";
   if (status === "error") return "bg-red-50 text-red-700";
   return "bg-[#f1f2f4] text-[#686b72]";
-}
-
-const sqlTokens =
-  /(--[^\n]*|'(?:''|[^'])*'|\b(?:alter|and|cascade|check|create|default|delete|drop|enable|exists|for|grant|if|index|insert|not|null|on|or|owner|policy|primary|public|references|row|level|security|select|set|table|to|update|using|with)\b|\b(?:auth|authenticated|gen_random_uuid|now|public)\b|\b(?:true|false)\b)/gi;
-
-function highlightSql(source: string) {
-  return source.split(sqlTokens).map((token, index) => {
-    if (token.startsWith("--")) {
-      return (
-        <span key={index} className="text-[#8892a6]">
-          {token}
-        </span>
-      );
-    }
-    if (token.startsWith("'")) {
-      return (
-        <span key={index} className="text-[#a5d6a7]">
-          {token}
-        </span>
-      );
-    }
-    if (/^(auth|authenticated|gen_random_uuid|now|public)$/i.test(token)) {
-      return (
-        <span key={index} className="text-[#82b1ff]">
-          {token}
-        </span>
-      );
-    }
-    if (/^(true|false)$/i.test(token)) {
-      return (
-        <span key={index} className="text-[#ffcc80]">
-          {token}
-        </span>
-      );
-    }
-    if (token.trim()) {
-      return (
-        <span key={index} className="text-[#c792ea]">
-          {token}
-        </span>
-      );
-    }
-    return token;
-  });
 }
 
 type SettingsSection = "home" | "personal" | "configure" | "memory";
@@ -119,7 +71,7 @@ const settingsSections: Array<{
   {
     id: "configure",
     label: "Configure",
-    description: "Supabase database and Gemini API keys",
+    description: "Account sync and Gemini API keys",
     icon: SlidersHorizontal,
   },
   {
@@ -137,12 +89,15 @@ function sectionFromPath(pathname: string): SettingsSection {
     : "home";
 }
 
-export function SettingsPage({ pathname, onNavigate, onBack }: SettingsPageProps) {
+export function SettingsPage({
+  pathname,
+  onNavigate,
+  onBack,
+  client,
+  accountEmail,
+  onGeminiKeyChange,
+}: SettingsPageProps) {
   const [activeSection, setActiveSection] = useState(() => sectionFromPath(pathname));
-  const [databaseUrl, setDatabaseUrl] = useState("");
-  const [publishableKey, setPublishableKey] = useState("");
-  const [config, setConfig] = useState<DatabaseConfig | null>(null);
-  const [client, setClient] = useState<AppSupabaseClient | null>(null);
   const [isDatabaseReady, setIsDatabaseReady] = useState(false);
   const [databaseSessionError, setDatabaseSessionError] = useState("");
   const [apiKeys, setApiKeys] = useState<GeminiApiKey[]>([]);
@@ -152,17 +107,15 @@ export function SettingsPage({ pathname, onNavigate, onBack }: SettingsPageProps
   const [selectedModel, setSelectedModel] = useState<GeminiModel>(GEMINI_MODELS[0]);
   const [newApiKey, setNewApiKey] = useState("");
   const [isHelpOpen, setIsHelpOpen] = useState(false);
-  const [isSavingDatabase, setIsSavingDatabase] = useState(false);
   const [isSavingPersonalization, setIsSavingPersonalization] = useState(false);
   const [isLoadingKeys, setIsLoadingKeys] = useState(false);
   const [isLoadingPersonalization, setIsLoadingPersonalization] = useState(false);
   const [isAddingKey, setIsAddingKey] = useState(false);
   const [busyKeyId, setBusyKeyId] = useState<string | null>(null);
-  const [showPublishableKey, setShowPublishableKey] = useState(false);
   const [showApiKey, setShowApiKey] = useState(false);
-  const [sqlCopied, setSqlCopied] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
   const [notice, setNotice] = useState("");
+  const [isSigningOut, setIsSigningOut] = useState(false);
   const settingsContentRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -187,26 +140,6 @@ export function SettingsPage({ pathname, onNavigate, onBack }: SettingsPageProps
   }
 
   useEffect(() => {
-    try {
-      const saved = loadDatabaseConfig();
-      if (saved) {
-        setConfig(saved);
-        setDatabaseUrl(saved.url);
-        setPublishableKey(saved.publishableKey);
-        setClient(createSupabaseClient(saved));
-      }
-    } catch (error) {
-      setErrorMessage(getErrorMessage(error));
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!client) {
-      setIsDatabaseReady(false);
-      setApiKeys([]);
-      return;
-    }
-
     let isMounted = true;
     setIsDatabaseReady(false);
     setDatabaseSessionError("");
@@ -258,38 +191,6 @@ export function SettingsPage({ pathname, onNavigate, onBack }: SettingsPageProps
   }, [client, isDatabaseReady]);
 
   useEffect(() => {
-    if (!client || !isDatabaseReady || !config) return;
-
-    let isMounted = true;
-    void (async () => {
-      try {
-        const { data, error } = await client.auth.getUser();
-        if (error) throw error;
-        if (!data.user) throw new Error("The private Supabase session has no user ID.");
-
-        const { error: saveError } = await client.from("user_settings").upsert(
-          {
-            user_id: data.user.id,
-            supabase_url: config.url,
-            publishable_key: config.publishableKey,
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: "user_id" },
-        );
-        if (saveError) throw saveError;
-      } catch (error) {
-        if (isMounted) {
-          setErrorMessage(`Database settings could not be saved: ${getErrorMessage(error)}`);
-        }
-      }
-    })();
-
-    return () => {
-      isMounted = false;
-    };
-  }, [client, config, isDatabaseReady]);
-
-  useEffect(() => {
     if (!client || !isDatabaseReady) return;
 
     let isMounted = true;
@@ -308,7 +209,7 @@ export function SettingsPage({ pathname, onNavigate, onBack }: SettingsPageProps
           .maybeSingle();
         if (error) {
           throw new Error(
-            `Could not load Personal settings. Run the latest supabase/schema.sql in your project. ${error.message}`,
+            `Could not load Personal settings. The CheyaVerse database may need the latest supabase/schema.sql. ${error.message}`,
           );
         }
         if (isMounted && data) {
@@ -352,69 +253,12 @@ export function SettingsPage({ pathname, onNavigate, onBack }: SettingsPageProps
     setNotice("");
   }
 
-  async function saveDatabase(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    clearMessages();
-    setDatabaseSessionError("");
-
-    const normalizedUrl = databaseUrl.trim().replace(/\/+$/, "");
-    const nextConfig = {
-      url: normalizedUrl,
-      publishableKey: publishableKey.trim(),
-    };
-
-    try {
-      const parsedUrl = new URL(nextConfig.url);
-      if (parsedUrl.protocol !== "https:") {
-        throw new Error("Use the HTTPS Project URL from your Supabase project settings.");
-      }
-      if (parsedUrl.pathname !== "/" || parsedUrl.search || parsedUrl.hash) {
-        throw new Error("Enter only the Supabase Project URL, without a path or query string.");
-      }
-      if (!nextConfig.publishableKey) {
-        throw new Error("Enter the Supabase publishable (anon) key.");
-      }
-
-      setIsSavingDatabase(true);
-      let response: Response;
-      try {
-        response = await fetch(`${parsedUrl.origin}/auth/v1/settings`, {
-          headers: { apikey: nextConfig.publishableKey },
-          signal: AbortSignal.timeout(10000),
-        });
-      } catch (error) {
-        if (error instanceof DOMException && error.name === "TimeoutError") {
-          throw new Error("Supabase did not respond within 10 seconds. Check the Project URL and try again.");
-        }
-        throw new Error(
-          "Could not reach Supabase Auth. Check the Project URL, publishable key, and network connection.",
-        );
-      }
-      if (!response.ok) {
-        const responseText = await response.text();
-        throw new Error(
-          `Supabase rejected this connection (HTTP ${response.status}). ${
-            responseText || "Check that the Project URL and publishable key belong to the same project."
-          }`,
-        );
-      }
-
-      saveDatabaseConfig(nextConfig);
-      setConfig(nextConfig);
-      setClient(createSupabaseClient(nextConfig));
-    } catch (error) {
-      setErrorMessage(getErrorMessage(error));
-    } finally {
-      setIsSavingDatabase(false);
-    }
-  }
-
   async function savePersonalization(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     clearMessages();
     setPersonalizationError("");
-    if (!client || !isDatabaseReady || !config) {
-      setErrorMessage("Connect your Supabase database in Configure before saving Personal settings.");
+    if (!isDatabaseReady) {
+      setErrorMessage("Sign in with your Google account before saving Personal settings.");
       return;
     }
 
@@ -427,8 +271,6 @@ export function SettingsPage({ pathname, onNavigate, onBack }: SettingsPageProps
       const { error } = await client.from("user_settings").upsert(
         {
           user_id: data.user.id,
-          supabase_url: config.url,
-          publishable_key: config.publishableKey,
           ...personalization,
           updated_at: new Date().toISOString(),
         },
@@ -436,10 +278,11 @@ export function SettingsPage({ pathname, onNavigate, onBack }: SettingsPageProps
       );
       if (error) {
         throw new Error(
-          `Could not save Personal settings. Run the latest supabase/schema.sql in your project. ${error.message}`,
+          `Could not save Personal settings. The CheyaVerse database may need the latest supabase/schema.sql. ${error.message}`,
         );
       }
-      setNotice("Personal settings saved to your Supabase database.");
+
+      setNotice("Personal settings saved to your CheyaVerse account.");
     } catch (error) {
       const detail = getErrorMessage(error);
       setPersonalizationError(detail);
@@ -449,11 +292,24 @@ export function SettingsPage({ pathname, onNavigate, onBack }: SettingsPageProps
     }
   }
 
+  async function signOut() {
+    clearMessages();
+    setIsSigningOut(true);
+    try {
+      const { error } = await client.auth.signOut();
+      if (error) setErrorMessage(`Could not sign out: ${error.message}`);
+    } catch (error) {
+      setErrorMessage(`Could not sign out: ${getErrorMessage(error)}`);
+    } finally {
+      setIsSigningOut(false);
+    }
+  }
+
   async function addApiKey(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     clearMessages();
     if (!client || !isDatabaseReady) {
-      setErrorMessage("Connect your Supabase database before adding API keys.");
+      setErrorMessage("Sign in to your CheyaVerse account before adding API keys.");
       return;
     }
     const key = newApiKey.trim();
@@ -482,6 +338,7 @@ export function SettingsPage({ pathname, onNavigate, onBack }: SettingsPageProps
             a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id),
         ),
       );
+      onGeminiKeyChange(true);
       setNewApiKey("");
       setNotice("Gemini API key added. Test it or send a message to check the connection.");
     } catch (error) {
@@ -551,46 +408,12 @@ export function SettingsPage({ pathname, onNavigate, onBack }: SettingsPageProps
       if (error) throw error;
       if (data.length === 0) throw new Error("The API key was not found or could not be removed.");
       setApiKeys((keys) => keys.filter((key) => key.id !== apiKey.id));
+      onGeminiKeyChange(apiKeys.length > 1);
       setNotice("Gemini API key removed.");
     } catch (error) {
       setErrorMessage(`Could not remove the API key: ${getErrorMessage(error)}`);
     } finally {
       setBusyKeyId(null);
-    }
-  }
-
-  async function copySql() {
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(schemaSql);
-      } else {
-        throw new Error("Clipboard API is unavailable.");
-      }
-      setSqlCopied(true);
-      window.setTimeout(() => setSqlCopied(false), 2000);
-    } catch {
-      let copied = false;
-      const textarea = document.createElement("textarea");
-      try {
-        textarea.value = schemaSql;
-        textarea.setAttribute("readonly", "");
-        textarea.style.position = "fixed";
-        textarea.style.opacity = "0";
-        document.body.append(textarea);
-        textarea.select();
-        copied = document.execCommand("copy");
-      } catch {
-        copied = false;
-      } finally {
-        textarea.remove();
-      }
-
-      if (copied) {
-        setSqlCopied(true);
-        window.setTimeout(() => setSqlCopied(false), 2000);
-      } else {
-        setErrorMessage("Could not copy the SQL. Select the code block and copy it manually.");
-      }
     }
   }
 
@@ -754,7 +577,7 @@ export function SettingsPage({ pathname, onNavigate, onBack }: SettingsPageProps
                   </label>
                   {!isDatabaseReady && (
                     <p className="text-xs leading-5 text-[#858890]">
-                      Connect Supabase in Configure to load and save these settings.
+                      Sign in to load and save these settings to your account.
                     </p>
                   )}
                   <button
@@ -808,23 +631,19 @@ export function SettingsPage({ pathname, onNavigate, onBack }: SettingsPageProps
                   Gemini APIs
                 </h2>
                 <p className="mt-1 text-sm leading-5 text-[#777a81]">
-                  Gemini API keys are private to this browser&apos;s Supabase session. Keys are tried
-                  one by one, rotating after each successful request.
+                  Gemini API keys are private to your signed-in account and sync across its devices.
+                  Keys are tried one by one, rotating after each successful request.
                 </p>
               </div>
             </div>
 
-            {!client || (!isDatabaseReady && !databaseSessionError) ? (
+            {!isDatabaseReady && !databaseSessionError ? (
               <p className="rounded-2xl bg-[#f7f8fa] px-3.5 py-3 text-sm leading-5 text-[#686b72]">
-                {!client
-                  ? "Connect your Supabase database below to add and manage Gemini API keys."
-                  : "Preparing your private database session…"}
+                Preparing your secure account…
               </p>
             ) : databaseSessionError ? (
               <p className="rounded-2xl border border-red-100 bg-red-50 px-3.5 py-3 text-sm leading-5 text-red-800">
-                Database session could not start. In Supabase, enable{" "}
-                <b>Authentication → Sign In / Providers → Anonymous Sign-Ins</b>, then click{" "}
-                <b>Save and connect</b> again.
+                Your account could not connect to the shared CheyaVerse database: {databaseSessionError}
               </p>
             ) : (
               <>
@@ -969,77 +788,45 @@ export function SettingsPage({ pathname, onNavigate, onBack }: SettingsPageProps
           </section>
 
           <section
-            aria-labelledby="database-settings-title"
+            aria-labelledby="account-settings-title"
             className="rounded-[24px] border border-[#e6e8eb] p-4 sm:p-5"
           >
-            <div className="mb-4 flex items-start gap-3">
-              <div className="flex size-10 shrink-0 items-center justify-center rounded-2xl bg-[#eaf5ff] text-[#3186c4]">
-                <Database aria-hidden="true" className="size-5" />
-              </div>
-              <div className="min-w-0 flex-1">
-                <h2 id="database-settings-title" className="font-semibold text-[#202126]">
-                  Supabase database
-                </h2>
-                <p className="mt-1 text-sm leading-5 text-[#777a81]">
-                  Connect your own project. The connection is saved on this device and in your
-                  database. A private anonymous session keeps your settings and API keys separate.
-                </p>
-              </div>
+            <div className="mb-4">
+              <h2 id="account-settings-title" className="font-semibold text-[#202126]">
+                Account sync
+              </h2>
+              <p className="mt-1 text-sm leading-5 text-[#777a81]">
+                Your private settings, Gemini API keys, chats, and memories sync through your account.
+              </p>
             </div>
-
-            <form className="space-y-3" onSubmit={saveDatabase}>
-              <label className="block text-xs font-medium text-[#656870]">
-                Project URL
-                <input
-                  type="url"
-                  value={databaseUrl}
-                  onChange={(event) => setDatabaseUrl(event.target.value)}
-                  placeholder="https://your-project.supabase.co"
-                  autoComplete="url"
-                  className="mt-1.5 h-11 w-full rounded-xl border border-[#e1e3e7] bg-white px-3 text-sm text-[#26272c] outline-none focus:border-[#9380dc]"
-                />
-              </label>
-              <label className="block text-xs font-medium text-[#656870]">
-                Publishable key (anon)
-                <span className="mt-1.5 flex h-11 items-center rounded-xl border border-[#e1e3e7] bg-white px-3 focus-within:border-[#9380dc]">
-                  <input
-                    type={showPublishableKey ? "text" : "password"}
-                    value={publishableKey}
-                    onChange={(event) => setPublishableKey(event.target.value)}
-                    autoComplete="off"
-                    spellCheck={false}
-                    placeholder="Paste your project's publishable key"
-                    className="min-w-0 flex-1 bg-transparent text-sm text-[#26272c] outline-none placeholder:text-[#a2a3a7]"
-                  />
-                  <button
-                    type="button"
-                    aria-label={showPublishableKey ? "Hide publishable key" : "Show publishable key"}
-                    onClick={() => setShowPublishableKey((visible) => !visible)}
-                    className="ml-2 flex size-8 items-center justify-center rounded-full text-[#777a81] hover:bg-[#f4f5f7]"
-                  >
-                    {showPublishableKey ? (
-                      <EyeOff className="size-4" />
-                    ) : (
-                      <Eye className="size-4" />
-                    )}
-                  </button>
-                </span>
-              </label>
-              <button
-                type="submit"
-                disabled={isSavingDatabase}
-                className="flex h-10 w-full items-center justify-center gap-2 rounded-xl border border-[#e1e3e7] bg-white px-4 text-sm font-medium text-[#34363b] transition hover:bg-[#f7f8fa] disabled:opacity-60"
-              >
-                {isSavingDatabase && (
+            {!isDatabaseReady ? (
+              <p className="rounded-2xl bg-[#f7f8fa] px-3.5 py-3 text-sm leading-5 text-[#686b72]">
+                Preparing your signed-in account…
+              </p>
+            ) : (
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex min-w-0 items-center gap-2 rounded-2xl bg-emerald-50 px-3.5 py-3 text-sm text-emerald-800">
+                  <Check aria-hidden="true" className="size-4 shrink-0" />
+                  <span className="min-w-0 truncate">
+                    {accountEmail ?? "Google account connected"}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void signOut()}
+                  disabled={isSigningOut}
+                  className="flex h-10 items-center justify-center gap-2 rounded-full border border-[#e1e3e7] px-4 text-sm font-medium text-[#34363b] hover:bg-[#f7f8fa] disabled:opacity-60"
+                >
+                  {isSigningOut ? (
                   <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                )}
-                Save and connect
-              </button>
-            </form>
-
+                  ) : null}
+                  Sign out
+                </button>
+              </div>
+            )}
             <p className="mt-3 text-xs leading-5 text-[#858890]">
-              Use only the publishable/anon key here. Never enter a Supabase service-role or secret
-              key in a browser app.
+              CheyaVerse manages the shared database. Your data is isolated from other accounts;
+              configure only your Gemini API key below.
             </p>
           </section>
             </>
@@ -1062,99 +849,17 @@ export function SettingsPage({ pathname, onNavigate, onBack }: SettingsPageProps
           >
             <header className="mb-5">
               <h2 id="setup-help-title" className="text-lg font-semibold text-[#202126]">
-                Setup guide
+                Gemini API setup
               </h2>
               <p className="mt-1 text-sm leading-5 text-[#777a81]">
-                Follow these steps to connect your own database and Gemini API keys.
+                CheyaVerse manages the database and Google sign-in. You only need to add your own
+                Gemini API key.
               </p>
             </header>
 
-            <ol className="space-y-5 text-sm leading-6 text-[#55575e]">
+            <ol className="space-y-4 text-sm leading-6 text-[#55575e]">
               <li>
-                <strong className="text-[#27282d]">1. Create a Supabase account and project.</strong>
-                <p className="mt-1">
-                  Open{" "}
-                  <a
-                    href="https://supabase.com/dashboard"
-                    target="_blank"
-                    rel="noreferrer"
-                    className="font-medium text-[#4d65ba] underline underline-offset-2"
-                  >
-                    supabase.com/dashboard
-                  </a>{" "}
-                  and sign in or create an account. Click <b>New project</b>, choose your
-                  organization, then fill in the project name, a strong database password, and a
-                  region close to you. Save the database password somewhere secure; this app does
-                  not ask for or use it. Wait until the project has finished provisioning.
-                </p>
-                <ul className="mt-2 list-disc space-y-1 pl-5 text-[13px] leading-5">
-                  <li>Use your own project: every user needs their own Supabase project.</li>
-                  <li>Never paste the database password or service-role/secret key into this app.</li>
-                  <li>Keep the project region and database password details for your own records.</li>
-                </ul>
-              </li>
-              <li>
-                <strong className="text-[#27282d]">2. Enable anonymous sessions.</strong>
-                <p className="mt-1">
-                  In the Supabase dashboard, open <b>Authentication → Sign In / Providers</b> and
-                  enable <b>Anonymous Sign-Ins</b>. The app creates a private Supabase session
-                  automatically; you do not need to enter an email or password. RLS keeps rows
-                  separated between browser sessions.
-                </p>
-                <p className="mt-2 text-xs leading-5 text-amber-800">
-                  This session is tied to this browser. Clearing browser data or moving to another
-                  device loses access to its Gemini keys; there is no account recovery.
-                </p>
-              </li>
-              <li>
-                <strong className="text-[#27282d]">3. Create the tables and access policies.</strong>
-                <p className="mt-1">
-                  Open <b>SQL Editor → New query</b> in your project. Copy the complete SQL below,
-                  paste it into the editor, and click <b>Run</b>. It creates both tables and enables
-                  Row Level Security (RLS) so each anonymous session can access only its own rows.
-                </p>
-                <div className="relative mt-3 overflow-hidden rounded-2xl border border-[#202638] bg-[#111827]">
-                  <div className="flex h-11 items-center justify-between border-b border-white/10 bg-[#182132] px-3">
-                    <span className="font-mono text-xs text-[#b8c3d8]">supabase/schema.sql</span>
-                    <button
-                      type="button"
-                      onClick={() => void copySql()}
-                      className="flex h-8 items-center gap-1.5 rounded-lg border border-white/15 px-2.5 text-xs font-medium text-[#e3e9f7] hover:bg-white/10"
-                    >
-                      {sqlCopied ? (
-                        <Check aria-hidden="true" className="size-3.5 text-[#a5d6a7]" />
-                      ) : (
-                        <Copy aria-hidden="true" className="size-3.5" />
-                      )}
-                      {sqlCopied ? "Copied" : "Copy SQL"}
-                    </button>
-                  </div>
-                  <pre
-                    aria-label="Supabase schema SQL"
-                    className="max-h-[38dvh] overflow-auto p-4 text-left font-mono text-[11px] leading-[1.65] text-[#d1d9e8] sm:text-xs"
-                  >
-                    <code>{highlightSql(schemaSql)}</code>
-                  </pre>
-                </div>
-                <p className="mt-2 text-xs leading-5 text-[#858890]">
-                  If you already ran an older version of this script, run this updated script again
-                  to add the Personal settings columns and keep Gemini API rows assigned to the
-                  current session.
-                </p>
-              </li>
-              <li>
-                <strong className="text-[#27282d]">4. Copy the Supabase connection details.</strong>
-                <p className="mt-1">
-                  In the dashboard, open <b>Project Settings → API</b> (or <b>API Keys</b>). Copy
-                  the <b>Project URL</b> and the <b>publishable key</b> (or legacy <b>anon</b>{" "}
-                  key). Return here, enter both in <b>Supabase database</b>, then click{" "}
-                  <b>Save and connect</b>. The app checks Supabase, creates a private anonymous
-                  session, and saves the connection settings to the database. Do not use the{" "}
-                  <b>secret</b> or <b>service_role</b> key.
-                </p>
-              </li>
-              <li>
-                <strong className="text-[#27282d]">5. Create a Gemini API key.</strong>
+                <strong className="text-[#27282d]">1. Create a Gemini API key.</strong>
                 <p className="mt-1">
                   Open{" "}
                   <a
@@ -1165,35 +870,22 @@ export function SettingsPage({ pathname, onNavigate, onBack }: SettingsPageProps
                   >
                     Google AI Studio API Keys
                   </a>
-                  , sign in with Google, choose <b>Create API key</b>, select your Google Cloud
-                  project if prompted, and copy the key. Check the project&apos;s Gemini API access,
-                  billing, and usage limits in Google AI Studio/Cloud Console.
+                  , create an API key, and copy it. Never share your key publicly.
                 </p>
               </li>
               <li>
-                <strong className="text-[#27282d]">6. Add and test Gemini APIs.</strong>
+                <strong className="text-[#27282d]">2. Add it to your account.</strong>
                 <p className="mt-1">
-                  In <b>Gemini APIs</b>, choose{" "}
-                  <code className="rounded bg-[#f2f3f5] px-1 py-0.5 text-xs">
-                    gemini-3.1-flash-lite
-                  </code>{" "}
-                  or{" "}
-                  <code className="rounded bg-[#f2f3f5] px-1 py-0.5 text-xs">
-                    gemini-3.5-flash-lite
-                  </code>
-                  , paste the key, and click <b>Add API key</b>. Add more keys if you want. Press
-                  the check button next to a key to send a small test request. A successful test
-                  marks that entry Active. Chat tries keys in rotation and automatically moves to
-                  another one when a Gemini request fails.
+                  Paste the key under <b>Gemini APIs</b> and click <b>Add API key</b>. Use the test
+                  button to verify it. The key is stored with your account and syncs across devices.
                 </p>
               </li>
             </ol>
 
             <div className="mt-5 rounded-2xl border border-amber-100 bg-amber-50 px-3.5 py-3 text-xs leading-5 text-amber-900">
-              The Supabase URL and publishable key are kept on this device to establish the
-              connection. Gemini keys are stored in your Supabase database with RLS. Gemini
-              requests run from your browser. The private anonymous session is specific to this
-              browser and cannot be recovered if its browser data is cleared.
+              Do not paste Google OAuth credentials, database credentials, or service-role keys
+              here. Account sign-in, bot protection, and database infrastructure are managed by
+              CheyaVerse.
             </div>
             <button
               type="button"

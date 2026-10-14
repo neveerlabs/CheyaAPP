@@ -24,27 +24,64 @@ Vite prints the local development URL when the server starts.
 | `npm run build` | Type-check and create a production build in `dist/` |
 | `npm run preview` | Preview the production build locally |
 
-## Supabase and Gemini setup
+## Shared account service setup
 
-Each user connects their own Supabase project. Enable **Anonymous Sign-Ins** in Supabase
-Authentication settings; the app automatically creates a private per-browser session, so no app
-email/password account is needed. Before connecting:
+CheyaVerse uses one operator-managed Supabase project for Google authentication and application
+data. Users do not create or connect their own Supabase or Google OAuth projects. Row Level
+Security isolates each account's chats, Gemini API keys, personalization, memories, feedback, and
+insights.
 
-1. Run [`supabase/schema.sql`](./supabase/schema.sql) in the project's Supabase SQL Editor.
-2. In Settings, enter the Supabase Project URL and publishable (or legacy anon) key.
-3. The app creates a Supabase session automatically. Row Level Security limits settings and Gemini
-   API keys to that browser session.
-4. In **Personal**, set a name, custom prompt, and conversation style. In **Configure**, add one
-   or more Gemini API keys using `gemini-3.1-flash-lite` or `gemini-3.5-flash-lite`.
-5. Run the latest `supabase/schema.sql` whenever the project has an older schema. It adds the
-   chat, insight, memory, and pgvector tables plus the semantic-search functions.
+### One-time operator setup
 
-The Supabase URL and publishable key are retained in the browser as bootstrap settings and copied
-to that session's database. Gemini API keys are stored in the session's Supabase rows and sent from
-the browser directly to Google's Gemini API. Never use a Supabase service-role key in this
-client-side app. Anonymous sessions are specific to a browser; clearing browser data or switching
-devices loses access to that session's data. The Settings page's help button includes the full setup
-checklist and copyable SQL schema.
+1. Run [`supabase/schema.sql`](./supabase/schema.sql) in the shared project's Supabase SQL Editor.
+   Rerun the complete script when updating an existing project.
+2. In Supabase **Authentication → Sign In / Providers**, enable Google. Create a Google OAuth web
+   client and configure the Google provider in Supabase with its client ID and secret. In Google
+   Cloud, authorize the app's local and deployed JavaScript origins, and add the Supabase callback
+   URL shown in the provider setup.
+3. In Supabase **Authentication → Bot and Abuse Protection**, enable Cloudflare Turnstile and enter
+   the Turnstile secret key. The Turnstile site key is a frontend value; the secret key stays in
+   Supabase.
+4. Add these build-time variables in Vercel Project Settings → Environment Variables for the
+   environments you deploy, then redeploy:
+
+   ```env
+   VITE_SUPABASE_URL=https://<project-ref>.supabase.co
+   VITE_SUPABASE_PUBLISHABLE_KEY=<publishable-or-anon-key>
+   VITE_GOOGLE_CLIENT_ID=<google-oauth-web-client-id>
+   VITE_TURNSTILE_SITE_KEY=<cloudflare-turnstile-site-key>
+   ```
+
+   Use the same Supabase project and Google client ID across local development and deployments.
+   These `VITE_*` values are included in the browser bundle and must be public values. Never expose
+   a Supabase service-role/secret key or the Turnstile secret key in Vite, the browser, or Git.
+
+### Local development
+
+Link this repository to the Vercel project, then pull its development environment variables into
+the ignored local environment file:
+
+```bash
+vercel link
+vercel env pull .env.local
+npm install
+npm run dev
+```
+
+Restart Vite after changing environment variables. Keep `.env.local` private and never commit it.
+If you do not use the Vercel CLI, create `.env.local` with only the four `VITE_*` values above.
+
+### User setup and data
+
+Every user must sign in with Google after completing Cloudflare Turnstile verification. The app
+blocks chat and Gemini configuration until the account is signed in; chat also requires at least
+one Gemini API key. Users add their own Gemini key in **Settings → Configure**. The key is stored
+with their Supabase account and sent directly from their browser to Google's Gemini API.
+
+Existing data configured in an older browser can be imported to the central account at sign-in.
+After a successful import, the old browser-specific Supabase connection is removed. The Settings
+help button covers only how users create and add a Gemini API key; Google sign-in, CAPTCHA, and
+database infrastructure are managed by the operator.
 
 Text chat messages, per-message conversation insights, and semantic embeddings are stored in the
 connected Supabase project and protected by row-level security. Gemini analyzes each user message
@@ -58,6 +95,9 @@ underscores are rendered as underline in this app). User messages stay in compac
 replies use the full conversation width and include controls for feedback, regeneration, reporting,
 and copying. The **Think** toggle shows progress stages and an optional user-facing summary of the
 context used; it does not expose private internal reasoning.
+Edited user messages and regenerated replies keep their earlier versions; revising a message also
+starts the active conversation branch from that point. Like/dislike feedback is stored per reply
+version, and regeneration retrieves chat context and insights from before the revised message.
 
 ## Notes
 
