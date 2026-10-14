@@ -80,6 +80,9 @@ type Database = {
 
 export type AppSupabaseClient = SupabaseClient<Database, "public">;
 
+const clients = new Map<string, AppSupabaseClient>();
+const pendingSessions = new WeakMap<AppSupabaseClient, Promise<void>>();
+
 export function loadDatabaseConfig(): DatabaseConfig | null {
   const stored = window.localStorage.getItem(DATABASE_CONFIG_KEY);
   if (!stored) return null;
@@ -114,7 +117,39 @@ export function saveDatabaseConfig(config: DatabaseConfig): void {
 }
 
 export function createSupabaseClient(config: DatabaseConfig): AppSupabaseClient {
-  return createClient<Database, "public">(config.url, config.publishableKey);
+  const cacheKey = JSON.stringify([config.url, config.publishableKey]);
+  const cachedClient = clients.get(cacheKey);
+  if (cachedClient) return cachedClient;
+
+  const client = createClient<Database, "public">(config.url, config.publishableKey);
+  clients.set(cacheKey, client);
+  return client;
+}
+
+export function ensureSupabaseSession(client: AppSupabaseClient): Promise<void> {
+  const pendingSession = pendingSessions.get(client);
+  if (pendingSession) return pendingSession;
+
+  const sessionAttempt = (async () => {
+    const {
+      data: { session },
+      error: sessionError,
+    } = await client.auth.getSession();
+    if (sessionError) throw sessionError;
+    if (session) return;
+
+    const { error } = await client.auth.signInAnonymously();
+    if (error) {
+      throw new Error(
+        `Could not create a private database session. Enable Anonymous Sign-Ins in your Supabase Auth settings. ${error.message}`,
+      );
+    }
+  })();
+
+  pendingSessions.set(client, sessionAttempt);
+  return sessionAttempt.finally(() => {
+    pendingSessions.delete(client);
+  });
 }
 
 export async function saveApiStatus(

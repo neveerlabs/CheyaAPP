@@ -11,7 +11,6 @@ import {
   KeyRound,
   LoaderCircle,
   Plus,
-  ShieldCheck,
   Trash2,
 } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
@@ -19,6 +18,7 @@ import schemaSql from "../supabase/schema.sql?raw";
 import { generateGeminiReply, GeminiFailoverError } from "./lib/gemini";
 import {
   createSupabaseClient,
+  ensureSupabaseSession,
   GEMINI_MODELS,
   loadDatabaseConfig,
   saveApiStatus,
@@ -97,17 +97,15 @@ function highlightSql(source: string) {
 export function SettingsPage({ onBack }: SettingsPageProps) {
   const [databaseUrl, setDatabaseUrl] = useState("");
   const [publishableKey, setPublishableKey] = useState("");
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
   const [config, setConfig] = useState<DatabaseConfig | null>(null);
   const [client, setClient] = useState<AppSupabaseClient | null>(null);
-  const [sessionEmail, setSessionEmail] = useState<string | null>(null);
+  const [isDatabaseReady, setIsDatabaseReady] = useState(false);
+  const [databaseSessionError, setDatabaseSessionError] = useState("");
   const [apiKeys, setApiKeys] = useState<GeminiApiKey[]>([]);
   const [selectedModel, setSelectedModel] = useState<GeminiModel>(GEMINI_MODELS[0]);
   const [newApiKey, setNewApiKey] = useState("");
   const [isHelpOpen, setIsHelpOpen] = useState(false);
   const [isSavingDatabase, setIsSavingDatabase] = useState(false);
-  const [isAuthenticating, setIsAuthenticating] = useState(false);
   const [isLoadingKeys, setIsLoadingKeys] = useState(false);
   const [isAddingKey, setIsAddingKey] = useState(false);
   const [busyKeyId, setBusyKeyId] = useState<string | null>(null);
@@ -134,35 +132,35 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
 
   useEffect(() => {
     if (!client) {
-      setSessionEmail(null);
+      setIsDatabaseReady(false);
       setApiKeys([]);
       return;
     }
 
     let isMounted = true;
-    const {
-      data: { subscription },
-    } = client.auth.onAuthStateChange((_event, session) => {
-      if (isMounted) setSessionEmail(session?.user.email ?? null);
-    });
-
-    void client.auth.getSession().then(({ data, error }) => {
-      if (!isMounted) return;
-      if (error) {
-        setErrorMessage(error.message);
-        return;
-      }
-      setSessionEmail(data.session?.user.email ?? null);
-    });
+    setIsDatabaseReady(false);
+    setDatabaseSessionError("");
+    setNotice("");
+    void ensureSupabaseSession(client)
+      .then(() => {
+        if (isMounted) setIsDatabaseReady(true);
+      })
+      .catch((error: unknown) => {
+        if (isMounted) {
+          const detail = getErrorMessage(error);
+          setDatabaseSessionError(detail);
+          setNotice("");
+          setErrorMessage(`Could not connect to the database: ${detail}`);
+        }
+      });
 
     return () => {
       isMounted = false;
-      subscription.unsubscribe();
     };
   }, [client]);
 
   useEffect(() => {
-    if (!client || !sessionEmail) {
+    if (!client || !isDatabaseReady) {
       setApiKeys([]);
       return;
     }
@@ -187,34 +185,42 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
     return () => {
       isMounted = false;
     };
-  }, [client, sessionEmail]);
+  }, [client, isDatabaseReady]);
 
   useEffect(() => {
-    if (!client || !sessionEmail || !config) return;
+    if (!client || !isDatabaseReady || !config) return;
 
-    void client.auth.getUser().then(async ({ data, error }) => {
-      if (error) {
-        setErrorMessage(error.message);
-        return;
-      }
-      if (!data.user) return;
+    let isMounted = true;
+    void (async () => {
+      try {
+        const { data, error } = await client.auth.getUser();
+        if (error) throw error;
+        if (!data.user) throw new Error("The private Supabase session has no user ID.");
 
-      const { error: saveError } = await client.from("user_settings").upsert(
-        {
-          user_id: data.user.id,
-          supabase_url: config.url,
-          publishable_key: config.publishableKey,
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: "user_id" },
-      );
-      if (saveError) {
-        setErrorMessage(`Database settings could not be saved: ${saveError.message}`);
-      } else {
-        setNotice("Your Supabase connection settings are saved to your account.");
+        const { error: saveError } = await client.from("user_settings").upsert(
+          {
+            user_id: data.user.id,
+            supabase_url: config.url,
+            publishable_key: config.publishableKey,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: "user_id" },
+        );
+        if (saveError) throw saveError;
+        if (isMounted) {
+          setNotice("Supabase connection and Gemini settings are saved to your database.");
+        }
+      } catch (error) {
+        if (isMounted) {
+          setErrorMessage(`Database settings could not be saved: ${getErrorMessage(error)}`);
+        }
       }
-    });
-  }, [client, config, sessionEmail]);
+    })();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [client, config, isDatabaseReady]);
 
   useEffect(() => {
     if (!isHelpOpen) return;
@@ -237,6 +243,7 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
   async function saveDatabase(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     clearMessages();
+    setDatabaseSessionError("");
 
     const normalizedUrl = databaseUrl.trim().replace(/\/+$/, "");
     const nextConfig = {
@@ -283,8 +290,6 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
       saveDatabaseConfig(nextConfig);
       setConfig(nextConfig);
       setClient(createSupabaseClient(nextConfig));
-      setSessionEmail(null);
-      setNotice("Supabase Auth connection verified. Settings saved on this device; sign in to finish connecting.");
     } catch (error) {
       setErrorMessage(getErrorMessage(error));
     } finally {
@@ -292,46 +297,11 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
     }
   }
 
-  async function authenticate(action: "sign-in" | "sign-up") {
-    clearMessages();
-    if (!client) {
-      setErrorMessage("Save your Supabase project settings before signing in.");
-      return;
-    }
-
-    setIsAuthenticating(true);
-    try {
-      const result =
-        action === "sign-in"
-          ? await client.auth.signInWithPassword({ email: email.trim(), password })
-          : await client.auth.signUp({ email: email.trim(), password });
-
-      if (result.error) throw result.error;
-      if (result.data.session) {
-        setNotice(action === "sign-in" ? "Connected to your Supabase account." : "Account created.");
-      } else {
-        setNotice("Account created. Confirm your email, then sign in to continue.");
-      }
-    } catch (error) {
-      setErrorMessage(getErrorMessage(error));
-    } finally {
-      setIsAuthenticating(false);
-    }
-  }
-
-  async function signOut() {
-    if (!client) return;
-    clearMessages();
-    const { error } = await client.auth.signOut();
-    if (error) setErrorMessage(error.message);
-    else setNotice("Signed out. Your saved API keys remain in your Supabase account.");
-  }
-
   async function addApiKey(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     clearMessages();
-    if (!client || !sessionEmail) {
-      setErrorMessage("Connect and sign in to your Supabase account before adding API keys.");
+    if (!client || !isDatabaseReady) {
+      setErrorMessage("Connect your Supabase database before adding API keys.");
       return;
     }
     const key = newApiKey.trim();
@@ -375,11 +345,6 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
     setBusyKeyId(apiKey.id);
     try {
       const reply = await generateGeminiReply([apiKey], "Reply with the word OK.", 0);
-      setApiKeys((keys) =>
-        keys.map((item) =>
-          item.id === apiKey.id ? { ...item, status: "active", last_error: null } : item,
-        ),
-      );
       try {
         await saveApiStatus(client, reply.attempts[0]);
       } catch (statusError) {
@@ -388,6 +353,11 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
         );
         return;
       }
+      setApiKeys((keys) =>
+        keys.map((item) =>
+          item.id === apiKey.id ? { ...item, status: "active", last_error: null } : item,
+        ),
+      );
       setNotice(`${apiKey.model} is active and responded successfully.`);
     } catch (error) {
       const failures = error instanceof GeminiFailoverError ? error.attempts : [];
@@ -550,15 +520,23 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
                   Gemini APIs
                 </h2>
                 <p className="mt-1 text-sm leading-5 text-[#777a81]">
-                  Gemini API keys are private to your signed-in Supabase account. Keys are tried
+                  Gemini API keys are private to this browser&apos;s Supabase session. Keys are tried
                   one by one, rotating after each successful request.
                 </p>
               </div>
             </div>
 
-            {!sessionEmail ? (
+            {!client || (!isDatabaseReady && !databaseSessionError) ? (
               <p className="rounded-2xl bg-[#f7f8fa] px-3.5 py-3 text-sm leading-5 text-[#686b72]">
-                Connect your Supabase database and sign in below to add and manage Gemini API keys.
+                {!client
+                  ? "Connect your Supabase database below to add and manage Gemini API keys."
+                  : "Preparing your private database session…"}
+              </p>
+            ) : databaseSessionError ? (
+              <p className="rounded-2xl border border-red-100 bg-red-50 px-3.5 py-3 text-sm leading-5 text-red-800">
+                Database session could not start. In Supabase, enable{" "}
+                <b>Authentication → Sign In / Providers → Anonymous Sign-Ins</b>, then click{" "}
+                <b>Save and connect</b> again.
               </p>
             ) : (
               <>
@@ -615,7 +593,7 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
                   </label>
                   <button
                     type="submit"
-                    disabled={isAddingKey}
+                    disabled={!isDatabaseReady || isAddingKey}
                     className="flex h-10 w-full items-center justify-center gap-2 rounded-xl bg-[#26272c] px-4 text-sm font-medium text-white transition hover:bg-[#3a3b41] disabled:opacity-60"
                   >
                     {isAddingKey ? (
@@ -715,19 +693,10 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
                   Supabase database
                 </h2>
                 <p className="mt-1 text-sm leading-5 text-[#777a81]">
-                  Connect your own project. The URL and publishable key are bootstrapped on this
-                  device and also saved to your signed-in account.
+                  Connect your own project. The connection is saved on this device and in your
+                  database. A private anonymous session keeps your settings and API keys separate.
                 </p>
               </div>
-              {sessionEmail && (
-                <button
-                  type="button"
-                  onClick={() => void signOut()}
-                  className="shrink-0 rounded-full border border-[#e5e6e9] px-3 py-1.5 text-xs font-medium text-[#55575e] hover:bg-[#f7f8fa]"
-                >
-                  Sign out
-                </button>
-              )}
             </div>
 
             <form className="space-y-3" onSubmit={saveDatabase}>
@@ -779,85 +748,6 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
                 Save and connect
               </button>
             </form>
-
-            <div className="my-4 flex items-center gap-3">
-              <span className="h-px flex-1 bg-[#eceef0]" />
-              <span className="text-[11px] font-medium uppercase tracking-wide text-[#999ba1]">
-                Supabase account
-              </span>
-              <span className="h-px flex-1 bg-[#eceef0]" />
-            </div>
-
-            {sessionEmail ? (
-              <div className="flex items-center gap-2 rounded-2xl bg-emerald-50 px-3.5 py-3 text-sm text-emerald-800">
-                <ShieldCheck aria-hidden="true" className="size-4 shrink-0" />
-                Connected as <span className="truncate font-medium">{sessionEmail}</span>
-              </div>
-            ) : (
-              <form
-                aria-label="Sign in or create a Supabase account"
-                className="space-y-3"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  void authenticate("sign-in");
-                }}
-              >
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <label className="block text-xs font-medium text-[#656870]">
-                    Email
-                    <input
-                      type="email"
-                      value={email}
-                      onChange={(event) => setEmail(event.target.value)}
-                      autoComplete="email"
-                      placeholder="you@example.com"
-                      required
-                      className="mt-1.5 h-11 w-full rounded-xl border border-[#e1e3e7] bg-white px-3 text-sm text-[#26272c] outline-none focus:border-[#9380dc]"
-                    />
-                  </label>
-                  <label className="block text-xs font-medium text-[#656870]">
-                    Password
-                    <input
-                      type="password"
-                      value={password}
-                      onChange={(event) => setPassword(event.target.value)}
-                      autoComplete="current-password"
-                      placeholder="Your Supabase account password"
-                      required
-                      className="mt-1.5 h-11 w-full rounded-xl border border-[#e1e3e7] bg-white px-3 text-sm text-[#26272c] outline-none focus:border-[#9380dc]"
-                    />
-                  </label>
-                </div>
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    type="submit"
-                    disabled={!client || isAuthenticating}
-                    className="flex h-10 items-center justify-center gap-2 rounded-xl bg-[#26272c] px-3 text-sm font-medium text-white hover:bg-[#3a3b41] disabled:opacity-50"
-                  >
-                    {isAuthenticating && <LoaderCircle className="size-4 animate-spin" />}
-                    Sign in
-                  </button>
-                  <button
-                    type="button"
-                    disabled={!client || isAuthenticating}
-                    onClick={(event) => {
-                      const form = event.currentTarget.form;
-                      if (form?.reportValidity()) {
-                        void authenticate("sign-up");
-                      }
-                    }}
-                    className="h-10 rounded-xl border border-[#e1e3e7] bg-white px-3 text-sm font-medium text-[#34363b] hover:bg-[#f7f8fa] disabled:opacity-50"
-                  >
-                    Create account
-                  </button>
-                </div>
-                {!client && (
-                  <p className="text-xs leading-5 text-[#858890]">
-                    Save a valid Supabase Project URL and publishable key to enable sign-in.
-                  </p>
-                )}
-              </form>
-            )}
 
             <p className="mt-3 text-xs leading-5 text-[#858890]">
               Use only the publishable/anon key here. Never enter a Supabase service-role or secret
@@ -914,13 +804,16 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
                 </ul>
               </li>
               <li>
-                <strong className="text-[#27282d]">2. Set up email sign-in.</strong>
+                <strong className="text-[#27282d]">2. Enable anonymous sessions.</strong>
                 <p className="mt-1">
                   In the Supabase dashboard, open <b>Authentication → Sign In / Providers</b> and
-                  make sure the <b>Email</b> provider is enabled. Email confirmation may remain
-                  enabled; if it is, confirm the email Supabase sends after you create your app
-                  account. The app uses Supabase Auth to keep each user&apos;s settings and API keys
-                  private.
+                  enable <b>Anonymous Sign-Ins</b>. The app creates a private Supabase session
+                  automatically; you do not need to enter an email or password. RLS keeps rows
+                  separated between browser sessions.
+                </p>
+                <p className="mt-2 text-xs leading-5 text-amber-800">
+                  This session is tied to this browser. Clearing browser data or moving to another
+                  device loses access to its Gemini keys; there is no account recovery.
                 </p>
               </li>
               <li>
@@ -928,7 +821,7 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
                 <p className="mt-1">
                   Open <b>SQL Editor → New query</b> in your project. Copy the complete SQL below,
                   paste it into the editor, and click <b>Run</b>. It creates both tables and enables
-                  Row Level Security (RLS) so a signed-in user can access only their own rows.
+                  Row Level Security (RLS) so each anonymous session can access only its own rows.
                 </p>
                 <div className="relative mt-3 overflow-hidden rounded-2xl border border-[#202638] bg-[#111827]">
                   <div className="flex h-11 items-center justify-between border-b border-white/10 bg-[#182132] px-3">
@@ -954,8 +847,8 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
                   </pre>
                 </div>
                 <p className="mt-2 text-xs leading-5 text-[#858890]">
-                  If you already ran an older version of this script, run this updated script again:
-                  it also adds the authenticated user&apos;s ID as the default for new Gemini API rows.
+                  If you already ran an older version of this script, run this updated script again
+                  so new Gemini API rows get the current session&apos;s user ID automatically.
                 </p>
               </li>
               <li>
@@ -964,9 +857,9 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
                   In the dashboard, open <b>Project Settings → API</b> (or <b>API Keys</b>). Copy
                   the <b>Project URL</b> and the <b>publishable key</b> (or legacy <b>anon</b>{" "}
                   key). Return here, enter both in <b>Supabase database</b>, then click{" "}
-                  <b>Save and connect</b>. The app checks that the Auth service is reachable before
-                  saving. Then create your account with email and password or sign in. Do not use
-                  the <b>secret</b> or <b>service_role</b> key.
+                  <b>Save and connect</b>. The app checks Supabase, creates a private anonymous
+                  session, and saves the connection settings to the database. Do not use the{" "}
+                  <b>secret</b> or <b>service_role</b> key.
                 </p>
               </li>
               <li>
@@ -1008,8 +901,8 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
             <div className="mt-5 rounded-2xl border border-amber-100 bg-amber-50 px-3.5 py-3 text-xs leading-5 text-amber-900">
               The Supabase URL and publishable key are kept on this device to establish the
               connection. Gemini keys are stored in your Supabase database with RLS. Gemini
-              requests run from your browser, so your keys are available to this app while you are
-              signed in. Protect your device and Supabase account.
+              requests run from your browser. The private anonymous session is specific to this
+              browser and cannot be recovered if its browser data is cleared.
             </div>
             <button
               type="button"

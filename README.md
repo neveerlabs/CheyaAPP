@@ -26,19 +26,22 @@ Vite prints the local development URL when the server starts.
 
 ## Supabase and Gemini setup
 
-Each user connects their own Supabase project and signs in with Supabase Auth. Enable the Email
-provider in Supabase Authentication settings. Before connecting:
+Each user connects their own Supabase project. Enable **Anonymous Sign-Ins** in Supabase
+Authentication settings; the app automatically creates a private per-browser session, so no app
+email/password account is needed. Before connecting:
 
 1. Run [`supabase/schema.sql`](./supabase/schema.sql) in the project's Supabase SQL Editor.
 2. In Settings, enter the Supabase Project URL and publishable (or legacy anon) key.
-3. Create an account or sign in. Row Level Security limits settings and Gemini API keys to that account.
+3. The app creates a Supabase session automatically. Row Level Security limits settings and Gemini
+   API keys to that browser session.
 4. Add one or more Gemini API keys and select `gemini-3.1-flash-lite` or `gemini-3.5-flash-lite`.
 
 The Supabase URL and publishable key are retained in the browser as bootstrap settings and copied
-to the signed-in user's database. Gemini API keys are stored in that user's Supabase table and sent
-from the browser directly to Google's Gemini API. Never use a Supabase service-role key in this
-client-side app. A user who can sign in can access their own Gemini keys from their browser. The
-Settings page's `?` help button includes the full setup checklist and copyable SQL schema.
+to that session's database. Gemini API keys are stored in the session's Supabase rows and sent from
+the browser directly to Google's Gemini API. Never use a Supabase service-role key in this
+client-side app. Anonymous sessions are specific to a browser; clearing browser data or switching
+devices loses access to that session's data. The Settings page's help button includes the full setup
+checklist and copyable SQL schema.
 
 ## Notes
 

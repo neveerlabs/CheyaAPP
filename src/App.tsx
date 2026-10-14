@@ -346,24 +346,19 @@ export function App() {
     let saveStatus: typeof import("./lib/supabase").saveApiStatus | null = null;
 
     try {
-      const { createSupabaseClient, loadDatabaseConfig, saveApiStatus } = await import(
-        "./lib/supabase"
-      );
+      const {
+        createSupabaseClient,
+        ensureSupabaseSession,
+        loadDatabaseConfig,
+        saveApiStatus,
+      } = await import("./lib/supabase");
       saveStatus = saveApiStatus;
       const config = loadDatabaseConfig();
       if (!config) {
         throw new Error("Connect your own Supabase project in Settings before using chat.");
       }
       client = createSupabaseClient(config);
-
-      const {
-        data: { session },
-        error: sessionError,
-      } = await client.auth.getSession();
-      if (sessionError) throw sessionError;
-      if (!session) {
-        throw new Error("Sign in to your Supabase account in Settings before using chat.");
-      }
+      await ensureSupabaseSession(client);
 
       const { data: keys, error: keysError } = await client
         .from("ai_api_keys")
