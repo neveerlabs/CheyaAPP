@@ -35,6 +35,45 @@ export type GeminiApiKey = {
   created_at: string;
 }
 
+export type StoredChatMessage = {
+  id: string;
+  user_id: string;
+  role: "user" | "assistant";
+  content: string;
+  created_at: string;
+};
+
+export type MessageInsight = {
+  id: string;
+  user_id: string;
+  message_id: string;
+  mood: string;
+  communication_style: string;
+  situation: string;
+  topics: string[];
+  support_needs: string;
+  summary: string;
+  created_at: string;
+};
+
+export type UserMemory = {
+  id: string;
+  user_id: string;
+  category: string;
+  content: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type MessageFeedback = {
+  id: string;
+  user_id: string;
+  message_id: string;
+  kind: "like" | "dislike" | "report";
+  details: string | null;
+  created_at: string;
+};
+
 type Database = {
   public: {
     Tables: {
@@ -91,9 +130,109 @@ type Database = {
         }>;
         Relationships: never[];
       };
+      chat_messages: {
+        Row: StoredChatMessage;
+        Insert: {
+          id?: string;
+          user_id?: string;
+          role: StoredChatMessage["role"];
+          content: string;
+          embedding?: string | null;
+          created_at?: string;
+        };
+        Update: Partial<{
+          role: StoredChatMessage["role"];
+          content: string;
+          embedding: string | null;
+        }>;
+        Relationships: never[];
+      };
+      message_insights: {
+        Row: MessageInsight;
+        Insert: {
+          id?: string;
+          user_id?: string;
+          message_id: string;
+          mood?: string;
+          communication_style?: string;
+          situation?: string;
+          topics?: string[];
+          support_needs?: string;
+          summary?: string;
+          created_at?: string;
+        };
+        Update: Partial<{
+          mood: string;
+          communication_style: string;
+          situation: string;
+          topics: string[];
+          support_needs: string;
+          summary: string;
+        }>;
+        Relationships: never[];
+      };
+      user_memories: {
+        Row: UserMemory;
+        Insert: {
+          id?: string;
+          user_id?: string;
+          category?: string;
+          content: string;
+          embedding?: string | null;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: Partial<{
+          category: string;
+          content: string;
+          embedding: string | null;
+          updated_at: string;
+        }>;
+        Relationships: never[];
+      };
+      message_feedback: {
+        Row: MessageFeedback;
+        Insert: {
+          id?: string;
+          user_id?: string;
+          message_id: string;
+          kind: MessageFeedback["kind"];
+          details?: string | null;
+          created_at?: string;
+        };
+        Update: Partial<{
+          kind: MessageFeedback["kind"];
+          details: string | null;
+        }>;
+        Relationships: never[];
+      };
     };
     Views: { [_ in never]: never };
-    Functions: { [_ in never]: never };
+    Functions: {
+      match_chat_messages: {
+        Args: {
+          query_embedding: string;
+          result_limit?: number;
+          exclude_message_id?: string | null;
+        };
+        Returns: Array<{
+          id: string;
+          role: StoredChatMessage["role"];
+          content: string;
+          created_at: string;
+          similarity: number;
+        }>;
+      };
+      match_user_memories: {
+        Args: { query_embedding: string; result_limit?: number };
+        Returns: Array<{
+          id: string;
+          category: string;
+          content: string;
+          similarity: number;
+        }>;
+      };
+    };
     Enums: { [_ in never]: never };
     CompositeTypes: { [_ in never]: never };
   };

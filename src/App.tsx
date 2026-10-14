@@ -5,22 +5,39 @@ import {
   Brain,
   Bug,
   Camera,
+  Check,
+  ChevronDown,
+  ChevronUp,
+  Copy,
   Files,
   Image,
   LoaderCircle,
   Mic,
   Plus,
+  RotateCw,
   X,
   Settings,
   Send,
+  ThumbsDown,
+  ThumbsUp,
 } from "lucide-react";
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import avatarUrl from "../assets/cheyaverse.jpg";
-import { generateGeminiReply, GeminiFailoverError } from "./lib/gemini";
+import {
+  analyzeGeminiMessage,
+  generateGeminiConversation,
+  GeminiFailoverError,
+  type GeminiAttempt,
+} from "./lib/gemini";
 import type { AppSupabaseClient } from "./lib/supabase";
 
 const SettingsPage = lazy(() =>
   import("./SettingsPage").then((module) => ({ default: module.SettingsPage })),
+);
+const AssistantMarkdown = lazy(() =>
+  import("./components/AssistantMarkdown").then((module) => ({
+    default: module.AssistantMarkdown,
+  })),
 );
 
 const headerActions = [
@@ -30,15 +47,28 @@ const headerActions = [
 const MAX_ATTACHMENTS = 10;
 
 interface ChatMessage {
-  id: number;
+  id: string;
   role: "user" | "assistant";
   text: string;
+  thinkingSummary?: string[];
 }
 
 interface AttachmentView {
   index: number;
   mode: "media" | "editor";
 }
+
+interface DeleteConfirmation {
+  label: string;
+  preview: string;
+}
+
+interface ReportTarget {
+  id: string;
+  text: string;
+}
+
+type AssistantRating = "like" | "dislike";
 
 const textFileExtensions = new Set([
   "c",
@@ -84,6 +114,18 @@ export function App() {
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isSending, setIsSending] = useState(false);
+  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const [isThinkMode, setIsThinkMode] = useState(false);
+  const [thinkingSteps, setThinkingSteps] = useState<string[]>([]);
+  const [expandedThinkingIds, setExpandedThinkingIds] = useState<Set<string>>(() => new Set());
+  const [ratings, setRatings] = useState<Record<string, AssistantRating>>({});
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const [reportTarget, setReportTarget] = useState<ReportTarget | null>(null);
+  const [reportDetails, setReportDetails] = useState("");
+  const [reportError, setReportError] = useState("");
+  const [isSavingReport, setIsSavingReport] = useState(false);
+  const [actionNotice, setActionNotice] = useState("");
+  const [deleteConfirmation, setDeleteConfirmation] = useState<DeleteConfirmation | null>(null);
   const [sendError, setSendError] = useState("");
   const [isMediaMenuOpen, setIsMediaMenuOpen] = useState(false);
   const [attachedMedia, setAttachedMedia] = useState<File[]>([]);
@@ -97,8 +139,8 @@ export function App() {
   const cameraCaptureInputRef = useRef<HTMLInputElement>(null);
   const messageInputRef = useRef<HTMLTextAreaElement>(null);
   const nextApiIndexRef = useRef(0);
-  const nextMessageIdRef = useRef(0);
   const attachmentViewRequestRef = useRef(0);
+  const deleteConfirmationResolverRef = useRef<((approved: boolean) => void) | null>(null);
   const wasSettingsRef = useRef(window.location.pathname === "/settings");
   const hasMessage = message.trim().length > 0 || attachedMedia.length > 0;
   const mediaPreviews = useMemo(
@@ -110,6 +152,20 @@ export function App() {
       ),
     [attachedMedia],
   );
+
+  function requestDeleteConfirmation(label: string, preview: string): Promise<boolean> {
+    if (deleteConfirmationResolverRef.current) return Promise.resolve(false);
+    setDeleteConfirmation({ label, preview });
+    return new Promise((resolve) => {
+      deleteConfirmationResolverRef.current = resolve;
+    });
+  }
+
+  function resolveDeleteConfirmation(approved: boolean) {
+    deleteConfirmationResolverRef.current?.(approved);
+    deleteConfirmationResolverRef.current = null;
+    setDeleteConfirmation(null);
+  }
 
   useEffect(
     () => () => {
@@ -135,6 +191,68 @@ export function App() {
       visualViewport?.removeEventListener("resize", updateViewport);
       visualViewport?.removeEventListener("scroll", updateViewport);
       window.removeEventListener("resize", updateViewport);
+    };
+  }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+    void (async () => {
+      try {
+        const {
+          createSupabaseClient,
+          ensureSupabaseSession,
+          loadDatabaseConfig,
+        } = await import("./lib/supabase");
+        const config = loadDatabaseConfig();
+        if (!config) return;
+        setIsLoadingHistory(true);
+        const client = createSupabaseClient(config);
+        await ensureSupabaseSession(client);
+        const { loadRecentChatMessages } = await import("./lib/chat-data");
+        const savedMessages = await loadRecentChatMessages(client);
+        const assistantMessages = savedMessages.filter((item) => item.role === "assistant");
+        const loadedRatings: Record<string, AssistantRating> = {};
+        if (assistantMessages.length > 0) {
+          const { data: feedback, error: feedbackError } = await client
+            .from("message_feedback")
+            .select("message_id, kind")
+            .in("message_id", assistantMessages.map((item) => item.id))
+            .in("kind", ["like", "dislike"]);
+          if (feedbackError) {
+            setSendError(
+              `Could not load saved response feedback. Run the latest supabase/schema.sql. ${feedbackError.message}`,
+            );
+          } else {
+            feedback.forEach((item) => {
+              if (item.kind === "like" || item.kind === "dislike") {
+                loadedRatings[item.message_id] = item.kind;
+              }
+            });
+          }
+        }
+        if (isMounted) {
+          setRatings(loadedRatings);
+          setMessages(
+            savedMessages.map(({ id, role, content }) => ({
+              id,
+              role,
+              text: content,
+            })),
+          );
+        }
+      } catch (error) {
+        if (isMounted) {
+          setSendError(
+            error instanceof Error ? error.message : "Could not load saved chat history.",
+          );
+        }
+      } finally {
+        if (isMounted) setIsLoadingHistory(false);
+      }
+    })();
+
+    return () => {
+      isMounted = false;
     };
   }, []);
 
@@ -352,14 +470,24 @@ export function App() {
   async function sendMessage() {
     const prompt = message.trim();
     if (!prompt) {
-      setSendError("Write a message before sending it to Gemini.");
+      setSendError("Write a message before sending it.");
+      return;
+    }
+    if (prompt.length > 50000) {
+      setSendError("Messages must be 50,000 characters or fewer.");
       return;
     }
 
     setSendError("");
+    setActionNotice("");
     setIsSending(true);
+    const showThinking = isThinkMode;
+    setThinkingSteps(showThinking ? ["Membaca pesan dan konteks percakapan…"] : []);
     let client: AppSupabaseClient | null = null;
     let saveStatus: typeof import("./lib/supabase").saveApiStatus | null = null;
+    const attempts: GeminiAttempt[] = [];
+    const warnings: string[] = [];
+    let savedUserMessage: ChatMessage | null = null;
 
     try {
       const {
@@ -369,6 +497,15 @@ export function App() {
         loadDatabaseConfig,
         saveApiStatus,
       } = await import("./lib/supabase");
+      const {
+        createEmbedding,
+        executeChatDataTool,
+        findRelevantContext,
+        loadRecentChatMessages,
+        loadRecentInsights,
+        saveChatMessage,
+        saveMessageInsight,
+      } = await import("./lib/chat-data");
       saveStatus = saveApiStatus;
       const config = loadDatabaseConfig();
       if (!config) {
@@ -405,40 +542,236 @@ export function App() {
         );
       }
 
-      const result = await generateGeminiReply(
+      const selectedIndex = ((nextApiIndexRef.current % keys.length) + keys.length) % keys.length;
+      const selectedKey = keys[selectedIndex];
+      if (showThinking) setThinkingSteps(["Memuat riwayat dan preferensi percakapan…"]);
+      const history = await loadRecentChatMessages(client, 20);
+      let userEmbedding: number[] | null = null;
+      try {
+        userEmbedding = await createEmbedding(selectedKey.api_key, prompt, "RETRIEVAL_DOCUMENT");
+      } catch (error) {
+        warnings.push(
+          `The message will be saved without a searchable embedding: ${
+            error instanceof Error ? error.message : "Could not create an embedding."
+          }`,
+        );
+      }
+
+      const persistedUserMessage = await saveChatMessage(client, "user", prompt, userEmbedding);
+      const newUserMessage = {
+        id: persistedUserMessage.id,
+        role: persistedUserMessage.role,
+        text: persistedUserMessage.content,
+      };
+      savedUserMessage = newUserMessage;
+      setMessages((current) => [...current, newUserMessage]);
+      setMessage("");
+      setAttachedMedia([]);
+      if (messageInputRef.current) messageInputRef.current.style.height = "52px";
+      if (showThinking) {
+        setThinkingSteps([
+          "Memuat riwayat dan preferensi percakapan…",
+          "Menganalisis pesan dan mencari konteks yang relevan…",
+        ]);
+      }
+
+      let currentInsight:
+        | Awaited<ReturnType<typeof analyzeGeminiMessage>>["insight"]
+        | undefined;
+      let queryEmbedding: number[] | null = null;
+      let insights: Awaited<ReturnType<typeof loadRecentInsights>> = [];
+      const [analysisResult, queryEmbeddingResult, insightsResult] = await Promise.allSettled([
+        analyzeGeminiMessage(keys, prompt, selectedIndex),
+        createEmbedding(selectedKey.api_key, prompt, "RETRIEVAL_QUERY"),
+        loadRecentInsights(client, 12, persistedUserMessage.id),
+      ]);
+
+      if (analysisResult.status === "fulfilled") {
+        const analysis = analysisResult.value;
+        attempts.push(...analysis.attempts);
+        currentInsight = analysis.insight;
+        nextApiIndexRef.current = (analysis.keyIndex + 1) % keys.length;
+      } else {
+        if (analysisResult.reason instanceof GeminiFailoverError) {
+          attempts.push(...analysisResult.reason.attempts);
+        }
+        warnings.push(
+          `Message insight was not saved: ${
+            analysisResult.reason instanceof Error
+              ? analysisResult.reason.message
+              : "Unknown analysis error."
+          }`,
+        );
+      }
+
+      if (queryEmbeddingResult.status === "fulfilled") {
+        queryEmbedding = queryEmbeddingResult.value;
+      } else {
+        warnings.push(
+          `Semantic history search is unavailable: ${
+            queryEmbeddingResult.reason instanceof Error
+              ? queryEmbeddingResult.reason.message
+              : "Could not create a retrieval query."
+          }`,
+        );
+      }
+      if (insightsResult.status === "fulfilled") {
+        insights = insightsResult.value;
+      } else {
+        warnings.push(
+          `Conversation insight lookup failed: ${
+            insightsResult.reason instanceof Error
+              ? insightsResult.reason.message
+              : "Unknown database error."
+          }`,
+        );
+      }
+
+      let relevantMessages: Array<{ role: "user" | "assistant"; content: string }> = [];
+      let memories: Array<{ category: string; content: string }> = [];
+      const contextResults = await Promise.allSettled([
+        queryEmbedding
+          ? findRelevantContext(client, queryEmbedding, persistedUserMessage.id)
+          : Promise.resolve(null),
+        currentInsight
+          ? saveMessageInsight(client, persistedUserMessage.id, currentInsight)
+          : Promise.resolve(),
+      ]);
+      if (contextResults[0].status === "fulfilled" && contextResults[0].value) {
+        relevantMessages = contextResults[0].value.messages;
+        memories = contextResults[0].value.memories;
+      } else if (contextResults[0].status === "rejected") {
+        warnings.push(
+          `Semantic history lookup failed: ${
+            contextResults[0].reason instanceof Error
+              ? contextResults[0].reason.message
+              : "Unknown retrieval error."
+          }`,
+        );
+      }
+      if (contextResults[1].status === "rejected") {
+        warnings.push(
+          `Message insight was not saved: ${
+            contextResults[1].reason instanceof Error
+              ? contextResults[1].reason.message
+              : "Unknown analysis error."
+          }`,
+        );
+      }
+      if (currentInsight) insights = [...insights, currentInsight];
+
+      if (showThinking) {
+        setThinkingSteps((steps) => [...steps, "Menyusun jawaban berdasarkan konteks…"]);
+      }
+      const result = await generateGeminiConversation(
         keys,
         prompt,
         nextApiIndexRef.current,
         profile ?? DEFAULT_PERSONALIZATION,
+        {
+          history: history.slice(-12),
+          relevantMessages,
+          memories,
+          insights: insights.slice(-12),
+          executeTool: (name, input, apiKey) =>
+            executeChatDataTool(client!, apiKey, name, input, requestDeleteConfirmation),
+        },
       );
+      attempts.push(...result.attempts);
       nextApiIndexRef.current = (result.keyIndex + 1) % keys.length;
+
+      let assistantEmbedding: number[] | null = null;
+      try {
+        assistantEmbedding = await createEmbedding(
+          keys[result.keyIndex].api_key,
+          result.text,
+          "RETRIEVAL_DOCUMENT",
+        );
+      } catch (error) {
+        warnings.push(
+          `The reply will be saved, but semantic retrieval is unavailable for it: ${
+            error instanceof Error ? error.message : "Could not create an embedding."
+          }`,
+        );
+      }
+      let assistantSaved = false;
+      try {
+        const persistedReply = await saveChatMessage(
+          client,
+          "assistant",
+          result.text,
+          assistantEmbedding,
+        );
+        setMessages((current) => [
+          ...current,
+          {
+            id: persistedReply.id,
+            role: persistedReply.role,
+            text: persistedReply.content,
+            ...(showThinking
+              ? {
+                  thinkingSummary: [
+                    "Memahami inti pesan dan konteks percakapan.",
+                    ...(history.length > 0 ? ["Mempertimbangkan riwayat chat terbaru."] : []),
+                    ...(relevantMessages.length > 0 || memories.length > 0
+                      ? ["Memakai konteks relevan yang tersimpan."]
+                      : []),
+                    "Menyusun jawaban ringkas sesuai gaya obrolan yang dipilih.",
+                  ],
+                }
+              : {}),
+          },
+        ]);
+        assistantSaved = true;
+      } catch (error) {
+        setMessages((current) => [
+          ...current,
+          { id: `unsaved-${Date.now()}`, role: "assistant", text: result.text },
+        ]);
+        warnings.push(
+          `The reply arrived but was not saved to the database: ${
+            error instanceof Error ? error.message : "Unknown database error."
+          }`,
+        );
+      }
+
+      try {
+        const refreshedHistory = await loadRecentChatMessages(client);
+        setMessages([
+          ...refreshedHistory.map(({ id, role, content }) => ({ id, role, text: content })),
+          ...(!assistantSaved ? [{ id: `unsaved-${Date.now()}`, role: "assistant" as const, text: result.text }] : []),
+        ]);
+      } catch (error) {
+        warnings.push(
+          `The chat is updated, but could not be refreshed after database actions: ${
+            error instanceof Error ? error.message : "Unknown database error."
+          }`,
+        );
+      }
+
+      const latestAttemptsByKey = new Map<string, GeminiAttempt>();
+      attempts.forEach((attempt) => latestAttemptsByKey.set(attempt.keyId, attempt));
       const statusErrors: string[] = [];
-      for (const attempt of result.attempts) {
+      for (const attempt of latestAttemptsByKey.values()) {
         try {
           await saveStatus(client, attempt);
         } catch (error) {
           statusErrors.push(error instanceof Error ? error.message : "Could not save API status.");
         }
       }
-
-      const userMessageId = nextMessageIdRef.current++;
-      const responseMessageId = nextMessageIdRef.current++;
-      setMessages((current) => [
-        ...current,
-        { id: userMessageId, role: "user", text: prompt },
-        { id: responseMessageId, role: "assistant", text: result.text },
-      ]);
-      setMessage("");
-      setAttachedMedia([]);
-      if (messageInputRef.current) messageInputRef.current.style.height = "52px";
       if (statusErrors.length > 0) {
-        setSendError(`Reply received, but API status could not be saved: ${statusErrors.join("; ")}`);
+        warnings.push(`Gemini API status could not be saved: ${statusErrors.join("; ")}`);
       }
+      if (warnings.length > 0) setSendError(warnings.join("\n"));
+      setThinkingSteps([]);
     } catch (error) {
       let detail = error instanceof Error ? error.message : "An unexpected error occurred.";
-      if (client && saveStatus && error instanceof GeminiFailoverError) {
+      if (error instanceof GeminiFailoverError) attempts.push(...error.attempts);
+      if (client && saveStatus) {
+        const latestAttemptsByKey = new Map<string, GeminiAttempt>();
+        attempts.forEach((attempt) => latestAttemptsByKey.set(attempt.keyId, attempt));
         const statusErrors: string[] = [];
-        for (const attempt of error.attempts) {
+        for (const attempt of latestAttemptsByKey.values()) {
           try {
             await saveStatus(client, attempt);
           } catch (statusError) {
@@ -451,8 +784,252 @@ export function App() {
           detail += `\nAPI status could not be saved: ${statusErrors.join("; ")}`;
         }
       }
+      if (savedUserMessage) {
+        detail = `Your message was saved, but the assistant could not complete the reply.\n${detail}`;
+      }
       setSendError(detail);
+      setThinkingSteps([]);
     } finally {
+      setIsSending(false);
+    }
+  }
+
+  async function handleAssistantRating(messageId: string, rating: AssistantRating) {
+    const nextRating = ratings[messageId] === rating ? null : rating;
+    try {
+      const [
+        { createSupabaseClient, ensureSupabaseSession, loadDatabaseConfig },
+        { saveAssistantRating },
+      ] = await Promise.all([import("./lib/supabase"), import("./lib/chat-data")]);
+      const config = loadDatabaseConfig();
+      if (!config) throw new Error("Connect your Supabase database before rating a reply.");
+      const client = createSupabaseClient(config);
+      await ensureSupabaseSession(client);
+      await saveAssistantRating(client, messageId, nextRating);
+      setRatings((current) => {
+        const updated = { ...current };
+        if (nextRating) updated[messageId] = nextRating;
+        else delete updated[messageId];
+        return updated;
+      });
+      setActionNotice(nextRating ? "Thanks for the feedback." : "Feedback removed.");
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : "Could not save feedback.");
+    }
+  }
+
+  async function submitAssistantReport() {
+    if (!reportTarget) return;
+    const details = reportDetails.trim();
+    if (!details) {
+      setReportError("Write a short description before sending a report.");
+      return;
+    }
+    setIsSavingReport(true);
+    setReportError("");
+    try {
+      const [
+        { createSupabaseClient, ensureSupabaseSession, loadDatabaseConfig },
+        { saveAssistantReport },
+      ] = await Promise.all([import("./lib/supabase"), import("./lib/chat-data")]);
+      const config = loadDatabaseConfig();
+      if (!config) throw new Error("Connect your Supabase database before reporting a reply.");
+      const client = createSupabaseClient(config);
+      await ensureSupabaseSession(client);
+      await saveAssistantReport(client, reportTarget.id, details);
+      setReportTarget(null);
+      setReportDetails("");
+      setReportError("");
+      setActionNotice("Report saved. Thanks for letting us know.");
+    } catch (error) {
+      setReportError(error instanceof Error ? error.message : "Could not save this report.");
+    } finally {
+      setIsSavingReport(false);
+    }
+  }
+
+  async function copyAssistantMessage(chatMessage: ChatMessage) {
+    try {
+      await navigator.clipboard.writeText(chatMessage.text);
+      setCopiedMessageId(chatMessage.id);
+      window.setTimeout(() => {
+        setCopiedMessageId((current) => (current === chatMessage.id ? null : current));
+      }, 1800);
+    } catch (error) {
+      setSendError(
+        error instanceof Error
+          ? `Could not copy this reply: ${error.message}`
+          : "Could not copy this reply.",
+      );
+    }
+  }
+
+  async function regenerateAssistantMessage(messageId: string) {
+    if (isSending) return;
+    const assistantIndex = messages.findIndex((item) => item.id === messageId);
+    const sourceIndex = assistantIndex - 1;
+    const sourceMessage = sourceIndex >= 0 ? messages[sourceIndex] : undefined;
+    if (
+      assistantIndex < 0 ||
+      messages[assistantIndex].role !== "assistant" ||
+      !sourceMessage ||
+      sourceMessage.role !== "user"
+    ) {
+      setSendError("Could not find the user message for this reply.");
+      return;
+    }
+
+    setIsSending(true);
+    setSendError("");
+    setActionNotice("");
+    const showThinking = isThinkMode;
+    setThinkingSteps(showThinking ? ["Mencari konteks untuk menyusun ulang jawaban…"] : []);
+    try {
+      const [
+        {
+          createSupabaseClient,
+          DEFAULT_PERSONALIZATION,
+          ensureSupabaseSession,
+          loadDatabaseConfig,
+          saveApiStatus,
+        },
+        {
+          createEmbedding,
+          executeChatDataTool,
+          findRelevantContext,
+          loadRecentInsights,
+          updateChatMessage,
+        },
+      ] = await Promise.all([import("./lib/supabase"), import("./lib/chat-data")]);
+      const config = loadDatabaseConfig();
+      if (!config) throw new Error("Connect your Supabase database before regenerating a reply.");
+      const client = createSupabaseClient(config);
+      await ensureSupabaseSession(client);
+      const [{ data: keys, error: keysError }, { data: profile, error: profileError }] =
+        await Promise.all([
+          client
+            .from("ai_api_keys")
+            .select("id, model, api_key, status, last_error, created_at")
+            .order("created_at", { ascending: true })
+            .order("id", { ascending: true }),
+          client
+            .from("user_settings")
+            .select("display_name, custom_prompt, chat_style")
+            .maybeSingle(),
+        ]);
+      if (keysError) throw keysError;
+      if (profileError) throw profileError;
+      if (keys.length === 0) throw new Error("Add a Gemini API key in Settings first.");
+
+      const startIndex = ((nextApiIndexRef.current % keys.length) + keys.length) % keys.length;
+      const selectedKey = keys[startIndex];
+      const [queryResult, insightsResult] = await Promise.allSettled([
+        createEmbedding(selectedKey.api_key, sourceMessage.text, "RETRIEVAL_QUERY"),
+        loadRecentInsights(client, 12, sourceMessage.id),
+      ]);
+      const regenerationWarnings: string[] = [];
+      if (queryResult.status === "rejected") {
+        regenerationWarnings.push(
+          `Semantic retrieval was unavailable: ${
+            queryResult.reason instanceof Error
+              ? queryResult.reason.message
+              : "Could not create a retrieval query."
+          }`,
+        );
+      }
+      if (insightsResult.status === "rejected") {
+        regenerationWarnings.push(
+          `Recent insights could not be loaded: ${
+            insightsResult.reason instanceof Error
+              ? insightsResult.reason.message
+              : "Unknown database error."
+          }`,
+        );
+      }
+      const history = messages.slice(0, sourceIndex).slice(-12);
+      const relevantContext =
+        queryResult.status === "fulfilled"
+          ? await findRelevantContext(client, queryResult.value, sourceMessage.id)
+          : { messages: [], memories: [] };
+      const insights = insightsResult.status === "fulfilled" ? insightsResult.value : [];
+      if (showThinking) setThinkingSteps(["Meninjau riwayat dan konteks tersimpan…"]);
+
+      const result = await generateGeminiConversation(
+        keys,
+        sourceMessage.text,
+        startIndex,
+        profile ?? DEFAULT_PERSONALIZATION,
+        {
+          history: history.map(({ role, text }) => ({ role, content: text })),
+          relevantMessages: relevantContext.messages,
+          memories: relevantContext.memories,
+          insights,
+          executeTool: (name, input, apiKey) =>
+            executeChatDataTool(client, apiKey, name, input, requestDeleteConfirmation),
+        },
+      );
+      let embedding: number[] | null = null;
+      try {
+        embedding = await createEmbedding(
+          keys[result.keyIndex].api_key,
+          result.text,
+          "RETRIEVAL_DOCUMENT",
+        );
+      } catch (error) {
+        regenerationWarnings.push(
+          `Semantic search could not be updated: ${
+            error instanceof Error ? error.message : "Unknown embedding error."
+          }`,
+        );
+      }
+      const updatedMessage = await updateChatMessage(
+        client,
+        messageId,
+        result.text,
+        embedding,
+      );
+      if (!updatedMessage) throw new Error("This reply could not be found in the database.");
+
+      setMessages((current) =>
+        current.map((item) =>
+          item.id === messageId
+            ? {
+                ...item,
+                text: updatedMessage.content,
+                thinkingSummary: showThinking
+                  ? [
+                      "Meninjau kembali pesan dan riwayat percakapan.",
+                      ...(relevantContext.messages.length > 0 || relevantContext.memories.length > 0
+                        ? ["Memakai konteks relevan yang tersimpan."]
+                        : []),
+                      "Menyusun versi jawaban yang baru.",
+                    ]
+                  : undefined,
+              }
+            : item,
+        ),
+      );
+      nextApiIndexRef.current = (result.keyIndex + 1) % keys.length;
+      await Promise.all(
+        result.attempts.map((attempt) =>
+          saveApiStatus(client, attempt).catch((error: unknown) => {
+            throw new Error(
+              `Reply regenerated, but API status could not be saved: ${
+                error instanceof Error ? error.message : "Unknown database error."
+              }`,
+            );
+          }),
+        ),
+      );
+      setActionNotice(
+        regenerationWarnings.length > 0
+          ? `Reply regenerated. ${regenerationWarnings.join(" ")}`
+          : "Reply regenerated.",
+      );
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : "Could not regenerate this reply.");
+    } finally {
+      setThinkingSteps([]);
       setIsSending(false);
     }
   }
@@ -646,35 +1223,139 @@ export function App() {
           className="absolute inset-0 overflow-y-auto overscroll-contain px-4 pb-28 pt-20 sm:px-6"
         >
           <div className="space-y-4">
-          {messages.map((chatMessage) => (
-            <div
-              key={chatMessage.id}
-              className={`flex ${chatMessage.role === "user" ? "justify-end" : "justify-start"}`}
-            >
-              <p
-                className={`max-w-[88%] whitespace-pre-wrap rounded-[20px] px-4 py-3 text-sm leading-6 ${
-                  chatMessage.role === "user"
-                    ? "rounded-br-md bg-[#28292e] text-white"
-                    : "rounded-bl-md bg-[#f2f3f5] text-[#27282d]"
-                }`}
-              >
-                {chatMessage.text}
+            {messages.map((chatMessage) =>
+              chatMessage.role === "user" ? (
+                <div key={chatMessage.id} className="flex justify-end">
+                  <p className="max-w-[76%] whitespace-pre-wrap rounded-[18px] rounded-br-md bg-[#28292e] px-3 py-2 text-[13px] leading-5 text-white sm:max-w-[70%]">
+                    {chatMessage.text}
+                  </p>
+                </div>
+              ) : (
+                <article key={chatMessage.id} className="w-full min-w-0 text-[#27282d]">
+                  <div className="max-w-full break-words text-[14px] leading-6 sm:text-[15px]">
+                    <Suspense fallback={<p className="whitespace-pre-wrap">{chatMessage.text}</p>}>
+                      <AssistantMarkdown content={chatMessage.text} />
+                    </Suspense>
+                  </div>
+                  {chatMessage.thinkingSummary && (
+                    <div className="mt-2">
+                      <button
+                        type="button"
+                        aria-expanded={expandedThinkingIds.has(chatMessage.id)}
+                        onClick={() =>
+                          setExpandedThinkingIds((current) => {
+                            const next = new Set(current);
+                            if (next.has(chatMessage.id)) next.delete(chatMessage.id);
+                            else next.add(chatMessage.id);
+                            return next;
+                          })
+                        }
+                        className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-xs text-[#747780] hover:bg-[#f5f6f8]"
+                      >
+                        {expandedThinkingIds.has(chatMessage.id) ? (
+                          <ChevronUp aria-hidden="true" className="size-3.5" />
+                        ) : (
+                          <ChevronDown aria-hidden="true" className="size-3.5" />
+                        )}
+                        Ringkasan proses
+                      </button>
+                      {expandedThinkingIds.has(chatMessage.id) && (
+                        <ul className="mt-1 space-y-1 border-l border-[#e4e5e8] pl-3 text-xs leading-5 text-[#747780]">
+                          {chatMessage.thinkingSummary.map((item, index) => (
+                            <li key={`${chatMessage.id}-thinking-${index}`}>{item}</li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  )}
+                  <div
+                    aria-label="Assistant message actions"
+                    className="mt-2 flex flex-wrap items-center gap-1"
+                  >
+                    <button
+                      type="button"
+                      aria-label="Like response"
+                      aria-pressed={ratings[chatMessage.id] === "like"}
+                      onClick={() => void handleAssistantRating(chatMessage.id, "like")}
+                      className={`flex size-8 items-center justify-center rounded-lg transition hover:bg-[#f1f2f4] ${
+                        ratings[chatMessage.id] === "like" ? "text-[#2088bf]" : "text-[#777a82]"
+                      }`}
+                    >
+                      <ThumbsUp aria-hidden="true" className="size-4" />
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="Dislike response"
+                      aria-pressed={ratings[chatMessage.id] === "dislike"}
+                      onClick={() => void handleAssistantRating(chatMessage.id, "dislike")}
+                      className={`flex size-8 items-center justify-center rounded-lg transition hover:bg-[#f1f2f4] ${
+                        ratings[chatMessage.id] === "dislike" ? "text-[#bd4a4a]" : "text-[#777a82]"
+                      }`}
+                    >
+                      <ThumbsDown aria-hidden="true" className="size-4" />
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="Regenerate response"
+                      disabled={isSending}
+                      onClick={() => void regenerateAssistantMessage(chatMessage.id)}
+                      className="flex size-8 items-center justify-center rounded-lg text-[#777a82] transition hover:bg-[#f1f2f4] disabled:opacity-50"
+                    >
+                      <RotateCw aria-hidden="true" className="size-4" />
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="Report response"
+                      onClick={() => {
+                        setReportTarget({ id: chatMessage.id, text: chatMessage.text });
+                        setReportDetails("");
+                        setReportError("");
+                        setSendError("");
+                      }}
+                      className="flex size-8 items-center justify-center rounded-lg text-[#777a82] transition hover:bg-[#f1f2f4]"
+                    >
+                      <Bug aria-hidden="true" className="size-4" />
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={copiedMessageId === chatMessage.id ? "Copied response" : "Copy response"}
+                      onClick={() => void copyAssistantMessage(chatMessage)}
+                      className="ml-auto flex size-8 items-center justify-center rounded-lg text-[#777a82] transition hover:bg-[#f1f2f4]"
+                    >
+                      {copiedMessageId === chatMessage.id ? (
+                        <Check aria-hidden="true" className="size-4 text-[#398650]" />
+                      ) : (
+                        <Copy aria-hidden="true" className="size-4" />
+                      )}
+                    </button>
+                  </div>
+                </article>
+              ),
+            )}
+            {isLoadingHistory && (
+              <p role="status" className="text-sm text-[#858890]">
+                Loading saved chat…
               </p>
-            </div>
-          ))}
-          {isSending && (
-            <p role="status" className="text-sm text-[#858890]">
-              Gemini is thinking…
-            </p>
-          )}
-          {sendError && (
-            <p
-              role="alert"
-              className="whitespace-pre-line rounded-2xl border border-red-100 bg-red-50 px-3 py-2 text-sm text-red-800"
-            >
-              {sendError}
-            </p>
-          )}
+            )}
+            {isSending && (
+              <div role="status" aria-live="polite" className="w-full space-y-1 text-xs text-[#747780]">
+                <p className="font-medium text-[#4b4e55]">CheyaVerse sedang menyusun jawaban…</p>
+                {isThinkMode && thinkingSteps.map((step) => <p key={step}>{step}</p>)}
+              </div>
+            )}
+            {actionNotice && (
+              <p role="status" className="text-xs text-[#43834c]">
+                {actionNotice}
+              </p>
+            )}
+            {sendError && (
+              <p
+                role="alert"
+                className="whitespace-pre-line rounded-2xl border border-red-100 bg-red-50 px-3 py-2 text-sm text-red-800"
+              >
+                {sendError}
+              </p>
+            )}
           </div>
         </div>
 
@@ -843,7 +1524,14 @@ export function App() {
                 <button
                   type="button"
                   aria-label="Think"
-                  className="flex h-10 items-center gap-2 rounded-full border border-[#e5e6e9] bg-white px-3.5 text-sm font-medium text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
+                  aria-pressed={isThinkMode}
+                  title={isThinkMode ? "Turn off thinking summary" : "Turn on thinking summary"}
+                  onClick={() => setIsThinkMode((enabled) => !enabled)}
+                  className={`flex h-10 items-center gap-2 rounded-full border px-3.5 text-sm font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] ${
+                    isThinkMode
+                      ? "border-[#b9dff2] bg-[#edf8fd] text-[#1678a8]"
+                      : "border-[#e5e6e9] bg-white text-[#34363b] hover:bg-[#f7f8fa]"
+                  }`}
                 >
                   <Brain aria-hidden="true" className="size-[18px]" strokeWidth={1.8} />
                   <span>Think</span>
@@ -853,7 +1541,7 @@ export function App() {
                     type="button"
                     aria-label="Send message"
                     onClick={sendMessage}
-                    disabled={isSending}
+                    disabled={isSending || isLoadingHistory}
                     className="flex size-10 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
                   >
                     {isSending ? (
@@ -885,6 +1573,100 @@ export function App() {
           </form>
         </footer>
       </section>
+
+      {reportTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-5 py-8">
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="report-response-title"
+            className="w-full max-w-sm rounded-3xl bg-white p-5 shadow-xl"
+          >
+            <h2 id="report-response-title" className="text-base font-semibold text-[#22242a]">
+              Report this response
+            </h2>
+            <p className="mt-2 max-h-20 overflow-y-auto whitespace-pre-wrap rounded-xl bg-[#f5f6f8] p-3 text-xs leading-5 text-[#64666d]">
+              {reportTarget.text.slice(0, 400)}
+            </p>
+            <label htmlFor="response-report-details" className="mt-4 block text-sm text-[#43454b]">
+              What went wrong?
+            </label>
+            <textarea
+              id="response-report-details"
+              maxLength={2000}
+              rows={4}
+              value={reportDetails}
+              onChange={(event) => setReportDetails(event.target.value)}
+              className="mt-2 w-full resize-y rounded-xl border border-[#e5e6e9] p-3 text-sm outline-none focus:border-[#229fe3]"
+            />
+            {reportError && (
+              <p role="alert" className="mt-2 text-sm text-red-700">
+                {reportError}
+              </p>
+            )}
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={isSavingReport}
+                onClick={() => {
+                  setReportTarget(null);
+                  setReportError("");
+                }}
+                className="h-10 rounded-full border border-[#e5e6e9] px-4 text-sm font-medium text-[#34363b] hover:bg-[#f7f8fa] disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isSavingReport}
+                onClick={() => void submitAssistantReport()}
+                className="flex h-10 items-center gap-2 rounded-full bg-[#28292e] px-4 text-sm font-medium text-white hover:bg-[#3b3d43] disabled:opacity-50"
+              >
+                {isSavingReport && <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />}
+                Send report
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {deleteConfirmation && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-5 py-8">
+          <section
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="delete-confirmation-title"
+            aria-describedby="delete-confirmation-description"
+            className="w-full max-w-sm rounded-3xl bg-white p-5 shadow-xl"
+          >
+            <h2 id="delete-confirmation-title" className="text-base font-semibold text-[#22242a]">
+              Confirm deletion
+            </h2>
+            <p id="delete-confirmation-description" className="mt-2 text-sm leading-6 text-[#64666d]">
+              CheyaVerse wants to delete this {deleteConfirmation.label}:
+            </p>
+            <p className="mt-2 max-h-32 overflow-y-auto whitespace-pre-wrap break-words rounded-xl bg-[#f5f6f8] p-3 text-sm text-[#34363b]">
+              {deleteConfirmation.preview.slice(0, 500)}
+            </p>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => resolveDeleteConfirmation(false)}
+                className="h-10 rounded-full border border-[#e5e6e9] px-4 text-sm font-medium text-[#34363b] hover:bg-[#f7f8fa]"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => resolveDeleteConfirmation(true)}
+                className="h-10 rounded-full bg-[#bd3030] px-4 text-sm font-medium text-white hover:bg-[#a92929]"
+              >
+                Delete
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
 
       <input
         ref={fileInputRef}

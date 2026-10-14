@@ -36,8 +36,8 @@ email/password account is needed. Before connecting:
    API keys to that browser session.
 4. In **Personal**, set a name, custom prompt, and conversation style. In **Configure**, add one
    or more Gemini API keys using `gemini-3.1-flash-lite` or `gemini-3.5-flash-lite`.
-5. If the project already has the previous schema, run the updated `supabase/schema.sql` again to
-   add the Personal settings columns.
+5. Run the latest `supabase/schema.sql` whenever the project has an older schema. It adds the
+   chat, insight, memory, and pgvector tables plus the semantic-search functions.
 
 The Supabase URL and publishable key are retained in the browser as bootstrap settings and copied
 to that session's database. Gemini API keys are stored in the session's Supabase rows and sent from
@@ -45,6 +45,19 @@ the browser directly to Google's Gemini API. Never use a Supabase service-role k
 client-side app. Anonymous sessions are specific to a browser; clearing browser data or switching
 devices loses access to that session's data. The Settings page's help button includes the full setup
 checklist and copyable SQL schema.
+
+Text chat messages, per-message conversation insights, and semantic embeddings are stored in the
+connected Supabase project and protected by row-level security. Gemini analyzes each user message
+for tentative, non-clinical conversation insights and uses relevant past messages, saved memories,
+recent insights, and Personal settings as context. Its database tools are limited to the current
+user's chat, memories, and insights; the app asks before deleting a record. The browser sends
+message text to Gemini for replies, insights, and embeddings.
+
+Assistant replies support Markdown, including fenced code blocks and `_underlined text_` (single
+underscores are rendered as underline in this app). User messages stay in compact bubbles; assistant
+replies use the full conversation width and include controls for feedback, regeneration, reporting,
+and copying. The **Think** toggle shows progress stages and an optional user-facing summary of the
+context used; it does not expose private internal reasoning.
 
 ## Notes
 
