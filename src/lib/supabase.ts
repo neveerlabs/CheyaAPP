@@ -32,6 +32,22 @@ type Json =
   | { [key: string]: Json | undefined }
   | Json[];
 
+export type ChatJobStatus = "queued" | "processing" | "completed" | "failed";
+
+export type ChatMessageJob = {
+  id: string;
+  user_id: string;
+  message_id: string;
+  assistant_message_id: string | null;
+  thinking_mode: boolean;
+  status: ChatJobStatus;
+  progress: string;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+};
+
 export interface PersonalizationSettings {
   display_name: string;
   custom_prompt: string;
@@ -111,7 +127,7 @@ export type MessageFeedback = {
   created_at: string;
 };
 
-type Database = {
+export type Database = {
   public: {
     Tables: {
       ai_api_keys: {
@@ -205,7 +221,9 @@ type Database = {
           revision_reason: ChatMessageVersion["revision_reason"];
           created_at?: string;
         };
-        Update: never;
+        Update: Partial<{
+          embedding: string | null;
+        }>;
         Relationships: never[];
       };
       chat_conversation_branches: {
@@ -227,6 +245,31 @@ type Database = {
         };
         Update: Partial<{
           messages: Json;
+        }>;
+        Relationships: never[];
+      };
+      chat_message_jobs: {
+        Row: ChatMessageJob;
+        Insert: {
+          id?: string;
+          user_id?: string;
+          message_id: string;
+          assistant_message_id?: string | null;
+          thinking_mode?: boolean;
+          status?: ChatJobStatus;
+          progress?: string;
+          error?: string | null;
+          created_at?: string;
+          updated_at?: string;
+          completed_at?: string | null;
+        };
+        Update: Partial<{
+          assistant_message_id: string | null;
+          status: ChatJobStatus;
+          progress: string;
+          error: string | null;
+          updated_at: string;
+          completed_at: string | null;
         }>;
         Relationships: never[];
       };
@@ -331,6 +374,63 @@ type Database = {
           p_anchor_version_number: number;
         };
         Returns: undefined;
+      };
+      create_chat_job: {
+        Args: { p_content: string; p_thinking_mode: boolean };
+        Returns: Array<{ job_id: string; message_id: string }>;
+      };
+      complete_chat_job: {
+        Args: {
+          p_job_id: string;
+          p_content: string;
+          p_embedding: string | null;
+          p_thinking_summary: string | null;
+        };
+        Returns: StoredChatMessage[];
+      };
+      match_chat_messages_for_user: {
+        Args: {
+          p_user_id: string;
+          query_embedding: string;
+          result_limit?: number;
+          exclude_message_id?: string | null;
+        };
+        Returns: Array<{
+          id: string;
+          role: StoredChatMessage["role"];
+          content: string;
+          created_at: string;
+          similarity: number;
+        }>;
+      };
+      match_chat_messages_before_for_user: {
+        Args: {
+          p_user_id: string;
+          query_embedding: string;
+          max_created_at: string;
+          result_limit?: number;
+          exclude_message_id?: string | null;
+        };
+        Returns: Array<{
+          id: string;
+          role: StoredChatMessage["role"];
+          content: string;
+          created_at: string;
+          similarity: number;
+        }>;
+      };
+      match_user_memories_for_user: {
+        Args: {
+          p_user_id: string;
+          query_embedding: string;
+          result_limit?: number;
+        };
+        Returns: Array<{
+          id: string;
+          category: string;
+          content: string;
+          similarity: number;
+        }>;
       };
       match_chat_messages: {
         Args: {
@@ -724,15 +824,17 @@ async function ensureAnonymousSession(client: AppSupabaseClient): Promise<void> 
 export async function saveApiStatus(
   client: AppSupabaseClient,
   attempt: { keyId: string; status: Exclude<ApiStatus, "untested">; error: string | null },
+  userId?: string,
 ): Promise<void> {
-  const { data, error } = await client
+  let query = client
     .from("ai_api_keys")
     .update({
       status: attempt.status,
       last_error: attempt.error,
     })
-    .eq("id", attempt.keyId)
-    .select("id");
+    .eq("id", attempt.keyId);
+  if (userId) query = query.eq("user_id", userId);
+  const { data, error } = await query.select("id");
 
   if (error) throw error;
   if (data.length === 0) {

@@ -89,10 +89,12 @@ export async function saveChatMessage(
   content: string,
   embedding: number[] | null,
   thinkingSummary: string | null = null,
+  userId?: string,
 ): Promise<StoredChatMessage> {
   const { data, error } = await client
     .from("chat_messages")
     .insert({
+      ...(userId ? { user_id: userId } : {}),
       role,
       content,
       embedding: embedding ? serializeEmbedding(embedding) : null,
@@ -109,16 +111,36 @@ export async function saveChatMessage(
   return data;
 }
 
+export async function createChatJob(
+  client: AppSupabaseClient,
+  content: string,
+  thinkingMode: boolean,
+): Promise<{ jobId: string; messageId: string }> {
+  const { data, error } = await client.rpc("create_chat_job", {
+    p_content: content,
+    p_thinking_mode: thinkingMode,
+  });
+  if (error) {
+    throw new Error(`Could not queue your message: ${error.message}`);
+  }
+  const job = data[0];
+  if (!job) throw new Error("The chat server did not return a job ID.");
+  return { jobId: job.job_id, messageId: job.message_id };
+}
+
 export async function loadRecentChatMessages(
   client: AppSupabaseClient,
   limit = 50,
+  userId?: string,
 ): Promise<StoredChatMessage[]> {
-  const { data, error } = await client
+  let query = client
     .from("chat_messages")
     .select("id, user_id, role, content, embedding, created_at, version_number, thinking_summary, is_active, revision_reason")
     .eq("is_active", true)
     .order("created_at", { ascending: false })
     .limit(limit);
+  if (userId) query = query.eq("user_id", userId);
+  const { data, error } = await query;
   if (error) {
     throw new Error(
       `Could not load saved chat history: ${error.message} Confirm the latest supabase/schema.sql has been run.`,
@@ -145,13 +167,16 @@ export async function loadMessageCreatedAt(
 export async function loadMessageVersions(
   client: AppSupabaseClient,
   messageIds: string[],
+  userId?: string,
 ): Promise<Record<string, ChatMessageVersion[]>> {
   if (messageIds.length === 0) return {};
-  const { data, error } = await client
+  let query = client
     .from("chat_message_versions")
     .select("id, user_id, message_id, version_number, content, embedding, thinking_summary, revision_reason, created_at")
     .in("message_id", messageIds)
     .order("version_number", { ascending: true });
+  if (userId) query = query.eq("user_id", userId);
+  const { data, error } = await query;
   if (error) {
     throw new Error(`Could not load message versions: ${error.message}`);
   }
@@ -166,10 +191,26 @@ export async function findRelevantContext(
   embedding: number[],
   excludeMessageId: string,
   beforeCreatedAt?: string,
+  userId?: string,
 ): Promise<{ messages: RetrievedChatMessage[]; memories: RetrievedMemory[] }> {
   const queryEmbedding = serializeEmbedding(embedding);
   const [messageResult, memoryResult] = await Promise.all([
-    beforeCreatedAt
+    userId
+      ? beforeCreatedAt
+        ? client.rpc("match_chat_messages_before_for_user", {
+            p_user_id: userId,
+            query_embedding: queryEmbedding,
+            max_created_at: beforeCreatedAt,
+            result_limit: SEARCH_RESULT_LIMIT,
+            exclude_message_id: excludeMessageId,
+          })
+        : client.rpc("match_chat_messages_for_user", {
+            p_user_id: userId,
+            query_embedding: queryEmbedding,
+            result_limit: SEARCH_RESULT_LIMIT,
+            exclude_message_id: excludeMessageId,
+          })
+      : beforeCreatedAt
       ? client.rpc("match_chat_messages_before", {
           query_embedding: queryEmbedding,
           max_created_at: beforeCreatedAt,
@@ -181,10 +222,16 @@ export async function findRelevantContext(
           result_limit: SEARCH_RESULT_LIMIT,
           exclude_message_id: excludeMessageId,
         }),
-    client.rpc("match_user_memories", {
-      query_embedding: queryEmbedding,
-      result_limit: SEARCH_RESULT_LIMIT,
-    }),
+    userId
+      ? client.rpc("match_user_memories_for_user", {
+          p_user_id: userId,
+          query_embedding: queryEmbedding,
+          result_limit: SEARCH_RESULT_LIMIT,
+        })
+      : client.rpc("match_user_memories", {
+          query_embedding: queryEmbedding,
+          result_limit: SEARCH_RESULT_LIMIT,
+        }),
   ]);
 
   if (messageResult.error) {
@@ -208,14 +255,17 @@ export async function loadRecentInsights(
   limit = 12,
   excludeMessageId?: string,
   beforeCreatedAt?: string,
+  userId?: string,
 ): Promise<Array<Pick<MessageInsight, "mood" | "communication_style" | "situation" | "topics" | "support_needs" | "summary">>> {
-  const { data: activeMessages, error: messageError } = await client
+  let messageQuery = client
     .from("chat_messages")
     .select("id")
     .eq("is_active", true)
     .lt("created_at", beforeCreatedAt ?? new Date().toISOString())
     .order("created_at", { ascending: false })
     .limit(200);
+  if (userId) messageQuery = messageQuery.eq("user_id", userId);
+  const { data: activeMessages, error: messageError } = await messageQuery;
   if (messageError) {
     throw new Error(`Could not load active messages for insight context: ${messageError.message}`);
   }
@@ -231,6 +281,7 @@ export async function loadRecentInsights(
     .order("created_at", { ascending: false })
     .limit(limit);
   if (excludeMessageId) query = query.neq("message_id", excludeMessageId);
+  if (userId) query = query.eq("user_id", userId);
   const { data, error } = await query;
   if (error) {
     throw new Error(
@@ -244,11 +295,16 @@ export async function saveMessageInsight(
   client: AppSupabaseClient,
   messageId: string,
   insight: InsightDraft,
+  userId?: string,
 ): Promise<void> {
-  const { error } = await client.from("message_insights").insert({
-    message_id: messageId,
-    ...insight,
-  });
+  const { error } = await client.from("message_insights").upsert(
+    {
+      ...(userId ? { user_id: userId } : {}),
+      message_id: messageId,
+      ...insight,
+    },
+    { onConflict: "message_id" },
+  );
   if (error) throw new Error(`Could not save message insight: ${error.message}`);
 }
 
@@ -331,7 +387,39 @@ export async function saveChatBranch(
   client: AppSupabaseClient,
   anchorMessageId: string,
   anchorVersionNumber: number,
+  userId?: string,
 ): Promise<void> {
+  if (userId) {
+    const { data: activeMessages, error: messagesError } = await client
+      .from("chat_messages")
+      .select("id, version_number")
+      .eq("user_id", userId)
+      .eq("is_active", true)
+      .order("created_at", { ascending: true })
+      .order("id", { ascending: true });
+    if (messagesError) {
+      throw new Error(`Could not load active messages for this branch: ${messagesError.message}`);
+    }
+    const branchMessages = activeMessages.map((message) => ({
+      message_id: message.id,
+      version_number:
+        message.id === anchorMessageId ? anchorVersionNumber : message.version_number,
+    }));
+    if (!branchMessages.some((message) => message.message_id === anchorMessageId)) {
+      throw new Error("The branch anchor message is not active.");
+    }
+    const { error } = await client.from("chat_conversation_branches").upsert(
+      {
+        user_id: userId,
+        anchor_message_id: anchorMessageId,
+        anchor_version_number: anchorVersionNumber,
+        messages: branchMessages,
+      },
+      { onConflict: "user_id,anchor_message_id,anchor_version_number" },
+    );
+    if (error) throw new Error(`Could not save this conversation branch: ${error.message}`);
+    return;
+  }
   const { error } = await client.rpc("save_chat_branch", {
     p_anchor_message_id: anchorMessageId,
     p_anchor_version_number: anchorVersionNumber,
@@ -343,13 +431,16 @@ export async function loadMessageFeedback(
   client: AppSupabaseClient,
   messageId: string,
   versionNumber: number,
+  userId?: string,
 ): Promise<{ rating: "like" | "dislike" | null; reports: string[] }> {
-  const { data, error } = await client
+  let query = client
     .from("message_feedback")
     .select("kind, details")
     .eq("message_id", messageId)
     .eq("version_number", versionNumber)
     .order("created_at", { ascending: true });
+  if (userId) query = query.eq("user_id", userId);
+  const { data, error } = await query;
   if (error) throw new Error(`Could not load message feedback: ${error.message}`);
   const rating = data.find((item) => item.kind === "like" || item.kind === "dislike")?.kind;
   return {
@@ -364,6 +455,7 @@ export async function loadRecentAssistantFeedback(
   client: AppSupabaseClient,
   messageIds: string[],
   limit = 8,
+  userId?: string,
 ): Promise<
   Array<{
     rating: "like" | "dislike" | "report";
@@ -373,22 +465,25 @@ export async function loadRecentAssistantFeedback(
   }>
 > {
   if (messageIds.length === 0) return [];
-  const [ratingsResult, reportsResult] = await Promise.all([
-    client
+  let ratingsQuery = client
       .from("message_feedback")
       .select("message_id, version_number, kind, details, created_at")
       .in("message_id", messageIds)
       .in("kind", ["like", "dislike"])
       .order("created_at", { ascending: false })
-      .limit(limit),
-    client
+      .limit(limit);
+  let reportsQuery = client
       .from("message_feedback")
       .select("message_id, version_number, kind, details, created_at")
       .in("message_id", messageIds)
       .eq("kind", "report")
       .order("created_at", { ascending: false })
-      .limit(limit),
-  ]);
+      .limit(limit);
+  if (userId) {
+    ratingsQuery = ratingsQuery.eq("user_id", userId);
+    reportsQuery = reportsQuery.eq("user_id", userId);
+  }
+  const [ratingsResult, reportsResult] = await Promise.all([ratingsQuery, reportsQuery]);
   if (ratingsResult.error) {
     throw new Error(`Could not load recent response ratings: ${ratingsResult.error.message}`);
   }
@@ -397,10 +492,12 @@ export async function loadRecentAssistantFeedback(
   }
   const feedback = [...ratingsResult.data, ...reportsResult.data];
   if (feedback.length === 0) return [];
-  const { data: versions, error: versionsError } = await client
+  let versionsQuery = client
     .from("chat_message_versions")
     .select("message_id, version_number, content")
     .in("message_id", [...new Set(feedback.map((item) => item.message_id))]);
+  if (userId) versionsQuery = versionsQuery.eq("user_id", userId);
+  const { data: versions, error: versionsError } = await versionsQuery;
   if (versionsError) {
     throw new Error(`Could not load rated response versions: ${versionsError.message}`);
   }
@@ -446,6 +543,7 @@ function searchPattern(query: string): string {
 async function searchUserData(
   client: AppSupabaseClient,
   args: Record<string, unknown>,
+  userId?: string,
 ): Promise<unknown> {
   const query = requiredString(args.query, "search query", 200);
   const category = args.category;
@@ -456,28 +554,30 @@ async function searchUserData(
   const searches: Array<PromiseLike<unknown>> = [];
 
   if (category === "all" || category === "chat") {
+    let search = client
+      .from("chat_messages")
+      .select("id, role, content, created_at")
+      .ilike("content", pattern)
+      .order("created_at", { ascending: false })
+      .limit(SEARCH_RESULT_LIMIT);
+    if (userId) search = search.eq("user_id", userId);
     searches.push(
-      client
-        .from("chat_messages")
-        .select("id, role, content, created_at")
-        .ilike("content", pattern)
-        .order("created_at", { ascending: false })
-        .limit(SEARCH_RESULT_LIMIT)
-        .then(({ data, error }) => {
+      search.then(({ data, error }) => {
           if (error) throw new Error(`Could not search chat history: ${error.message}`);
           return { category: "chat", records: data };
         }),
     );
   }
   if (category === "all" || category === "memories") {
+    let search = client
+      .from("user_memories")
+      .select("id, category, content, updated_at")
+      .ilike("content", pattern)
+      .order("updated_at", { ascending: false })
+      .limit(SEARCH_RESULT_LIMIT);
+    if (userId) search = search.eq("user_id", userId);
     searches.push(
-      client
-        .from("user_memories")
-        .select("id, category, content, updated_at")
-        .ilike("content", pattern)
-        .order("updated_at", { ascending: false })
-        .limit(SEARCH_RESULT_LIMIT)
-        .then(({ data, error }) => {
+      search.then(({ data, error }) => {
           if (error) throw new Error(`Could not search memories: ${error.message}`);
           return { category: "memories", records: data };
         }),
@@ -488,12 +588,16 @@ async function searchUserData(
       const fields = ["summary", "mood", "communication_style", "situation", "support_needs"] as const;
       const results = await Promise.all(
         fields.map((field) =>
-          client
+          (async () => {
+            let search = client
             .from("message_insights")
             .select("id, message_id, mood, communication_style, situation, topics, support_needs, summary, created_at")
             .ilike(field, pattern)
             .order("created_at", { ascending: false })
-            .limit(SEARCH_RESULT_LIMIT),
+            .limit(SEARCH_RESULT_LIMIT);
+            if (userId) search = search.eq("user_id", userId);
+            return search;
+          })(),
         ),
       );
       const failedResult = results.find((result) => result.error);
@@ -520,13 +624,14 @@ export async function executeChatDataTool(
   name: string,
   input: unknown,
   confirmDelete: (label: string, preview: string) => boolean | Promise<boolean>,
+  userId?: string,
 ): Promise<unknown> {
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
     throw new Error("The AI provided invalid database tool input.");
   }
   const args = input as Record<string, unknown>;
 
-  if (name === "search_user_data") return searchUserData(client, args);
+  if (name === "search_user_data") return searchUserData(client, args, userId);
 
   if (name === "create_memory") {
     const content = requiredString(args.content, "memory content", 10000);
@@ -534,7 +639,12 @@ export async function executeChatDataTool(
     const embedding = await createEmbedding(apiKey, content, "RETRIEVAL_DOCUMENT");
     const { data, error } = await client
       .from("user_memories")
-      .insert({ content, category: category || "general", embedding: serializeEmbedding(embedding) })
+      .insert({
+        ...(userId ? { user_id: userId } : {}),
+        content,
+        category: category || "general",
+        embedding: serializeEmbedding(embedding),
+      })
       .select("id, category, content, created_at, updated_at")
       .single();
     if (error) throw new Error(`Could not create memory: ${error.message}`);
@@ -554,10 +664,12 @@ export async function executeChatDataTool(
       updates.category = requiredString(args.category, "memory category", 80);
     }
     if (Object.keys(updates).length === 0) throw new Error("Provide new memory content or category.");
-    const { data, error } = await client
+    let update = client
       .from("user_memories")
       .update({ ...updates, updated_at: new Date().toISOString() })
-      .eq("id", id)
+      .eq("id", id);
+    if (userId) update = update.eq("user_id", userId);
+    const { data, error } = await update
       .select("id, category, content, updated_at")
       .maybeSingle();
     if (error) throw new Error(`Could not update memory: ${error.message}`);
@@ -567,17 +679,20 @@ export async function executeChatDataTool(
 
   if (name === "delete_memory") {
     const id = requiredId(args.id, "memory ID");
-    const { data: memory, error: readError } = await client
+    let read = client
       .from("user_memories")
       .select("id, category, content")
-      .eq("id", id)
-      .maybeSingle();
+      .eq("id", id);
+    if (userId) read = read.eq("user_id", userId);
+    const { data: memory, error: readError } = await read.maybeSingle();
     if (readError) throw new Error(`Could not load memory before deletion: ${readError.message}`);
     if (!memory) throw new Error("Memory not found in this user's database.");
     if (!(await confirmDelete("memory", memory.content))) {
       return { deleted: false, reason: "User cancelled deletion." };
     }
-    const { error } = await client.from("user_memories").delete().eq("id", id);
+    let remove = client.from("user_memories").delete().eq("id", id);
+    if (userId) remove = remove.eq("user_id", userId);
+    const { error } = await remove;
     if (error) throw new Error(`Could not delete memory: ${error.message}`);
     return { deleted: true, category: memory.category, content: memory.content };
   }
@@ -586,10 +701,12 @@ export async function executeChatDataTool(
     const id = requiredId(args.id, "message ID");
     const content = requiredString(args.content, "message content", 50000);
     const embedding = serializeEmbedding(await createEmbedding(apiKey, content, "RETRIEVAL_DOCUMENT"));
-    const { data, error } = await client
+    let update = client
       .from("chat_messages")
       .update({ content, embedding, revision_reason: "ai_update" })
-      .eq("id", id)
+      .eq("id", id);
+    if (userId) update = update.eq("user_id", userId);
+    const { data, error } = await update
       .select("id, role, content, created_at")
       .maybeSingle();
     if (error) throw new Error(`Could not update chat message: ${error.message}`);
@@ -599,17 +716,20 @@ export async function executeChatDataTool(
 
   if (name === "delete_chat_message") {
     const id = requiredId(args.id, "message ID");
-    const { data: message, error: readError } = await client
+    let read = client
       .from("chat_messages")
       .select("id, role, content")
-      .eq("id", id)
-      .maybeSingle();
+      .eq("id", id);
+    if (userId) read = read.eq("user_id", userId);
+    const { data: message, error: readError } = await read.maybeSingle();
     if (readError) throw new Error(`Could not load chat message before deletion: ${readError.message}`);
     if (!message) throw new Error("Chat message not found in this user's database.");
     if (!(await confirmDelete("chat message", message.content))) {
       return { deleted: false, reason: "User cancelled deletion." };
     }
-    const { error } = await client.from("chat_messages").delete().eq("id", id);
+    let remove = client.from("chat_messages").delete().eq("id", id);
+    if (userId) remove = remove.eq("user_id", userId);
+    const { error } = await remove;
     if (error) throw new Error(`Could not delete chat message: ${error.message}`);
     return { deleted: true, role: message.role, content: message.content };
   }
@@ -627,10 +747,12 @@ export async function executeChatDataTool(
       updates.topics = args.topics.slice(0, 20).map((topic) => topic.trim().slice(0, 100));
     }
     if (Object.keys(updates).length === 0) throw new Error("Provide at least one insight field to update.");
-    const { data, error } = await client
+    let update = client
       .from("message_insights")
       .update(updates)
-      .eq("id", id)
+      .eq("id", id);
+    if (userId) update = update.eq("user_id", userId);
+    const { data, error } = await update
       .select("id, message_id, mood, communication_style, situation, topics, support_needs, summary, created_at")
       .maybeSingle();
     if (error) throw new Error(`Could not update insight: ${error.message}`);
@@ -640,17 +762,20 @@ export async function executeChatDataTool(
 
   if (name === "delete_message_insight") {
     const id = requiredId(args.id, "insight ID");
-    const { data: insight, error: readError } = await client
+    let read = client
       .from("message_insights")
       .select("id, summary, mood")
-      .eq("id", id)
-      .maybeSingle();
+      .eq("id", id);
+    if (userId) read = read.eq("user_id", userId);
+    const { data: insight, error: readError } = await read.maybeSingle();
     if (readError) throw new Error(`Could not load insight before deletion: ${readError.message}`);
     if (!insight) throw new Error("Insight not found in this user's database.");
     if (!(await confirmDelete("insight", insight.summary || insight.mood))) {
       return { deleted: false, reason: "User cancelled deletion." };
     }
-    const { error } = await client.from("message_insights").delete().eq("id", id);
+    let remove = client.from("message_insights").delete().eq("id", id);
+    if (userId) remove = remove.eq("user_id", userId);
+    const { error } = await remove;
     if (error) throw new Error(`Could not delete insight: ${error.message}`);
     return { deleted: true, summary: insight.summary };
   }

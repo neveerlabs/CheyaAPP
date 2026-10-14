@@ -29,13 +29,10 @@ import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import cheyaLogo from "../assets/circle.png";
 import { AccountLogin } from "./AccountLogin";
 import {
-  analyzeGeminiMessage,
   generateThinkingSummary,
   generateGeminiConversation,
-  GeminiFailoverError,
-  type GeminiAttempt,
 } from "./lib/gemini";
-import type { AppSupabaseClient, ChatMessageVersion } from "./lib/supabase";
+import type { AppSupabaseClient, ChatMessageJob, ChatMessageVersion } from "./lib/supabase";
 
 const SettingsPage = lazy(() =>
   import("./SettingsPage").then((module) => ({ default: module.SettingsPage })),
@@ -125,11 +122,13 @@ export function App() {
   const [authError, setAuthError] = useState("");
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [chatJobs, setChatJobs] = useState<ChatMessageJob[]>([]);
   const [messageVersions, setMessageVersions] = useState<Record<string, ChatMessageVersion[]>>({});
   const [selectedMessageVersions, setSelectedMessageVersions] = useState<Record<string, number>>({});
   const [isSending, setIsSending] = useState(false);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [isRestoringVersion, setIsRestoringVersion] = useState(false);
+  const [realtimeRevision, setRealtimeRevision] = useState(0);
   const [hasGeminiApiKey, setHasGeminiApiKey] = useState(false);
   const [isThinkMode, setIsThinkMode] = useState(false);
   const [thinkingSteps, setThinkingSteps] = useState<string[]>([]);
@@ -165,6 +164,16 @@ export function App() {
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wasSettingsRef = useRef(window.location.pathname === "/settings");
   const hasMessage = message.trim().length > 0 || attachedMedia.length > 0;
+  const chatJobsByMessageId = useMemo(() => {
+    const result = new Map<string, ChatMessageJob>();
+    for (const job of chatJobs) {
+      if (!result.has(job.message_id)) result.set(job.message_id, job);
+    }
+    return result;
+  }, [chatJobs]);
+  const activeChatJob = chatJobs.find(
+    (job) => job.status === "queued" || job.status === "processing",
+  );
   const mediaPreviews = useMemo(
     () =>
       new Map(
@@ -375,6 +384,7 @@ export function App() {
         setAuthUser(null);
         setIsAuthLoading(false);
         setMessages([]);
+        setChatJobs([]);
         setHasGeminiApiKey(false);
         return;
       }
@@ -425,6 +435,8 @@ export function App() {
       setSelectedMessageVersions({});
       setRatings({});
       setHasGeminiApiKey(false);
+      setChatJobs([]);
+      setIsSending(false);
       return;
     }
 
@@ -433,15 +445,22 @@ export function App() {
     void (async () => {
       try {
         const { loadMessageVersions, loadRecentChatMessages } = await import("./lib/chat-data");
-        const [savedMessages, keyResult] = await Promise.all([
+        const [savedMessages, keyResult, jobsResult] = await Promise.all([
           loadRecentChatMessages(authClient),
           authClient
             .from("ai_api_keys")
             .select("id")
             .order("created_at", { ascending: true })
             .limit(1),
+          authClient
+            .from("chat_message_jobs")
+            .select("*")
+            .in("status", ["queued", "processing", "failed"])
+            .order("created_at", { ascending: false })
+            .limit(50),
         ]);
         if (keyResult.error) throw keyResult.error;
+        if (jobsResult.error) throw jobsResult.error;
         const loadedVersions = await loadMessageVersions(
           authClient,
           savedMessages.map((item) => item.id),
@@ -467,6 +486,10 @@ export function App() {
         }
         if (isMounted) {
           setHasGeminiApiKey(keyResult.data.length > 0);
+          setChatJobs(jobsResult.data);
+          setIsSending(
+            jobsResult.data.some((job) => job.status === "queued" || job.status === "processing"),
+          );
           setRatings(loadedRatings);
           setMessageVersions(loadedVersions);
           setSelectedMessageVersions(
@@ -495,6 +518,48 @@ export function App() {
 
     return () => {
       isMounted = false;
+    };
+  }, [authClient, authUser, pathname, realtimeRevision]);
+
+  useEffect(() => {
+    if (!authClient || !authUser) return;
+    let isMounted = true;
+    let channel = authClient.channel(`account-live-${authUser.id}`);
+    const tables = [
+      "chat_messages",
+      "chat_message_versions",
+      "chat_conversation_branches",
+      "chat_message_jobs",
+      "message_feedback",
+      "message_insights",
+      "user_memories",
+      "user_settings",
+      "ai_api_keys",
+    ] as const;
+    for (const table of tables) {
+      channel = channel.on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table,
+        },
+        () => {
+          if (isMounted) setRealtimeRevision((revision) => revision + 1);
+        },
+      );
+    }
+    channel = channel.subscribe((status) => {
+      if (isMounted && status === "SUBSCRIBED") {
+        setRealtimeRevision((revision) => revision + 1);
+      } else if (isMounted && (status === "CHANNEL_ERROR" || status === "TIMED_OUT")) {
+        setSendError("Live sync is unavailable. Check your connection and reload to refresh data.");
+      }
+    });
+
+    return () => {
+      isMounted = false;
+      void authClient.removeChannel(channel);
     };
   }, [authClient, authUser]);
 
@@ -731,451 +796,63 @@ export function App() {
     setSendError("");
     setIsSending(true);
     const showThinking = isThinkMode;
-    setThinkingSteps(showThinking ? ["Membaca pesan dan konteks percakapan…"] : []);
-    let client: AppSupabaseClient | null = null;
-    let saveStatus: typeof import("./lib/supabase").saveApiStatus | null = null;
-    const attempts: GeminiAttempt[] = [];
-    const warnings: string[] = [];
-    let savedUserMessage: ChatMessage | null = null;
-    let savedAssistantMessage: ChatMessage | null = null;
-
+    let jobAccepted = false;
     try {
+      if (!authClient) throw new Error("Sign in before sending a message.");
       const {
-        createSupabaseClient,
-        DEFAULT_PERSONALIZATION,
-        ensureSupabaseSession,
-        loadDatabaseConfig,
-        saveApiStatus,
-      } = await import("./lib/supabase");
-      const {
-        createEmbedding,
-        executeChatDataTool,
-        findRelevantContext,
-        loadMessageVersions,
-        loadRecentAssistantFeedback,
-        loadRecentChatMessages,
-        loadRecentInsights,
-        saveChatBranch,
-        saveChatMessage,
-        saveMessageInsight,
-      } = await import("./lib/chat-data");
-      saveStatus = saveApiStatus;
-      const config = loadDatabaseConfig();
-      if (!config) {
-        throw new Error("The CheyaVerse account service is not configured for this deployment.");
-      }
-      client = createSupabaseClient(config);
-      await ensureSupabaseSession(client);
+        data: { session },
+        error: sessionError,
+      } = await authClient.auth.getSession();
+      if (sessionError) throw sessionError;
+      if (!session?.access_token) throw new Error("Your account session has expired. Sign in again.");
 
-      const { data: keys, error: keysError } = await client
-        .from("ai_api_keys")
-        .select("id, model, api_key, status, last_error, created_at")
-        .order("created_at", { ascending: true })
-        .order("id", { ascending: true });
-      if (keysError) throw keysError;
-      if (keys.length === 0) {
-        throw new Error("Add at least one Gemini API key in Settings before sending a message.");
-      }
-
-      const {
-        data: { user },
-        error: userError,
-      } = await client.auth.getUser();
-      if (userError) throw userError;
-      if (!user) throw new Error("The private Supabase session has no user ID.");
-
-      const { data: profile, error: profileError } = await client
-        .from("user_settings")
-        .select("display_name, custom_prompt, chat_style")
-        .eq("user_id", user.id)
-        .maybeSingle();
-      if (profileError) {
+      const response = await fetch("/api/chat-jobs", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${session.access_token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ content: prompt, thinkingMode: showThinking }),
+      });
+      const result = (await response.json().catch(() => null)) as
+        | { jobId?: string; messageId?: string; statusMessage?: string; message?: string }
+        | null;
+      if (!response.ok) {
         throw new Error(
-          `Could not load Personal settings. The CheyaVerse database may need the latest supabase/schema.sql. ${profileError.message}`,
+          result?.statusMessage ??
+            result?.message ??
+            `The chat server could not queue your message (${response.status}).`,
         );
+      }
+      if (!result?.jobId || !result.messageId) {
+        throw new Error("The chat server accepted an invalid job response.");
       }
 
-      const selectedIndex = ((nextApiIndexRef.current % keys.length) + keys.length) % keys.length;
-      const selectedKey = keys[selectedIndex];
-      if (showThinking) setThinkingSteps(["Memuat riwayat dan preferensi percakapan…"]);
-      const history = await loadRecentChatMessages(client, 20);
-      let recentFeedback: Array<{
-        rating: AssistantRating | "report";
-        response: string;
-        versionNumber: number;
-        details: string | null;
-      }> = [];
-      try {
-        recentFeedback = await loadRecentAssistantFeedback(
-          client,
-          history.filter((item) => item.role === "assistant").map((item) => item.id),
-        );
-      } catch (error) {
-        warnings.push(
-          `Saved response feedback could not be loaded: ${
-            error instanceof Error ? error.message : "Unknown database error."
-          }`,
-        );
-      }
-      let userEmbedding: number[] | null = null;
-      try {
-        userEmbedding = await createEmbedding(selectedKey.api_key, prompt, "RETRIEVAL_DOCUMENT");
-      } catch (error) {
-        warnings.push(
-          `The message will be saved without a searchable embedding: ${
-            error instanceof Error ? error.message : "Could not create an embedding."
-          }`,
-        );
-      }
-
-      const persistedUserMessage = await saveChatMessage(client, "user", prompt, userEmbedding);
-      const newUserMessage = {
-        id: persistedUserMessage.id,
-        role: persistedUserMessage.role,
-        text: persistedUserMessage.content,
-        versionNumber: persistedUserMessage.version_number,
-        thinkingSummary: persistedUserMessage.thinking_summary,
-      };
-      setMessageVersions((current) => ({
-        ...current,
-        [persistedUserMessage.id]: [
-          {
-            id: "",
-            user_id: persistedUserMessage.user_id,
-            message_id: persistedUserMessage.id,
-            version_number: persistedUserMessage.version_number,
-            content: persistedUserMessage.content,
-            embedding: null,
-            thinking_summary: persistedUserMessage.thinking_summary,
-            revision_reason: "initial",
-            created_at: persistedUserMessage.created_at,
-          },
-        ],
-      }));
-      setSelectedMessageVersions((current) => ({
-        ...current,
-        [persistedUserMessage.id]: persistedUserMessage.version_number,
-      }));
-      savedUserMessage = newUserMessage;
-      setMessages((current) => [...current, newUserMessage]);
+      jobAccepted = true;
+      setMessages((current) =>
+        current.some((item) => item.id === result.messageId)
+          ? current
+          : [
+              ...current,
+              {
+                id: result.messageId!,
+                role: "user",
+                text: prompt,
+                versionNumber: 1,
+                thinkingSummary: null,
+              },
+            ],
+      );
       setMessage("");
       setAttachedMedia([]);
       if (messageInputRef.current) messageInputRef.current.style.height = "52px";
-      if (showThinking) {
-        setThinkingSteps([
-          "Memuat riwayat dan preferensi percakapan…",
-          "Menganalisis pesan dan mencari konteks yang relevan…",
-        ]);
-      }
-
-      let currentInsight:
-        | Awaited<ReturnType<typeof analyzeGeminiMessage>>["insight"]
-        | undefined;
-      let queryEmbedding: number[] | null = null;
-      let insights: Awaited<ReturnType<typeof loadRecentInsights>> = [];
-      const [analysisResult, queryEmbeddingResult, insightsResult] = await Promise.allSettled([
-        analyzeGeminiMessage(keys, prompt, selectedIndex),
-        createEmbedding(selectedKey.api_key, prompt, "RETRIEVAL_QUERY"),
-        loadRecentInsights(client, 12, persistedUserMessage.id),
-      ]);
-
-      if (analysisResult.status === "fulfilled") {
-        const analysis = analysisResult.value;
-        attempts.push(...analysis.attempts);
-        currentInsight = analysis.insight;
-        nextApiIndexRef.current = (analysis.keyIndex + 1) % keys.length;
-      } else {
-        if (analysisResult.reason instanceof GeminiFailoverError) {
-          attempts.push(...analysisResult.reason.attempts);
-        }
-        warnings.push(
-          `Message insight was not saved: ${
-            analysisResult.reason instanceof Error
-              ? analysisResult.reason.message
-              : "Unknown analysis error."
-          }`,
-        );
-      }
-
-      if (queryEmbeddingResult.status === "fulfilled") {
-        queryEmbedding = queryEmbeddingResult.value;
-      } else {
-        warnings.push(
-          `Semantic history search is unavailable: ${
-            queryEmbeddingResult.reason instanceof Error
-              ? queryEmbeddingResult.reason.message
-              : "Could not create a retrieval query."
-          }`,
-        );
-      }
-      if (insightsResult.status === "fulfilled") {
-        insights = insightsResult.value;
-      } else {
-        warnings.push(
-          `Conversation insight lookup failed: ${
-            insightsResult.reason instanceof Error
-              ? insightsResult.reason.message
-              : "Unknown database error."
-          }`,
-        );
-      }
-
-      let relevantMessages: Array<{ role: "user" | "assistant"; content: string }> = [];
-      let memories: Array<{ category: string; content: string }> = [];
-      const contextResults = await Promise.allSettled([
-        queryEmbedding
-          ? findRelevantContext(client, queryEmbedding, persistedUserMessage.id)
-          : Promise.resolve(null),
-        currentInsight
-          ? saveMessageInsight(client, persistedUserMessage.id, currentInsight)
-          : Promise.resolve(),
-      ]);
-      if (contextResults[0].status === "fulfilled" && contextResults[0].value) {
-        relevantMessages = contextResults[0].value.messages;
-        memories = contextResults[0].value.memories;
-      } else if (contextResults[0].status === "rejected") {
-        warnings.push(
-          `Semantic history lookup failed: ${
-            contextResults[0].reason instanceof Error
-              ? contextResults[0].reason.message
-              : "Unknown retrieval error."
-          }`,
-        );
-      }
-      if (contextResults[1].status === "rejected") {
-        warnings.push(
-          `Message insight was not saved: ${
-            contextResults[1].reason instanceof Error
-              ? contextResults[1].reason.message
-              : "Unknown analysis error."
-          }`,
-        );
-      }
-      if (currentInsight) insights = [...insights, currentInsight];
-
-      if (showThinking) {
-        setThinkingSteps((steps) => [...steps, "Menyusun jawaban berdasarkan konteks…"]);
-      }
-      const result = await generateGeminiConversation(
-        keys,
-        prompt,
-        nextApiIndexRef.current,
-        profile ?? DEFAULT_PERSONALIZATION,
-        {
-          thinkingMode: showThinking,
-          history: history.slice(-12),
-          relevantMessages,
-          memories,
-          insights: insights.slice(-12),
-          feedback: recentFeedback,
-          executeTool: (name, input, apiKey) =>
-            executeChatDataTool(client!, apiKey, name, input, requestDeleteConfirmation),
-        },
-      );
-      attempts.push(...result.attempts);
-      nextApiIndexRef.current = (result.keyIndex + 1) % keys.length;
-
-      let thinkingSummary: string | null = null;
-      if (showThinking) {
-        try {
-          const summary = await generateThinkingSummary(
-            keys,
-            prompt,
-            result.text,
-            {
-              history: history.slice(-12).map(({ role, content }) => ({ role, content })),
-              relevantMessages,
-              memories,
-              insights,
-              feedback: recentFeedback,
-            },
-            result.keyIndex,
-          );
-          thinkingSummary = summary.summary;
-          attempts.push(...summary.attempts);
-        } catch (error) {
-          if (error instanceof GeminiFailoverError) attempts.push(...error.attempts);
-          warnings.push(
-            `The answer is ready, but the Thinking mode explanation could not be created: ${
-              error instanceof Error ? error.message : "Unknown Gemini error."
-            }`,
-          );
-        }
-      }
-      let assistantEmbedding: number[] | null = null;
-      try {
-        assistantEmbedding = await createEmbedding(
-          keys[result.keyIndex].api_key,
-          result.text,
-          "RETRIEVAL_DOCUMENT",
-        );
-      } catch (error) {
-        warnings.push(
-          `The reply will be saved, but semantic retrieval is unavailable for it: ${
-            error instanceof Error ? error.message : "Could not create an embedding."
-          }`,
-        );
-      }
-      let assistantSaved = false;
-      try {
-        const persistedReply = await saveChatMessage(
-          client,
-          "assistant",
-          result.text,
-          assistantEmbedding,
-          thinkingSummary,
-        );
-        savedAssistantMessage = {
-          id: persistedReply.id,
-          role: persistedReply.role,
-          text: persistedReply.content,
-          versionNumber: persistedReply.version_number,
-          thinkingSummary: persistedReply.thinking_summary,
-        };
-        const initialVersion = {
-          id: "",
-          user_id: persistedReply.user_id,
-          message_id: persistedReply.id,
-          version_number: persistedReply.version_number,
-          content: persistedReply.content,
-          embedding: null,
-          thinking_summary: persistedReply.thinking_summary,
-          revision_reason: "initial" as const,
-          created_at: persistedReply.created_at,
-        };
-        setMessageVersions((current) => ({
-          ...current,
-          [persistedReply.id]: [initialVersion],
-        }));
-        setSelectedMessageVersions((current) => ({
-          ...current,
-          [persistedReply.id]: persistedReply.version_number,
-        }));
-        setMessages((current) => [
-          ...current,
-          {
-            id: persistedReply.id,
-            role: persistedReply.role,
-            text: persistedReply.content,
-            versionNumber: persistedReply.version_number,
-            thinkingSummary: persistedReply.thinking_summary,
-          },
-        ]);
-        assistantSaved = true;
-      } catch (error) {
-        setMessages((current) => [
-          ...current,
-          {
-            id: `unsaved-${Date.now()}`,
-            role: "assistant",
-            text: result.text,
-            versionNumber: 1,
-            thinkingSummary,
-          },
-        ]);
-        warnings.push(
-          `The reply arrived but was not saved to the database: ${
-            error instanceof Error ? error.message : "Unknown database error."
-          }`,
-        );
-      }
-
-      try {
-        const refreshedHistory = await loadRecentChatMessages(client);
-        const refreshedVersions = await loadMessageVersions(
-          client,
-          refreshedHistory.map((item) => item.id),
-        );
-        setMessageVersions(refreshedVersions);
-        setSelectedMessageVersions((current) => ({
-          ...current,
-          ...Object.fromEntries(
-            refreshedHistory.map((item) => [item.id, item.version_number]),
-          ),
-        }));
-        setMessages([
-          ...refreshedHistory.map(
-            ({ id, role, content, version_number, thinking_summary }) => ({
-              id,
-              role,
-              text: content,
-              versionNumber: version_number,
-              thinkingSummary: thinking_summary,
-            }),
-          ),
-          ...(!assistantSaved
-            ? [{
-                id: `unsaved-${Date.now()}`,
-                role: "assistant" as const,
-                text: result.text,
-                versionNumber: 1,
-                thinkingSummary,
-              }]
-            : []),
-        ]);
-        if (savedAssistantMessage && savedUserMessage) {
-          for (const anchor of [savedUserMessage, savedAssistantMessage]) {
-            try {
-              await saveChatBranch(client, anchor.id, anchor.versionNumber);
-            } catch (error) {
-              warnings.push(
-                `Conversation history was saved, but its version branch could not be preserved: ${
-                  error instanceof Error ? error.message : "Unknown database error."
-                }`,
-              );
-            }
-          }
-        }
-      } catch (error) {
-        warnings.push(
-          `The chat is updated, but could not be refreshed after database actions: ${
-            error instanceof Error ? error.message : "Unknown database error."
-          }`,
-        );
-      }
-
-      const latestAttemptsByKey = new Map<string, GeminiAttempt>();
-      attempts.forEach((attempt) => latestAttemptsByKey.set(attempt.keyId, attempt));
-      const statusErrors: string[] = [];
-      for (const attempt of latestAttemptsByKey.values()) {
-        try {
-          await saveStatus(client, attempt);
-        } catch (error) {
-          statusErrors.push(error instanceof Error ? error.message : "Could not save API status.");
-        }
-      }
-      if (statusErrors.length > 0) {
-        warnings.push(`Gemini API status could not be saved: ${statusErrors.join("; ")}`);
-      }
-      if (warnings.length > 0) setSendError(warnings.join("\n"));
-      setThinkingSteps([]);
+      setThinkingSteps(showThinking ? ["Membaca pesan dan konteks percakapan…"] : []);
+      setRealtimeRevision((revision) => revision + 1);
     } catch (error) {
-      let detail = error instanceof Error ? error.message : "An unexpected error occurred.";
-      if (error instanceof GeminiFailoverError) attempts.push(...error.attempts);
-      if (client && saveStatus) {
-        const latestAttemptsByKey = new Map<string, GeminiAttempt>();
-        attempts.forEach((attempt) => latestAttemptsByKey.set(attempt.keyId, attempt));
-        const statusErrors: string[] = [];
-        for (const attempt of latestAttemptsByKey.values()) {
-          try {
-            await saveStatus(client, attempt);
-          } catch (statusError) {
-            statusErrors.push(
-              statusError instanceof Error ? statusError.message : "Could not save API status.",
-            );
-          }
-        }
-        if (statusErrors.length > 0) {
-          detail += `\nAPI status could not be saved: ${statusErrors.join("; ")}`;
-        }
-      }
-      if (savedUserMessage) {
-        detail = `Your message was saved, but the assistant could not complete the reply.\n${detail}`;
-      }
-      setSendError(detail);
-      setThinkingSteps([]);
+      setSendError(error instanceof Error ? error.message : "Could not send your message.");
     } finally {
-      setIsSending(false);
+      setThinkingSteps([]);
+      if (!jobAccepted) setIsSending(false);
     }
   }
 
@@ -1876,6 +1553,7 @@ export function App() {
               const visibleText = displayedMessageText(chatMessage);
               const visibleThinkingSummary = displayedThinkingSummary(chatMessage);
               const ratingKey = `${chatMessage.id}:${versionNumber}`;
+              const chatJob = chatJobsByMessageId.get(chatMessage.id);
               const versionControls = versions.length > 1 ? (
                 <div className="flex items-center gap-0.5 text-[11px] text-[#777a82]">
                   <button
@@ -1921,13 +1599,25 @@ export function App() {
                         setActiveUserActions(chatMessage.id);
                       }}
                       onDragStart={(event) => event.preventDefault()}
-                      className="max-w-[76%] select-none rounded-[18px] rounded-br-md bg-[#28292e] px-3 py-2 text-[13px] leading-5 text-white [webkit-touch-callout:none] sm:max-w-[70%]"
+                      className="max-w-[88%] select-none rounded-[18px] rounded-br-md bg-[#28292e] px-3 py-2 text-[13px] leading-5 text-white [webkit-touch-callout:none] sm:max-w-[82%]"
                       style={{ WebkitTouchCallout: "none" }}
                     >
                       <Suspense fallback={<p className="m-0 whitespace-pre-wrap">{visibleText}</p>}>
                         <AssistantMarkdown content={visibleText} userMessage />
                       </Suspense>
                     </div>
+                    {chatJob && (
+                      <p
+                        role={chatJob.status === "failed" ? "alert" : "status"}
+                        className={`mt-1 max-w-[88%] text-xs ${
+                          chatJob.status === "failed" ? "text-red-700" : "text-[#747780]"
+                        }`}
+                      >
+                        {chatJob.status === "failed"
+                          ? chatJob.error || "Cheya could not complete this response."
+                          : chatJob.progress || "Cheya is preparing a reply…"}
+                      </p>
+                    )}
                     {versionControls && (
                       <div className="mt-0.5 flex min-h-7 w-full items-center justify-end">
                         {versionControls}
@@ -2087,8 +1777,11 @@ export function App() {
             )}
             {isSending && (
               <div role="status" aria-live="polite" className="w-full space-y-1 text-xs text-[#747780]">
-                <p className="font-medium text-[#4b4e55]">CheyaVerse sedang menyusun jawaban…</p>
-                {isThinkMode && thinkingSteps.map((step) => <p key={step}>{step}</p>)}
+                <p className="font-medium text-[#4b4e55]">
+                  {activeChatJob?.progress || "CheyaVerse sedang menyusun jawaban…"}
+                </p>
+                {(activeChatJob?.thinking_mode ?? isThinkMode) &&
+                  thinkingSteps.map((step) => <p key={step}>{step}</p>)}
               </div>
             )}
             {!hasGeminiApiKey && !isLoadingHistory && (

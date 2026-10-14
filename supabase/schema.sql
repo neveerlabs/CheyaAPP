@@ -209,6 +209,57 @@ create policy "Users can manage their own conversation branches"
 
 grant select, insert, update, delete on public.chat_conversation_branches to authenticated;
 
+create table if not exists public.chat_message_jobs (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null default auth.uid() references auth.users (id) on delete cascade,
+  message_id uuid not null,
+  assistant_message_id uuid,
+  thinking_mode boolean not null default false,
+  status text not null default 'queued'
+    check (status in ('queued', 'processing', 'completed', 'failed')),
+  progress text not null default 'Queued for Cheya',
+  error text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  completed_at timestamptz,
+  foreign key (user_id, message_id)
+    references public.chat_messages (user_id, id)
+    on delete cascade,
+  foreign key (user_id, assistant_message_id)
+    references public.chat_messages (user_id, id)
+    on delete cascade
+);
+
+alter table public.chat_message_jobs
+    add column if not exists progress text not null default 'Queued for Cheya';
+
+create index if not exists chat_message_jobs_user_created_idx
+  on public.chat_message_jobs (user_id, created_at desc);
+
+create index if not exists chat_message_jobs_pending_idx
+  on public.chat_message_jobs (user_id, status)
+  where status in ('queued', 'processing');
+
+alter table public.chat_message_jobs enable row level security;
+
+drop policy if exists "Users can read their own chat message jobs"
+  on public.chat_message_jobs;
+create policy "Users can read their own chat message jobs"
+  on public.chat_message_jobs
+  for select
+  to authenticated
+  using (auth.uid() = user_id);
+
+drop policy if exists "Users can create their own chat message jobs"
+  on public.chat_message_jobs;
+create policy "Users can create their own chat message jobs"
+  on public.chat_message_jobs
+  for insert
+  to authenticated
+  with check (auth.uid() = user_id);
+
+grant select, insert on public.chat_message_jobs to authenticated;
+
 create or replace function public.record_chat_message_version()
 returns trigger
 language plpgsql
@@ -508,6 +559,243 @@ begin
     set messages = excluded.messages;
 end;
 $$;
+
+create or replace function public.create_chat_job(
+  p_content text,
+  p_thinking_mode boolean default false
+)
+returns table (job_id uuid, message_id uuid)
+language plpgsql
+security invoker
+set search_path = public, auth
+as $$
+declare
+  new_message_id uuid;
+  new_job_id uuid;
+begin
+  if auth.uid() is null then
+    raise exception 'Authentication is required to send a chat message.';
+  end if;
+  if length(trim(p_content)) = 0 or length(p_content) > 50000 then
+    raise exception 'Message content must be between 1 and 50000 characters.';
+  end if;
+
+  insert into public.chat_messages (user_id, role, content)
+  values (auth.uid(), 'user', p_content)
+  returning id into new_message_id;
+
+  insert into public.chat_message_jobs (user_id, message_id, thinking_mode)
+  values (auth.uid(), new_message_id, coalesce(p_thinking_mode, false))
+  returning id into new_job_id;
+
+  return query select new_job_id, new_message_id;
+end;
+$$;
+
+create or replace function public.complete_chat_job(
+  p_job_id uuid,
+  p_content text,
+  p_embedding extensions.vector(768),
+  p_thinking_summary text
+)
+returns setof public.chat_messages
+language plpgsql
+security definer
+set search_path = public, auth, extensions
+as $$
+declare
+  job public.chat_message_jobs%rowtype;
+  result public.chat_messages%rowtype;
+begin
+  if auth.role() <> 'service_role' then
+    raise exception 'Only the chat workflow can complete a message job.';
+  end if;
+  if length(trim(p_content)) = 0 or length(p_content) > 50000 then
+    raise exception 'Assistant response must be between 1 and 50000 characters.';
+  end if;
+
+  select * into job
+  from public.chat_message_jobs
+  where id = p_job_id
+  for update;
+  if not found then
+    raise exception 'Chat job not found.';
+  end if;
+
+  if job.status = 'completed' and job.assistant_message_id is not null then
+    return query
+    select *
+    from public.chat_messages
+    where id = job.assistant_message_id
+      and user_id = job.user_id;
+    return;
+  end if;
+
+  insert into public.chat_messages (
+    user_id,
+    role,
+    content,
+    embedding,
+    thinking_summary,
+    revision_reason
+  )
+  values (
+    job.user_id,
+    'assistant',
+    p_content,
+    p_embedding,
+    p_thinking_summary,
+    'initial'
+  )
+  returning * into result;
+
+  update public.chat_message_jobs
+  set assistant_message_id = result.id,
+      status = 'completed',
+      error = null,
+      updated_at = now(),
+      completed_at = now()
+  where id = p_job_id;
+
+  return next result;
+end;
+$$;
+
+create or replace function public.match_chat_messages_for_user(
+  p_user_id uuid,
+  query_embedding extensions.vector(768),
+  result_limit integer default 8,
+  exclude_message_id uuid default null
+)
+returns table (
+  id uuid,
+  role text,
+  content text,
+  created_at timestamptz,
+  similarity double precision
+)
+language plpgsql
+stable
+security definer
+set search_path = public, extensions, auth
+as $$
+begin
+  if auth.role() <> 'service_role' then
+    raise exception 'This retrieval function is reserved for the chat workflow.';
+  end if;
+
+  return query
+  select
+    messages.id,
+    messages.role,
+    messages.content,
+    messages.created_at,
+    1 - (messages.embedding <=> query_embedding) as similarity
+  from public.chat_messages as messages
+  where messages.user_id = p_user_id
+    and messages.is_active
+    and messages.embedding is not null
+    and messages.id is distinct from exclude_message_id
+  order by messages.embedding <=> query_embedding
+  limit least(greatest(result_limit, 1), 20);
+end;
+$$;
+
+create or replace function public.match_chat_messages_before_for_user(
+  p_user_id uuid,
+  query_embedding extensions.vector(768),
+  max_created_at timestamptz,
+  result_limit integer default 8,
+  exclude_message_id uuid default null
+)
+returns table (
+  id uuid,
+  role text,
+  content text,
+  created_at timestamptz,
+  similarity double precision
+)
+language plpgsql
+stable
+security definer
+set search_path = public, extensions, auth
+as $$
+begin
+  if auth.role() <> 'service_role' then
+    raise exception 'This retrieval function is reserved for the chat workflow.';
+  end if;
+
+  return query
+  select
+    messages.id,
+    messages.role,
+    messages.content,
+    messages.created_at,
+    1 - (messages.embedding <=> query_embedding) as similarity
+  from public.chat_messages as messages
+  where messages.user_id = p_user_id
+    and messages.is_active
+    and messages.embedding is not null
+    and messages.created_at < max_created_at
+    and messages.id is distinct from exclude_message_id
+  order by messages.embedding <=> query_embedding
+  limit least(greatest(result_limit, 1), 20);
+end;
+$$;
+
+create or replace function public.match_user_memories_for_user(
+  p_user_id uuid,
+  query_embedding extensions.vector(768),
+  result_limit integer default 6
+)
+returns table (
+  id uuid,
+  category text,
+  content text,
+  similarity double precision
+)
+language plpgsql
+stable
+security definer
+set search_path = public, extensions, auth
+as $$
+begin
+  if auth.role() <> 'service_role' then
+    raise exception 'This retrieval function is reserved for the chat workflow.';
+  end if;
+
+  return query
+  select
+    memories.id,
+    memories.category,
+    memories.content,
+    1 - (memories.embedding <=> query_embedding) as similarity
+  from public.user_memories as memories
+  where memories.user_id = p_user_id
+    and memories.embedding is not null
+  order by memories.embedding <=> query_embedding
+  limit least(greatest(result_limit, 1), 20);
+end;
+$$;
+
+revoke all on function public.create_chat_job(text, boolean) from public, anon;
+grant execute on function public.create_chat_job(text, boolean) to authenticated;
+revoke all on function public.complete_chat_job(uuid, text, extensions.vector, text)
+  from public, anon, authenticated;
+grant execute on function public.complete_chat_job(uuid, text, extensions.vector, text)
+  to service_role;
+revoke all on function public.match_chat_messages_for_user(uuid, extensions.vector, integer, uuid)
+  from public, anon, authenticated;
+grant execute on function public.match_chat_messages_for_user(uuid, extensions.vector, integer, uuid)
+  to service_role;
+revoke all on function public.match_chat_messages_before_for_user(uuid, extensions.vector, timestamptz, integer, uuid)
+  from public, anon, authenticated;
+grant execute on function public.match_chat_messages_before_for_user(uuid, extensions.vector, timestamptz, integer, uuid)
+  to service_role;
+revoke all on function public.match_user_memories_for_user(uuid, extensions.vector, integer)
+  from public, anon, authenticated;
+grant execute on function public.match_user_memories_for_user(uuid, extensions.vector, integer)
+  to service_role;
 
 revoke all on function public.restore_chat_branch(uuid, integer) from public, anon;
 grant execute on function public.restore_chat_branch(uuid, integer) to authenticated;
@@ -956,3 +1244,37 @@ grant execute on function public.match_chat_messages(extensions.vector, integer,
 grant execute on function public.match_chat_messages_before(extensions.vector, timestamptz, integer, uuid) to authenticated;
 grant execute on function public.match_user_memories(extensions.vector, integer) to authenticated;
 grant usage on schema extensions to authenticated;
+
+do $$
+declare
+  table_name text;
+begin
+  if exists (select 1 from pg_publication where pubname = 'supabase_realtime') then
+    foreach table_name in array array[
+      'chat_messages',
+      'chat_message_versions',
+      'chat_conversation_branches',
+      'chat_message_jobs',
+      'message_feedback',
+      'message_insights',
+      'user_memories',
+      'user_settings',
+      'ai_api_keys'
+    ]
+    loop
+      if not exists (
+        select 1
+        from pg_publication_tables
+        where pubname = 'supabase_realtime'
+          and schemaname = 'public'
+          and tablename = table_name
+      ) then
+        execute format(
+          'alter publication supabase_realtime add table public.%I',
+          table_name
+        );
+      end if;
+    end loop;
+  end if;
+end;
+$$;

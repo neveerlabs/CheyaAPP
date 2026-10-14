@@ -21,7 +21,7 @@ Vite prints the local development URL when the server starts.
 | Command | Description |
 | --- | --- |
 | `npm run dev` | Start the development server |
-| `npm run build` | Type-check and create a production build in `dist/` |
+| `npm run build` | Type-check and create a production build in `.output/` |
 | `npm run preview` | Preview the production build locally |
 
 ## Shared account service setup
@@ -50,11 +50,18 @@ insights.
    VITE_SUPABASE_PUBLISHABLE_KEY=<publishable-or-anon-key>
    VITE_GOOGLE_CLIENT_ID=<google-oauth-web-client-id>
    VITE_TURNSTILE_SITE_KEY=<cloudflare-turnstile-site-key>
+   SUPABASE_URL=https://<project-ref>.supabase.co
+   SUPABASE_PUBLISHABLE_KEY=<publishable-or-anon-key>
+   SUPABASE_SERVICE_ROLE_KEY=<supabase-service-role-secret>
    ```
 
    Use the same Supabase project and Google client ID across local development and deployments.
    These `VITE_*` values are included in the browser bundle and must be public values. Never expose
    a Supabase service-role/secret key or the Turnstile secret key in Vite, the browser, or Git.
+   `SUPABASE_SERVICE_ROLE_KEY` is a server-only Vercel environment variable required by durable chat
+   jobs; add it to Development, Preview, and Production environments as needed. The unprefixed
+   `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY` are server-side settings (the server can fall back
+   to their `VITE_*` counterparts).
 
 ### Local development
 
@@ -69,7 +76,8 @@ npm run dev
 ```
 
 Restart Vite after changing environment variables. Keep `.env.local` private and never commit it.
-If you do not use the Vercel CLI, create `.env.local` with only the four `VITE_*` values above.
+If you do not use the Vercel CLI, create `.env.local` with the four `VITE_*` values and the three
+server-side `SUPABASE_*` values above. Keep this file private; `.env.local` is ignored by Git.
 
 ### User setup and data
 
@@ -83,12 +91,13 @@ After a successful import, the old browser-specific Supabase connection is remov
 help button covers only how users create and add a Gemini API key; Google sign-in, CAPTCHA, and
 database infrastructure are managed by the operator.
 
-Text chat messages, per-message conversation insights, and semantic embeddings are stored in the
-connected Supabase project and protected by row-level security. Gemini analyzes each user message
-for tentative, non-clinical conversation insights and uses relevant past messages, saved memories,
-recent insights, and Personal settings as context. Its database tools are limited to the current
-user's chat, memories, and insights; the app asks before deleting a record. The browser sends
-message text to Gemini for replies, insights, and embeddings.
+Text chat messages, per-message conversation insights, semantic embeddings, and job status are
+stored in the connected Supabase project and protected by row-level security. A server-side Vercel
+Workflow processes each queued chat job, so refreshing the browser does not cancel generation.
+Supabase Realtime keeps chat and settings data in sync across tabs and signed-in devices. Gemini
+analyzes each user message for tentative, non-clinical conversation insights and uses relevant past
+messages, saved memories, recent insights, and Personal settings as context. Its database tools are
+limited to the current user's chat, memories, and insights.
 
 Assistant replies support Markdown, including fenced code blocks and `_underlined text_` (single
 underscores are rendered as underline in this app). User messages also render Markdown inside

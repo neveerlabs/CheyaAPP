@@ -116,6 +116,7 @@ export function SettingsPage({
   const [errorMessage, setErrorMessage] = useState("");
   const [notice, setNotice] = useState("");
   const [isSigningOut, setIsSigningOut] = useState(false);
+  const [realtimeRevision, setRealtimeRevision] = useState(0);
   const settingsContentRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -163,6 +164,71 @@ export function SettingsPage({
   }, [client]);
 
   useEffect(() => {
+    if (!client || !isDatabaseReady) return;
+    let isMounted = true;
+    let channel: ReturnType<typeof client.channel> | null = null;
+
+    void client.auth
+      .getUser()
+      .then(({ data, error }) => {
+        if (!isMounted) return;
+        if (error) {
+          setErrorMessage(`Could not start live settings sync: ${error.message}`);
+          return;
+        }
+        if (!data.user) {
+          setErrorMessage("Could not start live settings sync without an account.");
+          return;
+        }
+
+        channel = client
+          .channel(`settings-live-${data.user.id}`)
+          .on(
+            "postgres_changes",
+            {
+              event: "*",
+              schema: "public",
+              table: "ai_api_keys",
+            },
+            () => {
+              if (isMounted) setRealtimeRevision((revision) => revision + 1);
+            },
+          )
+          .on(
+            "postgres_changes",
+            {
+              event: "*",
+              schema: "public",
+              table: "user_settings",
+            },
+            () => {
+              if (isMounted) setRealtimeRevision((revision) => revision + 1);
+            },
+          )
+          .subscribe((status, error) => {
+            if (
+              isMounted &&
+              (status === "CHANNEL_ERROR" || status === "TIMED_OUT")
+            ) {
+              setErrorMessage(
+                `Live settings sync is unavailable: ${error?.message ?? status}.`,
+              );
+            }
+          });
+      })
+      .catch((error: unknown) => {
+        if (isMounted) {
+          setErrorMessage(`Could not start live settings sync: ${getErrorMessage(error)}`);
+        }
+      });
+
+    return () => {
+      isMounted = false;
+      if (channel) void client.removeChannel(channel);
+    };
+  }, [client, isDatabaseReady]);
+
+  useEffect(() => {
     if (!client || !isDatabaseReady) {
       setApiKeys([]);
       return;
@@ -188,7 +254,7 @@ export function SettingsPage({
     return () => {
       isMounted = false;
     };
-  }, [client, isDatabaseReady]);
+  }, [client, isDatabaseReady, pathname, realtimeRevision]);
 
   useEffect(() => {
     if (!client || !isDatabaseReady) return;
@@ -233,7 +299,7 @@ export function SettingsPage({
     return () => {
       isMounted = false;
     };
-  }, [client, isDatabaseReady]);
+  }, [client, isDatabaseReady, pathname, realtimeRevision]);
 
   useEffect(() => {
     if (!isHelpOpen) return;

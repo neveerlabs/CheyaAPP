@@ -1,0 +1,348 @@
+import { createServiceRoleClient } from "../src/lib/server-supabase";
+import {
+  createEmbedding,
+  executeChatDataTool,
+  findRelevantContext,
+  loadRecentAssistantFeedback,
+  loadRecentChatMessages,
+  loadRecentInsights,
+  saveChatBranch,
+  saveMessageInsight,
+} from "../src/lib/chat-data";
+import {
+  analyzeGeminiMessage,
+  generateGeminiConversation,
+  generateThinkingSummary,
+  GeminiFailoverError,
+  type GeminiAttempt,
+} from "../src/lib/gemini";
+import {
+  DEFAULT_PERSONALIZATION,
+  saveApiStatus,
+  type ChatMessageJob,
+  type GeminiApiKey,
+  type PersonalizationSettings,
+  type StoredChatMessage,
+} from "../src/lib/supabase";
+
+async function updateJob(
+  jobId: string,
+  userId: string,
+  values: Partial<Pick<ChatMessageJob, "status" | "progress" | "error" | "updated_at">>,
+) {
+  "use step";
+  const client = createServiceRoleClient();
+  const { error } = await client
+    .from("chat_message_jobs")
+    .update({ ...values, updated_at: new Date().toISOString() })
+    .eq("id", jobId)
+    .eq("user_id", userId)
+    .neq("status", "completed");
+  if (error) throw new Error(`Could not update chat processing status: ${error.message}`);
+}
+
+async function markJobFailed(jobId: string, message: string) {
+  "use step";
+  const client = createServiceRoleClient();
+  const { error } = await client
+    .from("chat_message_jobs")
+    .update({
+      status: "failed",
+      progress: "Cheya could not complete this response.",
+      error: message.slice(0, 2000),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", jobId)
+    .neq("status", "completed");
+  if (error) throw new Error(`Could not save the chat failure status: ${error.message}`);
+}
+
+async function processChatJob(jobId: string) {
+  "use step";
+  const client = createServiceRoleClient();
+  const { data: job, error: jobError } = await client
+    .from("chat_message_jobs")
+    .select("*")
+    .eq("id", jobId)
+    .maybeSingle();
+  if (jobError) throw new Error(`Could not load the chat job: ${jobError.message}`);
+  if (!job) throw new Error("The queued chat job no longer exists.");
+  if (job.status === "completed" || job.status === "failed") return;
+
+  const { data: userMessage, error: messageError } = await client
+    .from("chat_messages")
+    .select("id, user_id, role, content, embedding, created_at, version_number, thinking_summary, is_active, revision_reason")
+    .eq("id", job.message_id)
+    .eq("user_id", job.user_id)
+    .maybeSingle();
+  if (messageError) throw new Error(`Could not load the queued message: ${messageError.message}`);
+  if (!userMessage || userMessage.role !== "user") {
+    throw new Error("The queued user message could not be found.");
+  }
+
+  await updateJob(jobId, job.user_id, {
+    status: "processing",
+    progress: "Loading your chat history and settings…",
+    error: null,
+  });
+
+  const [{ data: keys, error: keysError }, { data: profile, error: profileError }] =
+    await Promise.all([
+      client
+        .from("ai_api_keys")
+        .select("id, model, api_key, status, last_error, created_at")
+        .eq("user_id", job.user_id)
+        .order("created_at", { ascending: true })
+        .order("id", { ascending: true }),
+      client
+        .from("user_settings")
+        .select("display_name, custom_prompt, chat_style")
+        .eq("user_id", job.user_id)
+        .maybeSingle(),
+    ]);
+  if (keysError) throw new Error(`Could not load Gemini API configuration: ${keysError.message}`);
+  if (profileError) throw new Error(`Could not load Personal settings: ${profileError.message}`);
+  if (keys.length === 0) throw new Error("Add a Gemini API key in Settings before chatting.");
+
+  const typedKeys: GeminiApiKey[] = keys;
+  const personalization: PersonalizationSettings = profile ?? DEFAULT_PERSONALIZATION;
+  const attempts: GeminiAttempt[] = [];
+  const warnings: string[] = [];
+
+  let messageEmbedding: number[] | null = null;
+  try {
+    messageEmbedding = await createEmbedding(
+      typedKeys[0].api_key,
+      userMessage.content,
+      "RETRIEVAL_DOCUMENT",
+    );
+    const serialized = `[${messageEmbedding.join(",")}]`;
+    const { error: messageUpdateError } = await client
+      .from("chat_messages")
+      .update({ embedding: serialized })
+      .eq("id", userMessage.id)
+      .eq("user_id", job.user_id);
+    if (messageUpdateError) throw messageUpdateError;
+    const { error: versionUpdateError } = await client
+      .from("chat_message_versions")
+      .update({ embedding: serialized })
+      .eq("message_id", userMessage.id)
+      .eq("user_id", job.user_id)
+      .eq("version_number", userMessage.version_number);
+    if (versionUpdateError) throw versionUpdateError;
+  } catch (error) {
+    warnings.push(
+      `The message was saved without a searchable embedding: ${
+        error instanceof Error ? error.message : "Could not create its embedding."
+      }`,
+    );
+  }
+
+  await updateJob(jobId, job.user_id, {
+    progress: "Analyzing your message and finding relevant context…",
+  });
+  const history = (await loadRecentChatMessages(client, 20, job.user_id))
+    .filter((item) => item.id !== userMessage.id)
+    .slice(-12);
+  const assistantIds = history
+    .filter((item) => item.role === "assistant")
+    .map((item) => item.id);
+  const [feedbackResult, insightsResult] = await Promise.allSettled([
+    loadRecentAssistantFeedback(client, assistantIds, 8, job.user_id),
+    loadRecentInsights(client, 12, userMessage.id, undefined, job.user_id),
+  ]);
+
+  let feedback: Awaited<ReturnType<typeof loadRecentAssistantFeedback>> = [];
+  if (feedbackResult.status === "fulfilled") feedback = feedbackResult.value;
+  else {
+    warnings.push(
+      `Saved response feedback could not be loaded: ${
+        feedbackResult.reason instanceof Error ? feedbackResult.reason.message : "Unknown error."
+      }`,
+    );
+  }
+
+  let insights: Awaited<ReturnType<typeof loadRecentInsights>> = [];
+  if (insightsResult.status === "fulfilled") insights = insightsResult.value;
+  else {
+    warnings.push(
+      `Conversation insights could not be loaded: ${
+        insightsResult.reason instanceof Error ? insightsResult.reason.message : "Unknown error."
+      }`,
+    );
+  }
+  let currentInsight:
+    | Awaited<ReturnType<typeof analyzeGeminiMessage>>["insight"]
+    | undefined;
+  let insightKeyIndex = 0;
+  try {
+    const analysis = await analyzeGeminiMessage(typedKeys, userMessage.content, 0);
+    currentInsight = analysis.insight;
+    insightKeyIndex = analysis.keyIndex;
+    attempts.push(...analysis.attempts);
+    await saveMessageInsight(client, userMessage.id, currentInsight, job.user_id);
+    insights = [...insights, currentInsight];
+  } catch (error) {
+    if (error instanceof GeminiFailoverError) attempts.push(...error.attempts);
+    warnings.push(
+      `Message insight could not be saved: ${
+        error instanceof Error ? error.message : "Unknown analysis error."
+      }`,
+    );
+  }
+
+  let relevantMessages: Array<{ role: "user" | "assistant"; content: string }> = [];
+  let memories: Array<{ category: string; content: string }> = [];
+  if (messageEmbedding) {
+    try {
+      const context = await findRelevantContext(
+        client,
+        messageEmbedding,
+        userMessage.id,
+        undefined,
+        job.user_id,
+      );
+      relevantMessages = context.messages;
+      memories = context.memories;
+    } catch (error) {
+      warnings.push(
+        `Semantic chat context could not be loaded: ${
+          error instanceof Error ? error.message : "Unknown retrieval error."
+        }`,
+      );
+    }
+  }
+
+  await updateJob(jobId, job.user_id, {
+    progress: job.thinking_mode
+      ? "Thinking through your request and preparing a reply…"
+      : "Preparing Cheya's reply…",
+  });
+  const result = await generateGeminiConversation(
+    typedKeys,
+    userMessage.content,
+    insightKeyIndex,
+    personalization,
+    {
+      thinkingMode: job.thinking_mode,
+      history: history.map(({ role, content }) => ({ role, content })),
+      relevantMessages,
+      memories,
+      insights: insights.slice(-12),
+      feedback,
+      executeTool: (name, input, apiKey) =>
+        executeChatDataTool(
+          client,
+          apiKey,
+          name,
+          input,
+          async () => false,
+          job.user_id,
+        ),
+    },
+  );
+  attempts.push(...result.attempts);
+
+  let thinkingSummary: string | null = null;
+  if (job.thinking_mode) {
+    try {
+      const summary = await generateThinkingSummary(
+        typedKeys,
+        userMessage.content,
+        result.text,
+        {
+          history: history.map(({ role, content }) => ({ role, content })),
+          relevantMessages,
+          memories,
+          insights,
+          feedback,
+        },
+        result.keyIndex,
+      );
+      thinkingSummary = summary.summary;
+      attempts.push(...summary.attempts);
+    } catch (error) {
+      if (error instanceof GeminiFailoverError) attempts.push(...error.attempts);
+      warnings.push(
+        `The answer is ready, but its Thinking summary could not be created: ${
+          error instanceof Error ? error.message : "Unknown Gemini error."
+        }`,
+      );
+    }
+  }
+
+  let assistantEmbedding: number[] | null = null;
+  try {
+    assistantEmbedding = await createEmbedding(
+      typedKeys[result.keyIndex].api_key,
+      result.text,
+      "RETRIEVAL_DOCUMENT",
+    );
+  } catch (error) {
+    warnings.push(
+      `The answer will be saved without a searchable embedding: ${
+        error instanceof Error ? error.message : "Could not create its embedding."
+      }`,
+    );
+  }
+
+  await updateJob(jobId, job.user_id, { progress: "Saving Cheya's response…" });
+  const { data: savedResponses, error: completeError } = await client.rpc("complete_chat_job", {
+    p_job_id: jobId,
+    p_content:
+      warnings.length > 0
+        ? `${result.text}\n\n> Note: ${warnings.join(" ")}`
+        : result.text,
+    p_embedding: assistantEmbedding ? `[${assistantEmbedding.join(",")}]` : null,
+    p_thinking_summary: thinkingSummary,
+  });
+  if (completeError) throw new Error(`Could not save Cheya's response: ${completeError.message}`);
+  const savedResponse = savedResponses[0] as StoredChatMessage | undefined;
+  if (!savedResponse) throw new Error("The database did not return the saved response.");
+
+  for (const attempt of attempts) {
+    try {
+      await saveApiStatus(client, attempt, job.user_id);
+    } catch (error) {
+      warnings.push(
+        `Gemini API status could not be updated: ${
+          error instanceof Error ? error.message : "Unknown database error."
+        }`,
+      );
+    }
+  }
+
+  for (const anchor of [userMessage, savedResponse]) {
+    try {
+      await saveChatBranch(client, anchor.id, anchor.version_number, job.user_id);
+    } catch (error) {
+      warnings.push(
+        `The response was saved, but conversation history could not be snapshotted: ${
+          error instanceof Error ? error.message : "Unknown database error."
+        }`,
+      );
+    }
+  }
+
+  if (warnings.length > 0) {
+    const { error: warningError } = await client
+      .from("chat_message_jobs")
+      .update({
+        progress: warnings.join("\n").slice(0, 2000),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", jobId)
+      .eq("user_id", job.user_id);
+    if (warningError) throw new Error(`Could not save response warnings: ${warningError.message}`);
+  }
+}
+
+export async function createChatResponseWorkflow(jobId: string) {
+  "use workflow";
+  try {
+    await processChatJob(jobId);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "An unexpected chat processing error occurred.";
+    await markJobFailed(jobId, message);
+  }
+}
