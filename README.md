@@ -103,12 +103,14 @@ analyzes each user message for tentative, non-clinical conversation insights and
 messages, saved memories, recent insights, and Personal settings as context. Its database tools are
 limited to the current user's chat, memories, and insights.
 
-Assistant replies support Markdown, including fenced code blocks and `_underlined text_` (single
-underscores are rendered as underline in this app). User messages also render Markdown inside
-compact bubbles; assistant replies use the full conversation width and include controls for
-feedback, regeneration, reporting, and copying. Fenced code blocks show syntax colors, line numbers,
-and a copy control. The **Think** toggle shows progress stages and an optional user-facing summary
-of the context used; it does not expose private internal reasoning.
+Assistant and user messages support GitHub-Flavored Markdown, including tables such as
+`| Key | Title |` followed by `|--|--|`, fenced code blocks, and `_underlined text_` (single
+underscores are rendered as underline in this app). Tables scroll horizontally when needed.
+Assistant replies use the full conversation width and include controls for feedback, regeneration,
+reporting, and copying. Fenced code blocks show syntax colors, line numbers, and a copy control.
+New assistant replies render with a fast typewriter effect. On opening the chat, the conversation
+automatically scrolls to its latest message. The **Think** toggle shows progress stages and an
+optional user-facing summary of the context used; it does not expose private internal reasoning.
 Edited user messages and regenerated replies keep their earlier versions. Version navigation
 restores the associated conversation branch—including its reply and later messages—and branch
 snapshots are stored in Supabase after new replies, edits, and regenerations. Run the latest
@@ -127,6 +129,14 @@ jobs, branch snapshots, and AI memories that were learned from a deleted message
 lets users create, edit, and delete durable personal memories; Cheya can also save a clearly durable
 user fact as a memory from chat. These memories are embedded and retrieved alongside RAG conversation
 context.
+
+Cheya can automatically use Google Search grounding for requests that need current or verifiable
+web information. Each search runs five refinement passes, inspects grounded source pages, and
+requires at least three distinct cited sources before returning research context to the assistant.
+No additional environment variable is required; the user's configured Gemini API key and model are
+used. Google Search grounding availability and billing depend on the model and Gemini API account;
+five refinement passes may consume multiple search requests, so account for the applicable API
+charges.
 
 Vercel runs the database keepalive endpoint daily. After five days without application-table
 activity, it performs and removes a small database pulse. Run the updated SQL schema and configure

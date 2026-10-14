@@ -15,6 +15,7 @@ import {
   generateGeminiConversation,
   generateThinkingSummary,
   GeminiFailoverError,
+  searchGeminiWeb,
   type GeminiAttempt,
 } from "../src/lib/gemini";
 import {
@@ -275,16 +276,27 @@ async function processChatJob(jobId: string) {
       memories,
       insights: insights.slice(-12),
       feedback,
-      executeTool: (name, input, apiKey) =>
-        executeChatDataTool(
+      executeTool: (name, input, key) => {
+        if (name === "search_web") {
+          const query =
+            typeof input === "object" &&
+            input !== null &&
+            "query" in input &&
+            typeof input.query === "string"
+              ? input.query
+              : "";
+          return searchGeminiWeb(key, query);
+        }
+        return executeChatDataTool(
           client,
-          apiKey,
+          key.api_key,
           name,
           input,
           async (label) => hasExplicitDeleteIntent(userMessage.content, label),
           job.user_id,
           userMessage.id,
-        ),
+        );
+      },
     },
   );
   attempts.push(...result.attempts);

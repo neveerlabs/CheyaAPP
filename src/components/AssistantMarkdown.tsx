@@ -1,4 +1,4 @@
-import { isValidElement, useState, type ReactNode } from "react";
+import { isValidElement, useEffect, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Root } from "mdast";
 import { visit } from "unist-util-visit";
@@ -212,15 +212,75 @@ const markdownComponents = {
   ul: ({ children }: { children?: ReactNode }) => (
     <ul className="my-2 list-disc space-y-1 pl-6">{children}</ul>
   ),
+  table: ({ children }: { children?: ReactNode }) => (
+    <div className="my-3 max-w-full overflow-x-auto rounded-xl border border-[#e5e6e9]">
+      <table className="min-w-full border-collapse text-left text-[13px] leading-5">
+        {children}
+      </table>
+    </div>
+  ),
+  thead: ({ children }: { children?: ReactNode }) => (
+    <thead className="bg-[#f4f5f7] text-[#282a30]">{children}</thead>
+  ),
+  th: ({ children }: { children?: ReactNode }) => (
+    <th className="border-b border-r border-[#e5e6e9] px-3 py-2 font-semibold last:border-r-0">
+      {children}
+    </th>
+  ),
+  td: ({ children }: { children?: ReactNode }) => (
+    <td className="border-b border-r border-[#eceef1] px-3 py-2 align-top last:border-r-0">
+      {children}
+    </td>
+  ),
+  tr: ({ children }: { children?: ReactNode }) => (
+    <tr className="last:[&>td]:border-b-0">{children}</tr>
+  ),
 };
 
 export function AssistantMarkdown({
   content,
   userMessage = false,
+  animate = false,
+  onTypewriterProgress,
+  onTypewriterComplete,
 }: {
   content: string;
   userMessage?: boolean;
+  animate?: boolean;
+  onTypewriterProgress?: () => void;
+  onTypewriterComplete?: () => void;
 }) {
+  const [renderedContent, setRenderedContent] = useState(animate ? "" : content);
+  const progressCallback = useRef(onTypewriterProgress);
+  const completeCallback = useRef(onTypewriterComplete);
+
+  useEffect(() => {
+    progressCallback.current = onTypewriterProgress;
+    completeCallback.current = onTypewriterComplete;
+  }, [onTypewriterComplete, onTypewriterProgress]);
+
+  useEffect(() => {
+    if (!animate) {
+      setRenderedContent(content);
+      return;
+    }
+
+    const characters = Array.from(content);
+    let index = 0;
+    setRenderedContent("");
+    const timer = window.setInterval(() => {
+      index = Math.min(index + 8, characters.length);
+      setRenderedContent(characters.slice(0, index).join(""));
+      progressCallback.current?.();
+      if (index === characters.length) {
+        window.clearInterval(timer);
+        completeCallback.current?.();
+      }
+    }, 18);
+
+    return () => window.clearInterval(timer);
+  }, [animate, content]);
+
   return (
     <div
       className={
@@ -230,7 +290,7 @@ export function AssistantMarkdown({
       }
     >
       <ReactMarkdown remarkPlugins={[remarkGfm, remarkUnderline]} components={markdownComponents}>
-        {content}
+        {renderedContent}
       </ReactMarkdown>
     </div>
   );

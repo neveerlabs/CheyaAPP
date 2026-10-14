@@ -32,6 +32,7 @@ import { AccountLogin } from "./AccountLogin";
 import {
   generateThinkingSummary,
   generateGeminiConversation,
+  searchGeminiWeb,
 } from "./lib/gemini";
 import type { AppSupabaseClient, ChatMessageJob, ChatMessageVersion } from "./lib/supabase";
 
@@ -134,6 +135,9 @@ export function App() {
   const [isSending, setIsSending] = useState(false);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [isRestoringVersion, setIsRestoringVersion] = useState(false);
+  const [typingAssistant, setTypingAssistant] = useState<{ id: string; content: string } | null>(
+    null,
+  );
   const [realtimeRevision, setRealtimeRevision] = useState(0);
   const [hasGeminiApiKey, setHasGeminiApiKey] = useState(false);
   const [isThinkMode, setIsThinkMode] = useState(false);
@@ -160,6 +164,8 @@ export function App() {
   const [isEditorLoading, setIsEditorLoading] = useState(false);
   const [viewport, setViewport] = useState({ height: 0, top: 0 });
   const conversationRef = useRef<HTMLDivElement>(null);
+  const pendingAssistantAnchorRef = useRef<string | null>(null);
+  const shouldScrollToLatestRef = useRef(true);
   const footerRef = useRef<HTMLElement>(null);
   const [footerHeight, setFooterHeight] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -228,6 +234,7 @@ export function App() {
 
   async function setMessageVersion(chatMessage: ChatMessage, direction: -1 | 1) {
     setSendError("");
+    setTypingAssistant(null);
     const messageIndex = messages.findIndex((item) => item.id === chatMessage.id);
     const versions = messageVersions[chatMessage.id] ?? [];
     if (versions.length < 2) return;
@@ -350,6 +357,47 @@ export function App() {
     });
     return () => window.cancelAnimationFrame(frame);
   }, [isSending, thinkingSteps, messages.length]);
+
+  useEffect(() => {
+    if (
+      !shouldScrollToLatestRef.current ||
+      pathname !== "/" ||
+      isAuthLoading ||
+      isLoadingHistory ||
+      !authClient ||
+      !authUser
+    ) {
+      return;
+    }
+
+    let secondFrame = 0;
+    const firstFrame = window.requestAnimationFrame(() => {
+      if (conversationRef.current) {
+        conversationRef.current.scrollTop = conversationRef.current.scrollHeight;
+      }
+      secondFrame = window.requestAnimationFrame(() => {
+        if (conversationRef.current) {
+          conversationRef.current.scrollTop = conversationRef.current.scrollHeight;
+        }
+        shouldScrollToLatestRef.current = false;
+      });
+    });
+    return () => {
+      window.cancelAnimationFrame(firstFrame);
+      if (secondFrame) window.cancelAnimationFrame(secondFrame);
+    };
+  }, [authClient, authUser, isAuthLoading, isLoadingHistory, messages.length, pathname]);
+
+  useEffect(() => {
+    const anchorId = pendingAssistantAnchorRef.current;
+    if (!anchorId) return;
+    const anchorIndex = messages.findIndex((item) => item.id === anchorId);
+    if (anchorIndex < 0) return;
+    const response = messages.slice(anchorIndex + 1).find((item) => item.role === "assistant");
+    if (!response) return;
+    pendingAssistantAnchorRef.current = null;
+    setTypingAssistant({ id: response.id, content: displayedMessageText(response) });
+  }, [messages]);
 
   useEffect(() => {
     const footer = footerRef.current;
@@ -495,8 +543,22 @@ export function App() {
         if (isMounted) {
           setHasGeminiApiKey(keyResult.data.length > 0);
           setChatJobs(jobsResult.data);
+          const pendingJob = jobsResult.data.find(
+            (job) => job.status === "queued" || job.status === "processing",
+          );
+          if (pendingJob) {
+            pendingAssistantAnchorRef.current = pendingJob.message_id;
+          } else if (
+            jobsResult.data.some(
+              (job) =>
+                job.status === "failed" &&
+                job.message_id === pendingAssistantAnchorRef.current,
+            )
+          ) {
+            pendingAssistantAnchorRef.current = null;
+          }
           setIsSending(
-            jobsResult.data.some((job) => job.status === "queued" || job.status === "processing"),
+            Boolean(pendingJob),
           );
           setRatings(loadedRatings);
           setMessageVersions(loadedVersions);
@@ -622,6 +684,7 @@ export function App() {
         return;
       }
 
+      if (nextPath === "/") shouldScrollToLatestRef.current = true;
       setPathname(nextPath);
     };
     window.addEventListener("popstate", handlePopState);
@@ -837,6 +900,7 @@ export function App() {
       }
 
       jobAccepted = true;
+      pendingAssistantAnchorRef.current = result.messageId;
       setMessages((current) =>
         current.some((item) => item.id === result.messageId)
           ? current
@@ -1181,16 +1245,27 @@ export function App() {
             feedback: previousFeedback.rating,
             reports: previousFeedback.reports,
           },
-          executeTool: (name, input, apiKey) =>
-            executeChatDataTool(
+          executeTool: (name, input, key) => {
+            if (name === "search_web") {
+              const query =
+                typeof input === "object" &&
+                input !== null &&
+                "query" in input &&
+                typeof input.query === "string"
+                  ? input.query
+                  : "";
+              return searchGeminiWeb(key, query);
+            }
+            return executeChatDataTool(
               client,
-              apiKey,
+              key.api_key,
               name,
               input,
               requestDeleteConfirmation,
               undefined,
               sourceMessage.id,
-            ),
+            );
+          },
         },
       );
       let thinkingSummary: string | null = null;
@@ -1569,21 +1644,21 @@ export function App() {
             <img
               src={cheyaLogo}
               alt="CheyaVerse logo"
-              className="size-10 shrink-0 rounded-full object-cover"
+              className="pointer-events-none size-10 shrink-0 rounded-full object-cover select-none"
               draggable={false}
             />
-            <div className="flex min-w-0 flex-col justify-center">
+            <div className="pointer-events-none flex min-w-0 flex-col justify-center select-none">
               <div className="flex items-center gap-0.5">
                 <h1 className="truncate text-base font-semibold leading-5 text-[#17181b]">
                   CheyaVerse
                 </h1>
                 <BadgeCheck
                   aria-label="Verified account"
-                  className="size-[18px] shrink-0 fill-[#28a9e0] text-white"
+                  className="pointer-events-none size-[18px] shrink-0 fill-[#28a9e0] text-white select-none"
                   strokeWidth={2.5}
                 />
               </div>
-              <p className="truncate text-[11px] leading-4 text-[#96989d]">
+              <p className="pointer-events-none truncate text-[11px] leading-4 text-[#96989d] select-none">
                 Service notifications
               </p>
             </div>
@@ -1634,6 +1709,9 @@ export function App() {
               );
               const visibleText = displayedMessageText(chatMessage);
               const visibleThinkingSummary = displayedThinkingSummary(chatMessage);
+              const animateAssistant =
+                typingAssistant?.id === chatMessage.id &&
+                typingAssistant.content === visibleText;
               const ratingKey = `${chatMessage.id}:${versionNumber}`;
               const chatJob = chatJobsByMessageId.get(chatMessage.id);
               const versionControls = versions.length > 1 ? (
@@ -1788,7 +1866,19 @@ export function App() {
                   )}
                   <div className="max-w-full break-words text-[14px] leading-6 sm:text-[15px]">
                     <Suspense fallback={<p className="whitespace-pre-wrap">{visibleText}</p>}>
-                      <AssistantMarkdown content={visibleText} />
+                      <AssistantMarkdown
+                        content={visibleText}
+                        animate={animateAssistant}
+                        onTypewriterProgress={() => {
+                          const conversation = conversationRef.current;
+                          if (conversation) conversation.scrollTop = conversation.scrollHeight;
+                        }}
+                        onTypewriterComplete={() =>
+                          setTypingAssistant((current) =>
+                            current?.id === chatMessage.id ? null : current,
+                          )
+                        }
+                      />
                     </Suspense>
                   </div>
                   <div
