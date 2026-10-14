@@ -1,6 +1,7 @@
 import {
   AudioLines,
   ArrowLeft,
+  ArrowDown,
   ArrowRight,
   BadgeCheck,
   Bell,
@@ -32,7 +33,6 @@ import { AccountLogin } from "./AccountLogin";
 import {
   generateThinkingSummary,
   generateGeminiConversation,
-  searchGeminiWeb,
 } from "./lib/gemini";
 import type { AppSupabaseClient, ChatMessageJob, ChatMessageVersion } from "./lib/supabase";
 
@@ -138,11 +138,15 @@ export function App() {
   const [typingAssistant, setTypingAssistant] = useState<{ id: string; content: string } | null>(
     null,
   );
+  const [showScrollToLatest, setShowScrollToLatest] = useState(false);
   const [realtimeRevision, setRealtimeRevision] = useState(0);
   const [hasGeminiApiKey, setHasGeminiApiKey] = useState(false);
   const [isThinkMode, setIsThinkMode] = useState(false);
   const [thinkingSteps, setThinkingSteps] = useState<string[]>([]);
   const [expandedThinkingIds, setExpandedThinkingIds] = useState<Set<string>>(() => new Set());
+  const LinkPreviews = lazy(() =>
+    import("./components/LinkPreviews").then((module) => ({ default: module.LinkPreviews })),
+  );
   const [ratings, setRatings] = useState<Record<string, AssistantRating>>({});
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [reportTarget, setReportTarget] = useState<ReportTarget | null>(null);
@@ -166,6 +170,7 @@ export function App() {
   const conversationRef = useRef<HTMLDivElement>(null);
   const pendingAssistantAnchorRef = useRef<string | null>(null);
   const shouldScrollToLatestRef = useRef(true);
+  const followLatestRef = useRef(true);
   const footerRef = useRef<HTMLElement>(null);
   const [footerHeight, setFooterHeight] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -188,6 +193,22 @@ export function App() {
   const activeChatJob = chatJobs.find(
     (job) => job.status === "queued" || job.status === "processing",
   );
+
+  function scrollConversationToLatest(behavior: ScrollBehavior = "smooth") {
+    const conversation = conversationRef.current;
+    if (!conversation) return;
+    conversation.scrollTo({ top: conversation.scrollHeight, behavior });
+  }
+
+  function handleConversationScroll() {
+    const conversation = conversationRef.current;
+    if (!conversation) return;
+    setShowScrollToLatest(
+      conversation.scrollHeight - conversation.scrollTop - conversation.clientHeight > 120,
+    );
+    followLatestRef.current =
+      conversation.scrollHeight - conversation.scrollTop - conversation.clientHeight <= 120;
+  }
   const mediaPreviews = useMemo(
     () =>
       new Map(
@@ -389,6 +410,16 @@ export function App() {
   }, [authClient, authUser, isAuthLoading, isLoadingHistory, messages.length, pathname]);
 
   useEffect(() => {
+    const conversationContent = conversationRef.current?.firstElementChild;
+    if (!(conversationContent instanceof HTMLElement)) return;
+    const observer = new ResizeObserver(() => {
+      if (followLatestRef.current) scrollConversationToLatest("auto");
+    });
+    observer.observe(conversationContent);
+    return () => observer.disconnect();
+  }, [pathname]);
+
+  useEffect(() => {
     const anchorId = pendingAssistantAnchorRef.current;
     if (!anchorId) return;
     const anchorIndex = messages.findIndex((item) => item.id === anchorId);
@@ -497,6 +528,8 @@ export function App() {
     }
 
     let isMounted = true;
+    shouldScrollToLatestRef.current = true;
+    followLatestRef.current = true;
     setIsLoadingHistory(true);
     void (async () => {
       try {
@@ -574,6 +607,7 @@ export function App() {
               thinkingSummary: thinking_summary,
             })),
           );
+          shouldScrollToLatestRef.current = true;
         }
       } catch (error) {
         if (isMounted) {
@@ -1254,7 +1288,36 @@ export function App() {
                 typeof input.query === "string"
                   ? input.query
                   : "";
-              return searchGeminiWeb(key, query);
+              if (!authClient) throw new Error("Sign in before searching the web.");
+              return authClient.auth.getSession().then(async ({ data, error }) => {
+                if (error) throw error;
+                if (!data.session?.access_token) {
+                  throw new Error("Your account session has expired. Sign in again.");
+                }
+                const response = await fetch("/api/web-search", {
+                  method: "POST",
+                  headers: {
+                    Authorization: `Bearer ${data.session.access_token}`,
+                    "Content-Type": "application/json",
+                  },
+                  body: JSON.stringify({ query }),
+                });
+                const payload: unknown = await response.json().catch(() => null);
+                if (!response.ok) {
+                  const message =
+                    typeof payload === "object" &&
+                    payload !== null &&
+                    "statusMessage" in payload &&
+                    typeof payload.statusMessage === "string"
+                      ? payload.statusMessage
+                      : `Web search failed (${response.status}).`;
+                  throw new Error(message);
+                }
+                if (!payload || typeof payload !== "object") {
+                  throw new Error("The web search service returned an invalid result.");
+                }
+                return payload;
+              });
             }
             return executeChatDataTool(
               client,
@@ -1697,6 +1760,7 @@ export function App() {
           ref={conversationRef}
           aria-label="Conversation"
           aria-live="polite"
+          onScroll={handleConversationScroll}
           className="absolute inset-0 overflow-y-auto overscroll-contain px-4 pt-[72px] sm:px-6"
           style={{ paddingBottom: `${footerHeight + 12}px` }}
         >
@@ -1764,6 +1828,9 @@ export function App() {
                     >
                       <Suspense fallback={<p className="m-0 whitespace-pre-wrap">{visibleText}</p>}>
                         <AssistantMarkdown content={visibleText} userMessage />
+                      </Suspense>
+                      <Suspense fallback={null}>
+                        <LinkPreviews content={visibleText} client={authClient} userMessage />
                       </Suspense>
                     </div>
                     {chatJob && (
@@ -1870,8 +1937,7 @@ export function App() {
                         content={visibleText}
                         animate={animateAssistant}
                         onTypewriterProgress={() => {
-                          const conversation = conversationRef.current;
-                          if (conversation) conversation.scrollTop = conversation.scrollHeight;
+                          if (followLatestRef.current) scrollConversationToLatest("auto");
                         }}
                         onTypewriterComplete={() =>
                           setTypingAssistant((current) =>
@@ -1879,6 +1945,9 @@ export function App() {
                           )
                         }
                       />
+                    </Suspense>
+                    <Suspense fallback={null}>
+                      <LinkPreviews content={visibleText} client={authClient} />
                     </Suspense>
                   </div>
                   <div
@@ -2004,6 +2073,19 @@ export function App() {
             )}
           </div>
         </div>
+
+        {showScrollToLatest && pathname === "/" && (
+          <button
+            type="button"
+            aria-label="Scroll to latest message"
+            title="Scroll to latest message"
+            onClick={() => scrollConversationToLatest()}
+            className="absolute right-4 z-30 flex size-11 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] shadow-[0_3px_14px_rgba(20,24,32,0.16)] transition hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
+            style={{ bottom: `${footerHeight + 16}px` }}
+          >
+            <ArrowDown aria-hidden="true" className="size-5" />
+          </button>
+        )}
 
         <footer
           ref={footerRef}

@@ -15,9 +15,9 @@ import {
   generateGeminiConversation,
   generateThinkingSummary,
   GeminiFailoverError,
-  searchGeminiWeb,
   type GeminiAttempt,
 } from "../src/lib/gemini";
+import { searchWebWithFallback } from "../src/lib/server-web-search";
 import {
   DEFAULT_PERSONALIZATION,
   saveApiStatus,
@@ -285,7 +285,7 @@ async function processChatJob(jobId: string) {
             typeof input.query === "string"
               ? input.query
               : "";
-          return searchGeminiWeb(key, query);
+          return searchWebWithFallback(query, typedKeys);
         }
         return executeChatDataTool(
           client,

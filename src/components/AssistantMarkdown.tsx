@@ -128,11 +128,11 @@ function CodeBlock({ code, language }: { code: string; language: string }) {
           )}
         </button>
       </header>
-      <div className="overflow-x-auto">
+      <div className="max-h-32 overflow-auto">
         <div className="flex min-w-max py-2 font-mono">
           <div
             aria-hidden="true"
-            className="sticky left-0 z-10 shrink-0 border-r border-white/10 bg-[#171a21] px-2.5 text-right text-[#6e7681] select-none"
+            className="sticky left-0 top-0 z-10 shrink-0 border-r border-white/10 bg-[#171a21] px-2.5 text-right text-[#6e7681] select-none"
           >
             {lines.map((_, index) => (
               <div key={index} className="h-5">
@@ -140,7 +140,7 @@ function CodeBlock({ code, language }: { code: string; language: string }) {
               </div>
             ))}
           </div>
-          <pre className="m-0 px-3 text-[12px] leading-5">
+          <pre className="m-0 whitespace-pre px-3 text-[12px] leading-5">
             <code>{highlightCode(code, language)}</code>
           </pre>
         </div>

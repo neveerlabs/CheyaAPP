@@ -54,6 +54,8 @@ insights.
    SUPABASE_PUBLISHABLE_KEY=<publishable-or-anon-key>
    SUPABASE_SERVICE_ROLE_KEY=<supabase-service-role-secret>
    CRON_SECRET=<random-secret-at-least-32-characters>
+   TAVILY_API_KEY=<tavily-search-api-key>
+   BRAVE_SEARCH_API_KEY=<brave-search-api-key>
    ```
 
    Use the same Supabase project and Google client ID across local development and deployments.
@@ -64,7 +66,9 @@ insights.
    needed. `CRON_SECRET` is server-only and protects the scheduled keepalive endpoint. Generate it
    with `openssl rand -base64 32`; add the same value to Vercel and local `.env.local`. The unprefixed
    `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY` are server-side settings (the server can fall back
-   to their `VITE_*` counterparts).
+   to their `VITE_*` counterparts. `TAVILY_API_KEY` and `BRAVE_SEARCH_API_KEY` are server-only search
+   provider keys. Configure both in Vercel to enable independent provider failover; get them from
+   the Tavily and Brave Search developer dashboards. Never use a `VITE_` prefix for these keys.
 
 ### Local development
 
@@ -79,9 +83,9 @@ npm run dev
 ```
 
 Restart Vite after changing environment variables. Keep `.env.local` private and never commit it.
-If you do not use the Vercel CLI, create `.env.local` with the four `VITE_*` values and the three
-server-side `SUPABASE_*` values and `CRON_SECRET` above. Keep this file private; `.env.local` is
-ignored by Git.
+If you do not use the Vercel CLI, create `.env.local` with the four `VITE_*` values, the server-side
+`SUPABASE_*` values, `CRON_SECRET`, and the optional provider keys above. Keep this file private;
+`.env.local` is ignored by Git.
 
 ### User setup and data
 
@@ -131,12 +135,17 @@ user fact as a memory from chat. These memories are embedded and retrieved along
 context.
 
 Cheya can automatically use Google Search grounding for requests that need current or verifiable
-web information. Each search runs five refinement passes, inspects grounded source pages, and
-requires at least three distinct cited sources before returning research context to the assistant.
-No additional environment variable is required; the user's configured Gemini API key and model are
-used. Google Search grounding availability and billing depend on the model and Gemini API account;
-five refinement passes may consume multiple search requests, so account for the applicable API
-charges.
+web information. If grounding is unavailable or fails, the server retries and falls back to Tavily
+and then Brave Search, with query refinement across five passes and at least three distinct source
+URLs required. Configure both optional provider keys in Vercel for independent failover. Search
+results include source URLs and page text; Tavily returns extracted page content, while Brave
+results are supplemented by safely fetched public pages. Google Search grounding availability and
+billing depend on the model and Gemini API account; five refinement passes may consume multiple
+search requests, so account for applicable provider charges.
+
+Messages containing up to two public HTTPS links can show a preview with page title, description,
+site name, and available image/video metadata. Preview loading is authenticated, rejects local or
+private network destinations, limits redirects and response size, and only reads HTML.
 
 Vercel runs the database keepalive endpoint daily. After five days without application-table
 activity, it performs and removes a small database pulse. Run the updated SQL schema and configure
