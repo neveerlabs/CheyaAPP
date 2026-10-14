@@ -97,8 +97,10 @@ feedback, regeneration, reporting, and copying. Fenced code blocks show syntax c
 and a copy control. The **Think** toggle shows progress stages and an optional user-facing summary
 of the context used; it does not expose private internal reasoning.
 Edited user messages and regenerated replies keep their earlier versions. Version navigation
-restores the associated conversation branch—including its reply and later messages—and branches
-are stored in Supabase. Run the latest `supabase/schema.sql` to enable this for an existing project.
+restores the associated conversation branch—including its reply and later messages—and branch
+snapshots are stored in Supabase after new replies, edits, and regenerations. Run the latest
+`supabase/schema.sql` in the shared project's SQL Editor to enable this for an existing project;
+version navigation cannot restore branches that were never previously saved.
 Like/dislike feedback is stored per reply version, and regeneration retrieves chat context and
 insights from before the revised message.
 

@@ -417,8 +417,66 @@ begin
 end;
 $$;
 
+create or replace function public.save_chat_branch(
+  p_anchor_message_id uuid,
+  p_anchor_version_number integer
+)
+returns void
+language plpgsql
+security invoker
+set search_path = public, auth
+as $$
+declare
+  anchor_exists boolean;
+begin
+  if auth.uid() is null then
+    raise exception 'Authentication is required.';
+  end if;
+
+  select exists (
+    select 1
+    from public.chat_messages
+    where id = p_anchor_message_id
+      and user_id = auth.uid()
+      and version_number = p_anchor_version_number
+      and is_active
+  ) into anchor_exists;
+  if not anchor_exists then
+    raise exception 'The active message version was not found.';
+  end if;
+
+  insert into public.chat_conversation_branches (
+    user_id,
+    anchor_message_id,
+    anchor_version_number,
+    messages
+  )
+  select
+    auth.uid(),
+    p_anchor_message_id,
+    p_anchor_version_number,
+    coalesce(
+      jsonb_agg(
+        jsonb_build_object(
+          'message_id', messages.id,
+          'version_number', messages.version_number
+        )
+        order by messages.created_at, messages.id
+      ),
+      '[]'::jsonb
+    )
+  from public.chat_messages as messages
+  where messages.user_id = auth.uid()
+    and messages.is_active
+  on conflict (user_id, anchor_message_id, anchor_version_number) do update
+    set messages = excluded.messages;
+end;
+$$;
+
 revoke all on function public.restore_chat_branch(uuid, integer) from public, anon;
 grant execute on function public.restore_chat_branch(uuid, integer) to authenticated;
+revoke all on function public.save_chat_branch(uuid, integer) from public, anon;
+grant execute on function public.save_chat_branch(uuid, integer) to authenticated;
 
 grant execute on function public.revise_chat_message(
   uuid,

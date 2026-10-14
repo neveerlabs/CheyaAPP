@@ -129,6 +129,7 @@ export function App() {
   const [selectedMessageVersions, setSelectedMessageVersions] = useState<Record<string, number>>({});
   const [isSending, setIsSending] = useState(false);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const [isRestoringVersion, setIsRestoringVersion] = useState(false);
   const [hasGeminiApiKey, setHasGeminiApiKey] = useState(false);
   const [isThinkMode, setIsThinkMode] = useState(false);
   const [thinkingSteps, setThinkingSteps] = useState<string[]>([]);
@@ -153,6 +154,8 @@ export function App() {
   const [isEditorLoading, setIsEditorLoading] = useState(false);
   const [viewport, setViewport] = useState({ height: 0, top: 0 });
   const conversationRef = useRef<HTMLDivElement>(null);
+  const footerRef = useRef<HTMLElement>(null);
+  const [footerHeight, setFooterHeight] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const filesInputRef = useRef<HTMLInputElement>(null);
   const cameraCaptureInputRef = useRef<HTMLInputElement>(null);
@@ -218,6 +221,8 @@ export function App() {
     if (!nextVersion) return;
 
     if (authClient) {
+      if (isRestoringVersion) return;
+      setIsRestoringVersion(true);
       try {
         const { restoreChatBranch, loadMessageVersions } = await import("./lib/chat-data");
         const branch = await restoreChatBranch(
@@ -251,6 +256,8 @@ export function App() {
           error instanceof Error ? error.message : "Could not restore this conversation branch.",
         );
         return;
+      } finally {
+        setIsRestoringVersion(false);
       }
     }
 
@@ -326,6 +333,16 @@ export function App() {
     });
     return () => window.cancelAnimationFrame(frame);
   }, [isSending, thinkingSteps, messages.length]);
+
+  useEffect(() => {
+    const footer = footerRef.current;
+    if (!footer) return;
+    const updateHeight = () => setFooterHeight(footer.offsetHeight);
+    updateHeight();
+    const observer = new ResizeObserver(updateHeight);
+    observer.observe(footer);
+    return () => observer.disconnect();
+  }, [attachedMedia.length, hasMessage, viewport.height]);
 
   useEffect(() => {
     let isMounted = true;
@@ -721,6 +738,7 @@ export function App() {
     const attempts: GeminiAttempt[] = [];
     const warnings: string[] = [];
     let savedUserMessage: ChatMessage | null = null;
+    let savedAssistantMessage: ChatMessage | null = null;
 
     try {
       const {
@@ -738,6 +756,7 @@ export function App() {
         loadRecentAssistantFeedback,
         loadRecentChatMessages,
         loadRecentInsights,
+        saveChatBranch,
         saveChatMessage,
         saveMessageInsight,
       } = await import("./lib/chat-data");
@@ -1006,6 +1025,13 @@ export function App() {
           assistantEmbedding,
           thinkingSummary,
         );
+        savedAssistantMessage = {
+          id: persistedReply.id,
+          role: persistedReply.role,
+          text: persistedReply.content,
+          versionNumber: persistedReply.version_number,
+          thinkingSummary: persistedReply.thinking_summary,
+        };
         const initialVersion = {
           id: "",
           user_id: persistedReply.user_id,
@@ -1087,6 +1113,19 @@ export function App() {
               }]
             : []),
         ]);
+        if (savedAssistantMessage && savedUserMessage) {
+          for (const anchor of [savedUserMessage, savedAssistantMessage]) {
+            try {
+              await saveChatBranch(client, anchor.id, anchor.versionNumber);
+            } catch (error) {
+              warnings.push(
+                `Conversation history was saved, but its version branch could not be preserved: ${
+                  error instanceof Error ? error.message : "Unknown database error."
+                }`,
+              );
+            }
+          }
+        }
       } catch (error) {
         warnings.push(
           `The chat is updated, but could not be refreshed after database actions: ${
@@ -1224,7 +1263,10 @@ export function App() {
     await copyMessageText(chatMessage.id, displayedMessageText(chatMessage));
   }
 
-  async function regenerateAssistantMessage(messageId: string, editedSourceText?: string) {
+  async function regenerateAssistantMessage(
+    messageId: string,
+    editedSource?: { text: string; versionNumber: number },
+  ) {
     if (isSending) return;
     const assistantIndex = messages.findIndex((item) => item.id === messageId);
     const sourceIndex = assistantIndex - 1;
@@ -1238,7 +1280,7 @@ export function App() {
       setSendError("Could not find the user message for this reply.");
       return;
     }
-    const sourceText = editedSourceText ?? displayedMessageText(sourceMessage);
+    const sourceText = editedSource?.text ?? displayedMessageText(sourceMessage);
     const previousAnswer = displayedMessageText(messages[assistantIndex]);
     const previousVersionNumber = displayedVersionNumber(messages[assistantIndex]);
 
@@ -1265,6 +1307,7 @@ export function App() {
           loadMessageVersions,
           loadRecentAssistantFeedback,
           loadRecentInsights,
+          saveChatBranch,
           updateChatMessage,
         },
       ] = await Promise.all([import("./lib/supabase"), import("./lib/chat-data")]);
@@ -1452,6 +1495,26 @@ export function App() {
       );
       if (!updatedMessage) throw new Error("This reply could not be found in the database.");
 
+      for (const anchor of [
+        {
+          id: updatedMessage.id,
+          versionNumber: updatedMessage.version_number,
+        },
+        ...(editedSource
+          ? [{ id: sourceMessage.id, versionNumber: editedSource.versionNumber }]
+          : []),
+      ]) {
+        try {
+          await saveChatBranch(client, anchor.id, anchor.versionNumber);
+        } catch (error) {
+          regenerationWarnings.push(
+            `Reply was regenerated, but its conversation branch could not be preserved: ${
+              error instanceof Error ? error.message : "Unknown database error."
+            }`,
+          );
+        }
+      }
+
       const updatedVersions = await loadMessageVersions(client, [messageId]);
       setMessageVersions((current) => ({ ...current, ...updatedVersions }));
       setSelectedMessageVersions((current) => ({
@@ -1512,7 +1575,7 @@ export function App() {
     try {
       const [
         { createSupabaseClient, ensureSupabaseSession, loadDatabaseConfig },
-        { createEmbedding, loadMessageVersions, updateChatMessage },
+        { createEmbedding, loadMessageVersions, saveChatBranch, updateChatMessage },
       ] = await Promise.all([import("./lib/supabase"), import("./lib/chat-data")]);
       const config = loadDatabaseConfig();
       if (!config) throw new Error("The CheyaVerse account service is not configured.");
@@ -1547,6 +1610,15 @@ export function App() {
       );
       if (!updatedMessage) throw new Error("The edited message was not found.");
       const versions = await loadMessageVersions(client, [userEditTarget]);
+      try {
+        await saveChatBranch(client, updatedMessage.id, updatedMessage.version_number);
+      } catch (error) {
+        setSendError(
+          error instanceof Error
+            ? error.message
+            : "The edited message was saved, but its conversation branch could not be saved.",
+        );
+      }
       setMessageVersions((current) => ({ ...current, ...versions }));
       setSelectedMessageVersions((current) => ({
         ...current,
@@ -1570,7 +1642,10 @@ export function App() {
       const nextAssistant = messages[messageIndex + 1];
       if (nextAssistant?.role === "assistant") {
         setActionNotice("Pesan diperbarui. Cheya sedang membuat balasan baru…");
-        await regenerateAssistantMessage(nextAssistant.id, updatedMessage.content);
+        await regenerateAssistantMessage(nextAssistant.id, {
+          text: updatedMessage.content,
+          versionNumber: updatedMessage.version_number,
+        });
       } else {
         setActionNotice("Pesan diperbarui. Tidak ditemukan balasan AI untuk dibuat ulang.");
       }
@@ -1726,7 +1801,7 @@ export function App() {
         aria-label="CheyaVerse chat"
         className="relative flex h-full w-full flex-col overflow-hidden border-[#e7e8eb] bg-white sm:max-w-[580px] sm:rounded-[34px] sm:border"
       >
-        <header className="relative z-20 flex h-[64px] shrink-0 select-none items-center justify-between gap-2 px-2 py-1 sm:gap-3 sm:px-5">
+        <header className="absolute inset-x-0 top-0 z-20 flex h-[64px] select-none items-center justify-between gap-2 bg-transparent px-2 py-1 sm:gap-3 sm:px-5">
           <div className="flex h-12 min-w-0 flex-1 items-center gap-2 rounded-full border border-[#e8e9ec] bg-white py-1 pl-1 pr-2 sm:gap-2.5 sm:pr-2">
             <img
               src={cheyaLogo}
@@ -1784,7 +1859,8 @@ export function App() {
           ref={conversationRef}
           aria-label="Conversation"
           aria-live="polite"
-          className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-2 sm:px-6"
+          className="absolute inset-0 overflow-y-auto overscroll-contain px-4 pt-[72px] sm:px-6"
+          style={{ paddingBottom: `${footerHeight + 12}px` }}
         >
           <div className="space-y-3">
             {messages.map((chatMessage) => {
@@ -1801,7 +1877,7 @@ export function App() {
                   <button
                     type="button"
                     aria-label="Show previous message version"
-                    disabled={versionIndex <= 0}
+                    disabled={isRestoringVersion || versionIndex <= 0}
                     onClick={() => void setMessageVersion(chatMessage, -1)}
                     className="flex size-7 items-center justify-center rounded-md hover:bg-[#f1f2f4] disabled:opacity-30"
                   >
@@ -1811,7 +1887,9 @@ export function App() {
                   <button
                     type="button"
                     aria-label="Show newer message version"
-                    disabled={versionIndex < 0 || versionIndex >= versions.length - 1}
+                    disabled={
+                      isRestoringVersion || versionIndex < 0 || versionIndex >= versions.length - 1
+                    }
                     onClick={() => void setMessageVersion(chatMessage, 1)}
                     className="flex size-7 items-center justify-center rounded-md hover:bg-[#f1f2f4] disabled:opacity-30"
                   >
@@ -2037,7 +2115,10 @@ export function App() {
           </div>
         </div>
 
-        <footer className="relative z-20 shrink-0 px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-1.5 sm:px-5 sm:pb-5">
+        <footer
+          ref={footerRef}
+          className="absolute inset-x-0 bottom-0 z-20 bg-transparent px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-1.5 sm:px-5 sm:pb-5"
+        >
           {attachedMedia.length > 0 && (
             <div
               aria-label="Files ready to upload"

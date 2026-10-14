@@ -327,6 +327,18 @@ export async function restoreChatBranch(
   return data;
 }
 
+export async function saveChatBranch(
+  client: AppSupabaseClient,
+  anchorMessageId: string,
+  anchorVersionNumber: number,
+): Promise<void> {
+  const { error } = await client.rpc("save_chat_branch", {
+    p_anchor_message_id: anchorMessageId,
+    p_anchor_version_number: anchorVersionNumber,
+  });
+  if (error) throw new Error(`Could not save this conversation branch: ${error.message}`);
+}
+
 export async function loadMessageFeedback(
   client: AppSupabaseClient,
   messageId: string,

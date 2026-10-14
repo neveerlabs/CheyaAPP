@@ -325,6 +325,13 @@ type Database = {
         };
         Returns: StoredChatMessage[];
       };
+      save_chat_branch: {
+        Args: {
+          p_anchor_message_id: string;
+          p_anchor_version_number: number;
+        };
+        Returns: undefined;
+      };
       match_chat_messages: {
         Args: {
           query_embedding: string;
