@@ -1150,7 +1150,7 @@ export function App() {
     await copyMessageText(chatMessage.id, displayedMessageText(chatMessage));
   }
 
-  async function regenerateAssistantMessage(messageId: string) {
+  async function regenerateAssistantMessage(messageId: string, editedSourceText?: string) {
     if (isSending) return;
     const assistantIndex = messages.findIndex((item) => item.id === messageId);
     const sourceIndex = assistantIndex - 1;
@@ -1164,7 +1164,7 @@ export function App() {
       setSendError("Could not find the user message for this reply.");
       return;
     }
-    const sourceText = displayedMessageText(sourceMessage);
+    const sourceText = editedSourceText ?? displayedMessageText(sourceMessage);
     const previousAnswer = displayedMessageText(messages[assistantIndex]);
     const previousVersionNumber = displayedVersionNumber(messages[assistantIndex]);
 
@@ -1469,7 +1469,7 @@ export function App() {
         embedding,
         null,
         "user_edit",
-        true,
+        false,
       );
       if (!updatedMessage) throw new Error("The edited message was not found.");
       const versions = await loadMessageVersions(client, [userEditTarget]);
@@ -1478,19 +1478,28 @@ export function App() {
         ...current,
         [userEditTarget]: updatedMessage.version_number,
       }));
-      setMessages((current) => [
-        ...current.slice(0, messageIndex),
-        {
-          ...originalMessage,
-          text: updatedMessage.content,
-          versionNumber: updatedMessage.version_number,
-          thinkingSummary: null,
-        },
-      ]);
+      setMessages((current) =>
+        current.map((item) =>
+          item.id === userEditTarget
+            ? {
+                ...item,
+                text: updatedMessage.content,
+                versionNumber: updatedMessage.version_number,
+                thinkingSummary: null,
+              }
+            : item,
+        ),
+      );
       setUserEditTarget(null);
       setUserEditText("");
       setActiveUserActions(null);
-      setActionNotice("Pesan diperbarui. Percakapan setelah pesan ini tetap tersimpan sebagai riwayat lama.");
+      const nextAssistant = messages[messageIndex + 1];
+      if (nextAssistant?.role === "assistant") {
+        setActionNotice("Pesan diperbarui. Cheya sedang membuat balasan baru…");
+        await regenerateAssistantMessage(nextAssistant.id, updatedMessage.content);
+      } else {
+        setActionNotice("Pesan diperbarui. Tidak ditemukan balasan AI untuk dibuat ulang.");
+      }
     } catch (error) {
       setSendError(error instanceof Error ? error.message : "Could not edit this message.");
     } finally {

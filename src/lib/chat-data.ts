@@ -298,7 +298,17 @@ export async function updateChatMessage(
     p_revision_reason: revisionReason,
     p_branch: branch,
   });
-  if (error) throw new Error(`Could not save the regenerated reply: ${error.message}`);
+  if (error) {
+    const action =
+      revisionReason === "user_edit"
+        ? "edited message"
+        : revisionReason === "regenerate"
+          ? "regenerated reply"
+          : "updated message";
+    throw new Error(
+      `Could not save the ${action}: ${error.message} Confirm the latest supabase/schema.sql has been run.`,
+    );
+  }
   return data[0] ?? null;
 }
 

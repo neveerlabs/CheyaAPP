@@ -192,7 +192,6 @@ as $$
 begin
   if tg_op = 'UPDATE' then
     if new.content is distinct from old.content
-      or new.embedding is distinct from old.embedding
       or new.thinking_summary is distinct from old.thinking_summary
       or new.revision_reason is distinct from old.revision_reason then
       new.version_number := old.version_number + 1;
