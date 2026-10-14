@@ -208,6 +208,28 @@ type Database = {
         Update: never;
         Relationships: never[];
       };
+      chat_conversation_branches: {
+        Row: {
+          id: string;
+          user_id: string;
+          anchor_message_id: string;
+          anchor_version_number: number;
+          messages: Json;
+          created_at: string;
+        };
+        Insert: {
+          id?: string;
+          user_id?: string;
+          anchor_message_id: string;
+          anchor_version_number: number;
+          messages: Json;
+          created_at?: string;
+        };
+        Update: Partial<{
+          messages: Json;
+        }>;
+        Relationships: never[];
+      };
       message_insights: {
         Row: MessageInsight;
         Insert: {
@@ -293,6 +315,13 @@ type Database = {
           p_thinking_summary: string | null;
           p_revision_reason: ChatMessageVersion["revision_reason"];
           p_branch: boolean;
+        };
+        Returns: StoredChatMessage[];
+      };
+      restore_chat_branch: {
+        Args: {
+          p_anchor_message_id: string;
+          p_anchor_version_number: number;
         };
         Returns: StoredChatMessage[];
       };

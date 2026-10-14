@@ -9,7 +9,7 @@ import {
   Camera,
   Check,
   ChevronDown,
-  ChevronUp,
+  ChevronRight,
   Copy,
   Files,
   Image,
@@ -23,9 +23,10 @@ import {
   Send,
   ThumbsDown,
   ThumbsUp,
+  TriangleAlert,
 } from "lucide-react";
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
-import avatarUrl from "../assets/cheyaverse.jpg";
+import cheyaLogo from "../assets/circle.png";
 import { AccountLogin } from "./AccountLogin";
 import {
   analyzeGeminiMessage,
@@ -151,6 +152,7 @@ export function App() {
   const [editorError, setEditorError] = useState("");
   const [isEditorLoading, setIsEditorLoading] = useState(false);
   const [viewport, setViewport] = useState({ height: 0, top: 0 });
+  const conversationRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const filesInputRef = useRef<HTMLInputElement>(null);
   const cameraCaptureInputRef = useRef<HTMLInputElement>(null);
@@ -205,18 +207,68 @@ export function App() {
     );
   }
 
-  function setMessageVersion(chatMessage: ChatMessage, direction: -1 | 1) {
+  async function setMessageVersion(chatMessage: ChatMessage, direction: -1 | 1) {
+    setSendError("");
+    const messageIndex = messages.findIndex((item) => item.id === chatMessage.id);
     const versions = messageVersions[chatMessage.id] ?? [];
     if (versions.length < 2) return;
     const currentNumber = displayedVersionNumber(chatMessage);
     const currentIndex = versions.findIndex((item) => item.version_number === currentNumber);
     const nextVersion = versions[currentIndex + direction];
-    if (nextVersion) {
-      setSelectedMessageVersions((current) => ({
-        ...current,
-        [chatMessage.id]: nextVersion.version_number,
-      }));
+    if (!nextVersion) return;
+
+    if (authClient) {
+      try {
+        const { restoreChatBranch, loadMessageVersions } = await import("./lib/chat-data");
+        const branch = await restoreChatBranch(
+          authClient,
+          chatMessage.id,
+          nextVersion.version_number,
+        );
+        if (branch.length > 0) {
+          const loadedVersions = await loadMessageVersions(
+            authClient,
+            branch.map((item) => item.id),
+          );
+          setMessages(
+            branch.map(({ id, role, content, version_number, thinking_summary }) => ({
+              id,
+              role,
+              text: content,
+              versionNumber: version_number,
+              thinkingSummary: thinking_summary,
+            })),
+          );
+          setMessageVersions((current) => ({ ...current, ...loadedVersions }));
+          setSelectedMessageVersions(
+            Object.fromEntries(branch.map((item) => [item.id, item.version_number])),
+          );
+          setSendError("");
+          return;
+        }
+      } catch (error) {
+        setSendError(
+          error instanceof Error ? error.message : "Could not restore this conversation branch.",
+        );
+        return;
+      }
     }
+
+    const selectedVersions = {
+      ...selectedMessageVersions,
+      [chatMessage.id]: nextVersion.version_number,
+    };
+    for (const laterMessage of messages.slice(messageIndex + 1)) {
+      const laterVersions = messageVersions[laterMessage.id] ?? [];
+      if (laterVersions.length < 2) continue;
+      const laterCurrentNumber = selectedVersions[laterMessage.id] ?? laterMessage.versionNumber;
+      const laterIndex = laterVersions.findIndex(
+        (item) => item.version_number === laterCurrentNumber,
+      );
+      const adjacentVersion = laterVersions[laterIndex + direction];
+      if (adjacentVersion) selectedVersions[laterMessage.id] = adjacentVersion.version_number;
+    }
+    setSelectedMessageVersions(selectedVersions);
   }
 
   function clearLongPressTimer() {
@@ -225,6 +277,19 @@ export function App() {
       longPressTimerRef.current = null;
     }
   }
+
+  useEffect(() => {
+    if (!activeUserActions) return;
+    const closeMenu = (event: PointerEvent) => {
+      if (!(event.target instanceof Element) || !event.target.closest("[data-user-actions]")) {
+        setActiveUserActions(null);
+      }
+    };
+    document.addEventListener("pointerdown", closeMenu);
+    return () => document.removeEventListener("pointerdown", closeMenu);
+  }, [activeUserActions]);
+
+  useEffect(() => () => clearLongPressTimer(), []);
 
   useEffect(
     () => () => {
@@ -252,6 +317,15 @@ export function App() {
       window.removeEventListener("resize", updateViewport);
     };
   }, []);
+
+  useEffect(() => {
+    if (!isSending) return;
+    const frame = window.requestAnimationFrame(() => {
+      const conversation = conversationRef.current;
+      if (conversation) conversation.scrollTop = conversation.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [isSending, thinkingSteps, messages.length]);
 
   useEffect(() => {
     let isMounted = true;
@@ -1469,7 +1543,7 @@ export function App() {
         embedding,
         null,
         "user_edit",
-        false,
+        true,
       );
       if (!updatedMessage) throw new Error("The edited message was not found.");
       const versions = await loadMessageVersions(client, [userEditTarget]);
@@ -1650,14 +1724,15 @@ export function App() {
     >
       <section
         aria-label="CheyaVerse chat"
-        className="relative h-full w-full overflow-hidden border-[#e7e8eb] bg-white sm:max-w-[580px] sm:rounded-[34px] sm:border"
+        className="relative flex h-full w-full flex-col overflow-hidden border-[#e7e8eb] bg-white sm:max-w-[580px] sm:rounded-[34px] sm:border"
       >
-        <header className="absolute inset-x-0 top-0 z-20 flex h-[64px] items-center justify-between gap-2 px-2 py-1 sm:gap-3 sm:px-5">
+        <header className="relative z-20 flex h-[64px] shrink-0 select-none items-center justify-between gap-2 px-2 py-1 sm:gap-3 sm:px-5">
           <div className="flex h-12 min-w-0 flex-1 items-center gap-2 rounded-full border border-[#e8e9ec] bg-white py-1 pl-1 pr-2 sm:gap-2.5 sm:pr-2">
             <img
-              src={avatarUrl}
-              alt="CheyaVerse profile photo"
+              src={cheyaLogo}
+              alt="CheyaVerse logo"
               className="size-10 shrink-0 rounded-full object-cover"
+              draggable={false}
             />
             <div className="flex min-w-0 flex-col justify-center">
               <div className="flex items-center gap-0.5">
@@ -1706,11 +1781,12 @@ export function App() {
         </header>
 
         <div
+          ref={conversationRef}
           aria-label="Conversation"
           aria-live="polite"
-          className="absolute inset-0 overflow-y-auto overscroll-contain px-4 pb-28 pt-20 sm:px-6"
+          className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-2 sm:px-6"
         >
-          <div className="space-y-4">
+          <div className="space-y-3">
             {messages.map((chatMessage) => {
               const versionNumber = displayedVersionNumber(chatMessage);
               const versions = messageVersions[chatMessage.id] ?? [];
@@ -1726,7 +1802,7 @@ export function App() {
                     type="button"
                     aria-label="Show previous message version"
                     disabled={versionIndex <= 0}
-                    onClick={() => setMessageVersion(chatMessage, -1)}
+                    onClick={() => void setMessageVersion(chatMessage, -1)}
                     className="flex size-7 items-center justify-center rounded-md hover:bg-[#f1f2f4] disabled:opacity-30"
                   >
                     <ArrowLeft aria-hidden="true" className="size-3.5" />
@@ -1736,7 +1812,7 @@ export function App() {
                     type="button"
                     aria-label="Show newer message version"
                     disabled={versionIndex < 0 || versionIndex >= versions.length - 1}
-                    onClick={() => setMessageVersion(chatMessage, 1)}
+                    onClick={() => void setMessageVersion(chatMessage, 1)}
                     className="flex size-7 items-center justify-center rounded-md hover:bg-[#f1f2f4] disabled:opacity-30"
                   >
                     <ArrowRight aria-hidden="true" className="size-3.5" />
@@ -1746,8 +1822,8 @@ export function App() {
 
               if (chatMessage.role === "user") {
                 return (
-                  <article key={chatMessage.id} className="group flex flex-col items-end">
-                    <p
+                  <article key={chatMessage.id} className="group relative flex flex-col items-end">
+                    <div
                       onTouchStart={() => {
                         clearLongPressTimer();
                         longPressTimerRef.current = setTimeout(
@@ -1757,49 +1833,57 @@ export function App() {
                       }}
                       onTouchMove={clearLongPressTimer}
                       onTouchEnd={clearLongPressTimer}
+                      onTouchCancel={clearLongPressTimer}
                       onContextMenu={(event) => {
                         event.preventDefault();
                         setActiveUserActions(chatMessage.id);
                       }}
-                      className="max-w-[76%] whitespace-pre-wrap rounded-[18px] rounded-br-md bg-[#28292e] px-3 py-2 text-[13px] leading-5 text-white sm:max-w-[70%]"
+                      onDragStart={(event) => event.preventDefault()}
+                      className="max-w-[76%] select-none rounded-[18px] rounded-br-md bg-[#28292e] px-3 py-2 text-[13px] leading-5 text-white [webkit-touch-callout:none] sm:max-w-[70%]"
+                      style={{ WebkitTouchCallout: "none" }}
                     >
-                      {visibleText}
-                    </p>
-                    <div className="mt-1 flex min-h-7 items-center gap-1">
-                      {versionControls}
-                      <div
-                        aria-label="User message actions"
-                        className={`flex items-center gap-0.5 transition-opacity sm:pointer-events-auto sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100 ${
-                          activeUserActions === chatMessage.id
-                            ? "pointer-events-auto opacity-100"
-                            : "pointer-events-none opacity-0"
-                        }`}
-                      >
-                        <button
-                          type="button"
-                          aria-label="Copy user message"
-                          onClick={() => void copyMessageText(chatMessage.id, visibleText)}
-                          className="flex size-7 items-center justify-center rounded-md text-[#777a82] hover:bg-[#f1f2f4]"
-                        >
-                          {copiedMessageId === chatMessage.id ? (
-                            <Check aria-hidden="true" className="size-3.5 text-[#398650]" />
-                          ) : (
-                            <Copy aria-hidden="true" className="size-3.5" />
-                          )}
-                        </button>
-                        <button
-                          type="button"
-                          aria-label="Edit user message"
-                          onClick={() => {
-                            setUserEditTarget(chatMessage.id);
-                            setUserEditText(visibleText);
-                            setSendError("");
-                          }}
-                          className="flex size-7 items-center justify-center rounded-md text-[#777a82] hover:bg-[#f1f2f4]"
-                        >
-                          <Pencil aria-hidden="true" className="size-3.5" />
-                        </button>
+                      <Suspense fallback={<p className="m-0 whitespace-pre-wrap">{visibleText}</p>}>
+                        <AssistantMarkdown content={visibleText} userMessage />
+                      </Suspense>
+                    </div>
+                    {versionControls && (
+                      <div className="mt-0.5 flex min-h-7 w-full items-center justify-end">
+                        {versionControls}
                       </div>
+                    )}
+                    <div
+                      data-user-actions
+                      aria-label="User message actions"
+                      className={`absolute right-1 top-[calc(100%+2px)] z-30 items-center gap-0.5 rounded-xl border border-[#e5e6e9] bg-white p-1 shadow-lg sm:right-0 ${
+                        activeUserActions === chatMessage.id
+                          ? "flex"
+                          : "hidden sm:group-hover:flex sm:group-focus-within:flex"
+                      }`}
+                    >
+                      <button
+                        type="button"
+                        aria-label="Copy user message"
+                        onClick={() => void copyMessageText(chatMessage.id, visibleText)}
+                        className="flex size-7 items-center justify-center rounded-md text-[#777a82] hover:bg-[#f1f2f4]"
+                      >
+                        {copiedMessageId === chatMessage.id ? (
+                          <Check aria-hidden="true" className="size-3.5 text-[#398650]" />
+                        ) : (
+                          <Copy aria-hidden="true" className="size-3.5" />
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        aria-label="Edit user message"
+                        onClick={() => {
+                          setUserEditTarget(chatMessage.id);
+                          setUserEditText(visibleText);
+                          setSendError("");
+                        }}
+                        className="flex size-7 items-center justify-center rounded-md text-[#777a82] hover:bg-[#f1f2f4]"
+                      >
+                        <Pencil aria-hidden="true" className="size-3.5" />
+                      </button>
                     </div>
                   </article>
                 );
@@ -1820,12 +1904,12 @@ export function App() {
                             return next;
                           })
                         }
-                        className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-xs text-[#747780] hover:bg-[#f5f6f8]"
+                        className="inline-flex flex-row-reverse items-center gap-1 rounded-lg pl-0 pr-2 py-1 text-xs text-[#747780] hover:bg-[#f5f6f8]"
                       >
                         {expandedThinkingIds.has(ratingKey) ? (
-                          <ChevronUp aria-hidden="true" className="size-3.5" />
-                        ) : (
                           <ChevronDown aria-hidden="true" className="size-3.5" />
+                        ) : (
+                          <ChevronRight aria-hidden="true" className="size-3.5" />
                         )}
                         Thinking mode
                       </button>
@@ -1896,7 +1980,7 @@ export function App() {
                       }}
                       className="flex size-8 items-center justify-center rounded-lg text-[#777a82] transition hover:bg-[#f1f2f4]"
                     >
-                      <Bug aria-hidden="true" className="size-4" />
+                      <TriangleAlert aria-hidden="true" className="size-4" />
                     </button>
                     <button
                       type="button"
@@ -1953,7 +2037,7 @@ export function App() {
           </div>
         </div>
 
-        <footer className="absolute inset-x-0 bottom-0 z-20 bg-white px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-1.5 sm:px-5 sm:pb-5">
+        <footer className="relative z-20 shrink-0 px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-1.5 sm:px-5 sm:pb-5">
           {attachedMedia.length > 0 && (
             <div
               aria-label="Files ready to upload"
@@ -2175,10 +2259,14 @@ export function App() {
 
       {userEditTarget && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-5 py-8">
-          <section
+          <form
             role="dialog"
             aria-modal="true"
             aria-labelledby="edit-user-message-title"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void saveUserMessageEdit();
+            }}
             className="w-full max-w-lg rounded-3xl bg-white p-5 shadow-xl"
           >
             <h2 id="edit-user-message-title" className="text-base font-semibold text-[#22242a]">
@@ -2205,16 +2293,15 @@ export function App() {
                 Cancel
               </button>
               <button
-                type="button"
+                type="submit"
                 disabled={isSending}
-                onClick={() => void saveUserMessageEdit()}
                 className="flex h-10 items-center gap-2 rounded-full bg-[#28292e] px-4 text-sm font-medium text-white hover:bg-[#3b3d43] disabled:opacity-50"
               >
                 {isSending && <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />}
                 Save edit
               </button>
             </div>
-          </section>
+          </form>
         </div>
       )}
 

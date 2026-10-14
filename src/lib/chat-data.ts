@@ -312,6 +312,21 @@ export async function updateChatMessage(
   return data[0] ?? null;
 }
 
+export async function restoreChatBranch(
+  client: AppSupabaseClient,
+  anchorMessageId: string,
+  anchorVersionNumber: number,
+): Promise<StoredChatMessage[]> {
+  const { data, error } = await client.rpc("restore_chat_branch", {
+    p_anchor_message_id: anchorMessageId,
+    p_anchor_version_number: anchorVersionNumber,
+  });
+  if (error) {
+    throw new Error(`Could not restore this conversation branch: ${error.message}`);
+  }
+  return data;
+}
+
 export async function loadMessageFeedback(
   client: AppSupabaseClient,
   messageId: string,

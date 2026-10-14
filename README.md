@@ -91,13 +91,16 @@ user's chat, memories, and insights; the app asks before deleting a record. The 
 message text to Gemini for replies, insights, and embeddings.
 
 Assistant replies support Markdown, including fenced code blocks and `_underlined text_` (single
-underscores are rendered as underline in this app). User messages stay in compact bubbles; assistant
-replies use the full conversation width and include controls for feedback, regeneration, reporting,
-and copying. The **Think** toggle shows progress stages and an optional user-facing summary of the
-context used; it does not expose private internal reasoning.
-Edited user messages and regenerated replies keep their earlier versions; revising a message also
-starts the active conversation branch from that point. Like/dislike feedback is stored per reply
-version, and regeneration retrieves chat context and insights from before the revised message.
+underscores are rendered as underline in this app). User messages also render Markdown inside
+compact bubbles; assistant replies use the full conversation width and include controls for
+feedback, regeneration, reporting, and copying. Fenced code blocks show syntax colors, line numbers,
+and a copy control. The **Think** toggle shows progress stages and an optional user-facing summary
+of the context used; it does not expose private internal reasoning.
+Edited user messages and regenerated replies keep their earlier versions. Version navigation
+restores the associated conversation branch—including its reply and later messages—and branches
+are stored in Supabase. Run the latest `supabase/schema.sql` to enable this for an existing project.
+Like/dislike feedback is stored per reply version, and regeneration retrieves chat context and
+insights from before the revised message.
 
 ## Notes
 

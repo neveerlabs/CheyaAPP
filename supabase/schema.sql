@@ -183,6 +183,32 @@ select
 from public.chat_messages as messages
 on conflict (user_id, message_id, version_number) do nothing;
 
+create table if not exists public.chat_conversation_branches (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null default auth.uid() references auth.users (id) on delete cascade,
+  anchor_message_id uuid not null,
+  anchor_version_number integer not null check (anchor_version_number >= 1),
+  messages jsonb not null check (jsonb_typeof(messages) = 'array'),
+  created_at timestamptz not null default now(),
+  unique (user_id, anchor_message_id, anchor_version_number),
+  foreign key (user_id, anchor_message_id)
+    references public.chat_messages (user_id, id)
+    on delete cascade
+);
+
+alter table public.chat_conversation_branches enable row level security;
+
+drop policy if exists "Users can manage their own conversation branches"
+  on public.chat_conversation_branches;
+create policy "Users can manage their own conversation branches"
+  on public.chat_conversation_branches
+  for all
+  to authenticated
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+
+grant select, insert, update, delete on public.chat_conversation_branches to authenticated;
+
 create or replace function public.record_chat_message_version()
 returns trigger
 language plpgsql
@@ -190,6 +216,9 @@ security invoker
 set search_path = public, auth
 as $$
 begin
+  if current_setting('cheyaverse.restore_chat_branch', true) = 'on' then
+    return new;
+  end if;
   if tg_op = 'UPDATE' then
     if new.content is distinct from old.content
       or new.thinking_summary is distinct from old.thinking_summary
@@ -282,11 +311,39 @@ begin
   end if;
 
   if p_branch then
-    update public.chat_messages
-    set is_active = false
-    where user_id = auth.uid()
-      and is_active
-      and (created_at, id) > (target.created_at, target.id);
+    if target.is_active then
+      insert into public.chat_conversation_branches (
+        user_id,
+        anchor_message_id,
+        anchor_version_number,
+        messages
+      )
+      select
+        auth.uid(),
+        target.id,
+        target.version_number,
+        coalesce(
+          jsonb_agg(
+            jsonb_build_object(
+              'message_id', messages.id,
+              'version_number', messages.version_number
+            )
+            order by messages.created_at, messages.id
+          ),
+          '[]'::jsonb
+        )
+      from public.chat_messages as messages
+      where messages.user_id = auth.uid()
+        and messages.is_active
+      on conflict (user_id, anchor_message_id, anchor_version_number) do update
+        set messages = excluded.messages;
+
+      update public.chat_messages
+      set is_active = false
+      where user_id = auth.uid()
+        and is_active
+        and (created_at, id) > (target.created_at, target.id);
+    end if;
   end if;
 
   return query
@@ -301,6 +358,67 @@ begin
   returning *;
 end;
 $$;
+
+create or replace function public.restore_chat_branch(
+  p_anchor_message_id uuid,
+  p_anchor_version_number integer
+)
+returns setof public.chat_messages
+language plpgsql
+security invoker
+set search_path = public, auth
+as $$
+declare
+  branch_snapshot public.chat_conversation_branches%rowtype;
+begin
+  if auth.uid() is null then
+    raise exception 'Authentication is required.';
+  end if;
+
+  select * into branch_snapshot
+  from public.chat_conversation_branches
+  where user_id = auth.uid()
+    and anchor_message_id = p_anchor_message_id
+    and anchor_version_number = p_anchor_version_number;
+  if not found then
+    return;
+  end if;
+
+  perform set_config('cheyaverse.restore_chat_branch', 'on', true);
+  update public.chat_messages
+  set is_active = false
+  where user_id = auth.uid()
+    and is_active;
+
+  update public.chat_messages as messages
+  set content = versions.content,
+      embedding = versions.embedding,
+      thinking_summary = versions.thinking_summary,
+      version_number = versions.version_number,
+      revision_reason = versions.revision_reason,
+      is_active = true
+  from jsonb_to_recordset(branch_snapshot.messages) as snapshot(
+    message_id uuid,
+    version_number integer
+  )
+  join public.chat_message_versions as versions
+    on versions.message_id = snapshot.message_id
+    and versions.version_number = snapshot.version_number
+    and versions.user_id = auth.uid()
+  where messages.id = snapshot.message_id
+    and messages.user_id = auth.uid();
+
+  return query
+  select *
+  from public.chat_messages
+  where user_id = auth.uid()
+    and is_active
+  order by created_at, id;
+end;
+$$;
+
+revoke all on function public.restore_chat_branch(uuid, integer) from public, anon;
+grant execute on function public.restore_chat_branch(uuid, integer) to authenticated;
 
 grant execute on function public.revise_chat_message(
   uuid,

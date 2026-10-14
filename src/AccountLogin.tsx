@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Turnstile } from "@marsidev/react-turnstile";
 import { CircleAlert, LoaderCircle } from "lucide-react";
+import cheyaLogo from "../assets/circle.png";
 import { signInWithGoogle, type AppSupabaseClient } from "./lib/supabase";
 
 interface GoogleCredentialResponse {
@@ -123,7 +124,7 @@ export function AccountLogin({ client, error: initialError }: AccountLoginProps)
           size: "large",
           text: "continue_with",
           shape: "pill",
-          width: Math.min(360, googleButtonRef.current.clientWidth || 360),
+          width: Math.min(280, googleButtonRef.current.clientWidth || 280),
         });
       })
       .catch((sdkError: unknown) => {
@@ -146,8 +147,13 @@ export function AccountLogin({ client, error: initialError }: AccountLoginProps)
         aria-labelledby="account-login-title"
         className="w-full max-w-md rounded-[28px] border border-[#e7e8eb] bg-white p-6 shadow-sm sm:p-8"
       >
-        <div className="mx-auto flex size-12 items-center justify-center rounded-2xl bg-[#f3efff] text-[#7754ce]">
-          <span className="text-lg font-semibold">C</span>
+        <div className="mx-auto size-14 overflow-hidden rounded-full border border-[#e7e8eb] bg-white shadow-sm">
+          <img
+            src={cheyaLogo}
+            alt="Cheya logo"
+            className="size-full rounded-full object-cover"
+            draggable={false}
+          />
         </div>
         <h1
           id="account-login-title"
