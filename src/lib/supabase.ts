@@ -110,6 +110,7 @@ export type MessageInsight = {
 export type UserMemory = {
   id: string;
   user_id: string;
+  source_message_id: string | null;
   category: string;
   content: string;
   embedding: string | null;
@@ -302,6 +303,7 @@ export type Database = {
         Insert: {
           id?: string;
           user_id?: string;
+          source_message_id?: string | null;
           category?: string;
           content: string;
           embedding?: string | null;
@@ -311,6 +313,7 @@ export type Database = {
         Update: Partial<{
           category: string;
           content: string;
+          source_message_id: string | null;
           embedding: string | null;
           updated_at: string;
         }>;
@@ -349,6 +352,19 @@ export type Database = {
           p_rating: "like" | "dislike" | null;
         };
         Returns: undefined;
+      };
+      delete_chat_branch_from_message: {
+        Args: { p_message_id: string };
+        Returns: number;
+      };
+      run_database_keepalive: {
+        Args: Record<PropertyKey, never>;
+        Returns: Array<{
+          pinged: boolean;
+          idle_days: number;
+          last_activity_at: string;
+          last_keepalive_at: string | null;
+        }>;
       };
       revise_chat_message: {
         Args: {

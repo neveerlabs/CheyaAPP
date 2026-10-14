@@ -53,13 +53,16 @@ insights.
    SUPABASE_URL=https://<project-ref>.supabase.co
    SUPABASE_PUBLISHABLE_KEY=<publishable-or-anon-key>
    SUPABASE_SERVICE_ROLE_KEY=<supabase-service-role-secret>
+   CRON_SECRET=<random-secret-at-least-32-characters>
    ```
 
    Use the same Supabase project and Google client ID across local development and deployments.
    These `VITE_*` values are included in the browser bundle and must be public values. Never expose
    a Supabase service-role/secret key or the Turnstile secret key in Vite, the browser, or Git.
    `SUPABASE_SERVICE_ROLE_KEY` is a server-only Vercel environment variable required by durable chat
-   jobs; add it to Development, Preview, and Production environments as needed. The unprefixed
+   jobs and the database keepalive; add it to Development, Preview, and Production environments as
+   needed. `CRON_SECRET` is server-only and protects the scheduled keepalive endpoint. Generate it
+   with `openssl rand -base64 32`; add the same value to Vercel and local `.env.local`. The unprefixed
    `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY` are server-side settings (the server can fall back
    to their `VITE_*` counterparts).
 
@@ -77,7 +80,8 @@ npm run dev
 
 Restart Vite after changing environment variables. Keep `.env.local` private and never commit it.
 If you do not use the Vercel CLI, create `.env.local` with the four `VITE_*` values and the three
-server-side `SUPABASE_*` values above. Keep this file private; `.env.local` is ignored by Git.
+server-side `SUPABASE_*` values and `CRON_SECRET` above. Keep this file private; `.env.local` is
+ignored by Git.
 
 ### User setup and data
 
@@ -116,6 +120,19 @@ insights from before the revised message. Reports are private per-version feedba
 the response (not sent to an administrator); the report details are included as stronger guidance
 for regeneration and relevant future replies. Revising an earlier message keeps the remaining
 conversation visible on that branch, and switching versions restores the complete saved branch.
+
+Long-press a user message on mobile or use its desktop action menu to delete that message and the
+entire later conversation branch. The operation also removes related versions, insights, feedback,
+jobs, branch snapshots, and AI memories that were learned from a deleted message. Settings → Memory
+lets users create, edit, and delete durable personal memories; Cheya can also save a clearly durable
+user fact as a memory from chat. These memories are embedded and retrieved alongside RAG conversation
+context.
+
+Vercel runs the database keepalive endpoint daily. After five days without application-table
+activity, it performs and removes a small database pulse. Run the updated SQL schema and configure
+`SUPABASE_SERVICE_ROLE_KEY` and `CRON_SECRET` in the Vercel environment before relying on this job.
+The Free-plan inactivity policy can change, and a keepalive cannot guarantee that Supabase will
+never pause a project; monitor Cron execution in Vercel and database status in Supabase.
 
 ## Notes
 

@@ -83,6 +83,65 @@ function serializeEmbedding(values: number[]): string {
   return `[${values.join(",")}]`;
 }
 
+export async function saveUserMemory(
+  client: AppSupabaseClient,
+  apiKey: string,
+  content: string,
+  category = "general",
+  userId?: string,
+  sourceMessageId?: string,
+): Promise<UserMemory> {
+  const normalizedContent = requiredString(content, "memory content", 10000);
+  const normalizedCategory = category.trim().slice(0, 80) || "general";
+  const embedding = serializeEmbedding(
+    await createEmbedding(apiKey, normalizedContent, "RETRIEVAL_DOCUMENT"),
+  );
+
+  if (userId) {
+    const { data: matches, error: searchError } = await client.rpc(
+      "match_user_memories_for_user",
+      {
+        p_user_id: userId,
+        query_embedding: embedding,
+        result_limit: 1,
+      },
+    );
+    if (searchError) throw new Error(`Could not check for an existing memory: ${searchError.message}`);
+    const duplicate = matches[0];
+    if (duplicate && duplicate.similarity >= 0.94) {
+      const { data, error } = await client
+        .from("user_memories")
+        .update({
+          content: normalizedContent,
+          category: normalizedCategory,
+          ...(sourceMessageId ? { source_message_id: sourceMessageId } : {}),
+          embedding,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", duplicate.id)
+        .eq("user_id", userId)
+        .select("*")
+        .single();
+      if (error) throw new Error(`Could not update the existing memory: ${error.message}`);
+      return data;
+    }
+  }
+
+  const { data, error } = await client
+    .from("user_memories")
+    .insert({
+      ...(userId ? { user_id: userId } : {}),
+      ...(sourceMessageId ? { source_message_id: sourceMessageId } : {}),
+      content: normalizedContent,
+      category: normalizedCategory,
+      embedding,
+    })
+    .select("*")
+    .single();
+  if (error) throw new Error(`Could not create memory: ${error.message}`);
+  return data;
+}
+
 export async function saveChatMessage(
   client: AppSupabaseClient,
   role: StoredChatMessage["role"],
@@ -625,6 +684,7 @@ export async function executeChatDataTool(
   input: unknown,
   confirmDelete: (label: string, preview: string) => boolean | Promise<boolean>,
   userId?: string,
+  sourceMessageId?: string,
 ): Promise<unknown> {
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
     throw new Error("The AI provided invalid database tool input.");
@@ -634,21 +694,16 @@ export async function executeChatDataTool(
   if (name === "search_user_data") return searchUserData(client, args, userId);
 
   if (name === "create_memory") {
-    const content = requiredString(args.content, "memory content", 10000);
-    const category = typeof args.category === "string" ? args.category.trim().slice(0, 80) : "general";
-    const embedding = await createEmbedding(apiKey, content, "RETRIEVAL_DOCUMENT");
-    const { data, error } = await client
-      .from("user_memories")
-      .insert({
-        ...(userId ? { user_id: userId } : {}),
-        content,
-        category: category || "general",
-        embedding: serializeEmbedding(embedding),
-      })
-      .select("id, category, content, created_at, updated_at")
-      .single();
-    if (error) throw new Error(`Could not create memory: ${error.message}`);
-    return data;
+    const category =
+      typeof args.category === "string" ? args.category.trim().slice(0, 80) : "general";
+    return saveUserMemory(
+      client,
+      apiKey,
+      requiredString(args.content, "memory content", 10000),
+      category,
+      userId,
+      sourceMessageId,
+    );
   }
 
   if (name === "update_memory") {

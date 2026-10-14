@@ -10,6 +10,7 @@ import {
   EyeOff,
   LoaderCircle,
   KeyRound,
+  Pencil,
   Plus,
   SlidersHorizontal,
   Trash2,
@@ -27,6 +28,7 @@ import {
   type GeminiApiKey,
   type GeminiModel,
   type PersonalizationSettings,
+  type UserMemory,
 } from "./lib/supabase";
 
 interface SettingsPageProps {
@@ -77,7 +79,7 @@ const settingsSections: Array<{
   {
     id: "memory",
     label: "Memory",
-    description: "Memory settings will be available here later",
+    description: "Review and manage facts Cheya remembers long-term",
     icon: Brain,
   },
 ];
@@ -117,6 +119,12 @@ export function SettingsPage({
   const [notice, setNotice] = useState("");
   const [isSigningOut, setIsSigningOut] = useState(false);
   const [realtimeRevision, setRealtimeRevision] = useState(0);
+  const [memories, setMemories] = useState<UserMemory[]>([]);
+  const [memoryContent, setMemoryContent] = useState("");
+  const [memoryCategory, setMemoryCategory] = useState("general");
+  const [editingMemoryId, setEditingMemoryId] = useState<string | null>(null);
+  const [isLoadingMemories, setIsLoadingMemories] = useState(false);
+  const [isSavingMemory, setIsSavingMemory] = useState(false);
   const settingsContentRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -205,6 +213,17 @@ export function SettingsPage({
               if (isMounted) setRealtimeRevision((revision) => revision + 1);
             },
           )
+          .on(
+            "postgres_changes",
+            {
+              event: "*",
+              schema: "public",
+              table: "user_memories",
+            },
+            () => {
+              if (isMounted) setRealtimeRevision((revision) => revision + 1);
+            },
+          )
           .subscribe((status, error) => {
             if (
               isMounted &&
@@ -255,6 +274,26 @@ export function SettingsPage({
       isMounted = false;
     };
   }, [client, isDatabaseReady, pathname, realtimeRevision]);
+
+  useEffect(() => {
+    if (!client || !isDatabaseReady || activeSection !== "memory") return;
+    let isMounted = true;
+    setIsLoadingMemories(true);
+    void client
+      .from("user_memories")
+      .select("*")
+      .order("updated_at", { ascending: false })
+      .then(({ data, error }) => {
+        if (!isMounted) return;
+        if (error) setErrorMessage(`Could not load long-term memories: ${error.message}`);
+        else setMemories(data);
+        setIsLoadingMemories(false);
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [activeSection, client, isDatabaseReady, pathname, realtimeRevision]);
 
   useEffect(() => {
     if (!client || !isDatabaseReady) return;
@@ -483,6 +522,81 @@ export function SettingsPage({
     }
   }
 
+  function resetMemoryForm() {
+    setEditingMemoryId(null);
+    setMemoryContent("");
+    setMemoryCategory("general");
+  }
+
+  async function saveMemory(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    clearMessages();
+    const content = memoryContent.trim();
+    if (!content || content.length > 10000) {
+      setErrorMessage("A memory must contain 1–10,000 characters.");
+      return;
+    }
+    const apiKey = apiKeys[0];
+    if (!apiKey) {
+      setErrorMessage("Add a Gemini API key before creating a searchable memory.");
+      return;
+    }
+    setIsSavingMemory(true);
+    try {
+      const [{ createEmbedding }, { data: userData, error: userError }] = await Promise.all([
+        import("./lib/chat-data"),
+        client.auth.getUser(),
+      ]);
+      if (userError) throw userError;
+      if (!userData.user) throw new Error("Sign in before saving a memory.");
+      const embedding = await createEmbedding(apiKey.api_key, content, "RETRIEVAL_DOCUMENT");
+      const memoryData = {
+        content,
+        category: memoryCategory.trim().slice(0, 80) || "general",
+        embedding: `[${embedding.join(",")}]`,
+        updated_at: new Date().toISOString(),
+      };
+      const query = editingMemoryId
+        ? client
+            .from("user_memories")
+            .update(memoryData)
+            .eq("id", editingMemoryId)
+            .eq("user_id", userData.user.id)
+        : client.from("user_memories").insert({
+            ...memoryData,
+            user_id: userData.user.id,
+          });
+      const { data, error } = await query.select("*").single();
+      if (error) throw error;
+      setMemories((current) => [data, ...current.filter((memory) => memory.id !== data.id)]);
+      setNotice(editingMemoryId ? "Long-term memory updated." : "Long-term memory saved.");
+      resetMemoryForm();
+    } catch (error) {
+      setErrorMessage(`Could not save this memory: ${getErrorMessage(error)}`);
+    } finally {
+      setIsSavingMemory(false);
+    }
+  }
+
+  async function deleteMemory(memory: UserMemory) {
+    if (!window.confirm(`Delete this saved memory?\n\n${memory.content}`)) return;
+    clearMessages();
+    try {
+      const { data, error } = await client
+        .from("user_memories")
+        .delete()
+        .eq("id", memory.id)
+        .select("id");
+      if (error) throw error;
+      if (data.length === 0) throw new Error("Memory was not found or could not be deleted.");
+      setMemories((current) => current.filter((item) => item.id !== memory.id));
+      if (editingMemoryId === memory.id) resetMemoryForm();
+      setNotice("Long-term memory deleted.");
+    } catch (error) {
+      setErrorMessage(`Could not delete this memory: ${getErrorMessage(error)}`);
+    }
+  }
+
   return (
     <main className="fixed inset-0 flex justify-center bg-white">
       <section
@@ -589,10 +703,16 @@ export function SettingsPage({
                 </div>
               )}
               {isLoadingPersonalization ? (
-                <p className="flex items-center gap-2 py-4 text-sm text-[#777a81]">
-                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                  Loading personal settings…
-                </p>
+                <div
+                  role="status"
+                  aria-label="Loading personal settings"
+                  className="animate-pulse space-y-4"
+                >
+                  <div className="h-11 rounded-xl bg-[#f1f2f4]" />
+                  <div className="h-28 rounded-xl bg-[#f1f2f4]" />
+                  <div className="h-11 rounded-xl bg-[#f1f2f4]" />
+                  <div className="h-10 w-44 rounded-xl bg-[#f1f2f4]" />
+                </div>
               ) : (
                 <form className="space-y-4" onSubmit={savePersonalization}>
                   <label className="block text-xs font-medium text-[#656870]">
@@ -784,10 +904,14 @@ export function SettingsPage({
                     <span className="text-xs text-[#888b91]">{apiKeys.length} total</span>
                   </div>
                   {isLoadingKeys ? (
-                    <p className="flex items-center gap-2 py-4 text-sm text-[#777a81]">
-                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                      Loading API keys…
-                    </p>
+                    <div
+                      role="status"
+                      aria-label="Loading Gemini API keys"
+                      className="animate-pulse space-y-2"
+                    >
+                      <div className="h-16 rounded-2xl bg-[#f1f2f4]" />
+                      <div className="h-16 rounded-2xl bg-[#f1f2f4]" />
+                    </div>
                   ) : apiKeys.length === 0 ? (
                     <p className="rounded-2xl border border-dashed border-[#dfe1e5] px-3 py-4 text-center text-sm text-[#858890]">
                       No Gemini API keys added yet.
@@ -896,6 +1020,153 @@ export function SettingsPage({
             </p>
           </section>
             </>
+          )}
+
+          {activeSection === "memory" && (
+            <section
+              aria-labelledby="long-term-memory-title"
+              className="rounded-[24px] border border-[#e6e8eb] p-4 sm:p-5"
+            >
+              <div className="mb-4">
+                <h2 id="long-term-memory-title" className="font-semibold text-[#202126]">
+                  Long-term memory
+                </h2>
+                <p className="mt-1 text-sm leading-5 text-[#777a81]">
+                  Durable preferences and useful facts are searchable with RAG and can be created,
+                  edited, or removed here. Cheya may remember important details from chat; short-lived
+                  moods and sensitive inferences are not saved as memories.
+                </p>
+              </div>
+
+              {(errorMessage || notice) && (
+                <div
+                  role={errorMessage ? "alert" : "status"}
+                  className={`mb-4 rounded-2xl px-3.5 py-3 text-sm ${
+                    errorMessage
+                      ? "border border-red-100 bg-red-50 text-red-800"
+                      : "border border-emerald-100 bg-emerald-50 text-emerald-800"
+                  }`}
+                >
+                  {errorMessage || notice}
+                </div>
+              )}
+
+              {!isDatabaseReady ? (
+                <div className="animate-pulse space-y-3" aria-label="Loading long-term memories">
+                  <div className="h-11 rounded-xl bg-[#f1f2f4]" />
+                  <div className="h-24 rounded-2xl bg-[#f1f2f4]" />
+                </div>
+              ) : (
+                <form className="space-y-3 rounded-2xl bg-[#f7f8fa] p-3.5" onSubmit={saveMemory}>
+                  <label className="block text-xs font-medium text-[#656870]">
+                    Category
+                    <input
+                      value={memoryCategory}
+                      onChange={(event) => setMemoryCategory(event.target.value)}
+                      maxLength={80}
+                      placeholder="e.g. preferences, goals, projects"
+                      className="mt-1.5 h-11 w-full rounded-xl border border-[#e1e3e7] bg-white px-3 text-sm text-[#26272c] outline-none focus:border-[#9380dc]"
+                    />
+                  </label>
+                  <label className="block text-xs font-medium text-[#656870]">
+                    What should Cheya remember?
+                    <textarea
+                      value={memoryContent}
+                      onChange={(event) => setMemoryContent(event.target.value)}
+                      maxLength={10000}
+                      rows={3}
+                      placeholder="A stable preference, important fact, goal, or ongoing project"
+                      className="mt-1.5 w-full resize-y rounded-xl border border-[#e1e3e7] bg-white px-3 py-2.5 text-sm leading-5 text-[#26272c] outline-none focus:border-[#9380dc]"
+                    />
+                  </label>
+                  {apiKeys.length === 0 && (
+                    <p className="text-xs leading-5 text-amber-800">
+                      Add a Gemini API key in Configure first so this memory can be indexed for RAG.
+                    </p>
+                  )}
+                  <div className="flex justify-end gap-2">
+                    {editingMemoryId && (
+                      <button
+                        type="button"
+                        onClick={resetMemoryForm}
+                        className="h-10 rounded-full border border-[#e1e3e7] px-4 text-sm font-medium text-[#34363b] hover:bg-white"
+                      >
+                        Cancel
+                      </button>
+                    )}
+                    <button
+                      type="submit"
+                      disabled={isSavingMemory || apiKeys.length === 0}
+                      className="flex h-10 items-center justify-center gap-2 rounded-full bg-[#26272c] px-4 text-sm font-medium text-white transition hover:bg-[#3a3b41] disabled:opacity-60"
+                    >
+                      {isSavingMemory ? (
+                        <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                      ) : editingMemoryId ? (
+                        <Pencil aria-hidden="true" className="size-4" />
+                      ) : (
+                        <Plus aria-hidden="true" className="size-4" />
+                      )}
+                      {editingMemoryId ? "Update memory" : "Save memory"}
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              <div className="mt-5 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-sm font-semibold text-[#34363b]">Saved memories</h3>
+                  <span className="text-xs text-[#888b91]">{memories.length} total</span>
+                </div>
+                {isLoadingMemories ? (
+                  <div className="animate-pulse space-y-2" aria-label="Loading saved memories">
+                    {[0, 1, 2].map((item) => (
+                      <div key={item} className="h-20 rounded-2xl bg-[#f1f2f4]" />
+                    ))}
+                  </div>
+                ) : memories.length === 0 ? (
+                  <p className="rounded-2xl border border-dashed border-[#dfe1e5] px-3 py-4 text-center text-sm text-[#858890]">
+                    No long-term memories saved yet.
+                  </p>
+                ) : (
+                  memories.map((memory) => (
+                    <article
+                      key={memory.id}
+                      className="flex items-start gap-3 rounded-2xl border border-[#eceef0] px-3.5 py-3"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <p className="text-[11px] font-medium uppercase tracking-wide text-[#858890]">
+                          {memory.category}
+                        </p>
+                        <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-5 text-[#34363b]">
+                          {memory.content}
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        aria-label={`Edit memory: ${memory.content.slice(0, 40)}`}
+                        onClick={() => {
+                          setEditingMemoryId(memory.id);
+                          setMemoryContent(memory.content);
+                          setMemoryCategory(memory.category);
+                          settingsContentRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+                        }}
+                        className="flex size-9 shrink-0 items-center justify-center rounded-full border border-[#e6e8eb] text-[#45474e] hover:bg-[#f7f8fa]"
+                      >
+                        <Pencil aria-hidden="true" className="size-4" />
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Delete memory: ${memory.content.slice(0, 40)}`}
+                        onClick={() => void deleteMemory(memory)}
+                        className="flex size-9 shrink-0 items-center justify-center rounded-full border border-[#e6e8eb] text-[#777a81] hover:bg-red-50 hover:text-red-700"
+                      >
+                        <Trash2 aria-hidden="true" className="size-4" />
+                      </button>
+                    </article>
+                  ))
+                )}
+              </div>
+            </section>
           )}
         </div>
       </section>

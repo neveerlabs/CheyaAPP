@@ -6,6 +6,7 @@ import {
   loadRecentAssistantFeedback,
   loadRecentChatMessages,
   loadRecentInsights,
+  saveUserMemory,
   saveChatBranch,
   saveMessageInsight,
 } from "../src/lib/chat-data";
@@ -24,6 +25,20 @@ import {
   type PersonalizationSettings,
   type StoredChatMessage,
 } from "../src/lib/supabase";
+
+function hasExplicitDeleteIntent(message: string, label: string): boolean {
+  if (!/\b(delete|remove|forget|erase|hapus|buang|lupakan)\b/i.test(message)) return false;
+  const targetPattern =
+    label === "memory"
+      ? /\b(memory|memories|memori|ingatan)\b/i
+      : label === "insight"
+        ? /\b(insight|insights|analisis|catatan)\b/i
+        : /\b(message|chat|conversation|pesan|obrolan)\b/i;
+  return (
+    targetPattern.test(message) ||
+    /\b(this|that|it|these|those|itu|ini|tersebut|yang tadi)\b/i.test(message)
+  );
+}
 
 async function updateJob(
   jobId: string,
@@ -174,21 +189,51 @@ async function processChatJob(jobId: string) {
   let currentInsight:
     | Awaited<ReturnType<typeof analyzeGeminiMessage>>["insight"]
     | undefined;
+  let memoryCandidate: Awaited<ReturnType<typeof analyzeGeminiMessage>>["memory"] = null;
   let insightKeyIndex = 0;
   try {
     const analysis = await analyzeGeminiMessage(typedKeys, userMessage.content, 0);
     currentInsight = analysis.insight;
+    memoryCandidate = analysis.memory;
     insightKeyIndex = analysis.keyIndex;
     attempts.push(...analysis.attempts);
-    await saveMessageInsight(client, userMessage.id, currentInsight, job.user_id);
-    insights = [...insights, currentInsight];
   } catch (error) {
     if (error instanceof GeminiFailoverError) attempts.push(...error.attempts);
     warnings.push(
-      `Message insight could not be saved: ${
+      `Message insight and memory analysis failed: ${
         error instanceof Error ? error.message : "Unknown analysis error."
       }`,
     );
+  }
+  if (currentInsight) {
+    try {
+      await saveMessageInsight(client, userMessage.id, currentInsight, job.user_id);
+      insights = [...insights, currentInsight];
+    } catch (error) {
+      warnings.push(
+        `Message insight could not be saved: ${
+          error instanceof Error ? error.message : "Unknown database error."
+        }`,
+      );
+    }
+  }
+  if (memoryCandidate) {
+    try {
+      await saveUserMemory(
+        client,
+        typedKeys[insightKeyIndex].api_key,
+        memoryCandidate.content,
+        memoryCandidate.category,
+        job.user_id,
+        userMessage.id,
+      );
+    } catch (error) {
+      warnings.push(
+        `A durable memory was identified but could not be saved: ${
+          error instanceof Error ? error.message : "Unknown database error."
+        }`,
+      );
+    }
   }
 
   let relevantMessages: Array<{ role: "user" | "assistant"; content: string }> = [];
@@ -236,8 +281,9 @@ async function processChatJob(jobId: string) {
           apiKey,
           name,
           input,
-          async () => false,
+          async (label) => hasExplicitDeleteIntent(userMessage.content, label),
           job.user_id,
+          userMessage.id,
         ),
     },
   );

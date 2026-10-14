@@ -24,6 +24,7 @@ import {
   ThumbsDown,
   ThumbsUp,
   TriangleAlert,
+  Trash2,
 } from "lucide-react";
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import cheyaLogo from "../assets/circle.png";
@@ -65,6 +66,11 @@ interface AttachmentView {
 interface DeleteConfirmation {
   label: string;
   preview: string;
+}
+
+interface DeleteChatTarget {
+  id: string;
+  text: string;
 }
 
 interface ReportTarget {
@@ -143,6 +149,8 @@ export function App() {
   const [userEditText, setUserEditText] = useState("");
   const [activeUserActions, setActiveUserActions] = useState<string | null>(null);
   const [deleteConfirmation, setDeleteConfirmation] = useState<DeleteConfirmation | null>(null);
+  const [deleteChatTarget, setDeleteChatTarget] = useState<DeleteChatTarget | null>(null);
+  const [isDeletingChatBranch, setIsDeletingChatBranch] = useState(false);
   const [sendError, setSendError] = useState("");
   const [isMediaMenuOpen, setIsMediaMenuOpen] = useState(false);
   const [attachedMedia, setAttachedMedia] = useState<File[]>([]);
@@ -938,6 +946,59 @@ export function App() {
     await copyMessageText(chatMessage.id, displayedMessageText(chatMessage));
   }
 
+  async function deleteChatBranchFromMessage() {
+    if (!deleteChatTarget || !authClient || isDeletingChatBranch) return;
+    const targetId = deleteChatTarget.id;
+    setIsDeletingChatBranch(true);
+    setSendError("");
+    try {
+      const { data: removedCount, error } = await authClient.rpc(
+        "delete_chat_branch_from_message",
+        { p_message_id: targetId },
+      );
+      if (error) {
+        throw new Error(
+          `Could not delete this message branch. Confirm the latest supabase/schema.sql has been run. ${error.message}`,
+        );
+      }
+      if (removedCount < 1) {
+        throw new Error("The message branch was not found, so nothing was deleted.");
+      }
+
+      const targetIndex = messages.findIndex((item) => item.id === targetId);
+      if (targetIndex < 0) {
+        setDeleteChatTarget(null);
+        setRealtimeRevision((revision) => revision + 1);
+        return;
+      }
+      const removedIds = new Set(messages.slice(targetIndex).map((item) => item.id));
+      setMessages((current) => current.slice(0, targetIndex));
+      setMessageVersions((current) =>
+        Object.fromEntries(Object.entries(current).filter(([id]) => !removedIds.has(id))),
+      );
+      setSelectedMessageVersions((current) =>
+        Object.fromEntries(Object.entries(current).filter(([id]) => !removedIds.has(id))),
+      );
+      setRatings((current) =>
+        Object.fromEntries(
+          Object.entries(current).filter(
+            ([key]) => ![...removedIds].some((id) => key.startsWith(`${id}:`)),
+          ),
+        ),
+      );
+      setChatJobs((current) =>
+        current.filter((job) => !removedIds.has(job.message_id)),
+      );
+      setActiveUserActions(null);
+      setDeleteChatTarget(null);
+      setRealtimeRevision((revision) => revision + 1);
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : "Could not delete this message branch.");
+    } finally {
+      setIsDeletingChatBranch(false);
+    }
+  }
+
   async function regenerateAssistantMessage(
     messageId: string,
     editedSource?: { text: string; versionNumber: number },
@@ -1121,7 +1182,15 @@ export function App() {
             reports: previousFeedback.reports,
           },
           executeTool: (name, input, apiKey) =>
-            executeChatDataTool(client, apiKey, name, input, requestDeleteConfirmation),
+            executeChatDataTool(
+              client,
+              apiKey,
+              name,
+              input,
+              requestDeleteConfirmation,
+              undefined,
+              sourceMessage.id,
+            ),
         },
       );
       let thinkingSummary: string | null = null;
@@ -1339,8 +1408,16 @@ export function App() {
 
   if (isAuthLoading) {
     return (
-      <main className="fixed inset-0 flex items-center justify-center bg-white text-sm text-[#777a81]">
-        Loading your CheyaVerse account…
+      <main className="fixed inset-0 flex items-start justify-center bg-[#f5f6f8] p-5">
+        <div className="w-full max-w-[580px] animate-pulse space-y-5 rounded-[34px] bg-white p-6">
+          <div className="h-12 w-52 rounded-full bg-[#f1f2f4]" />
+          <div className="space-y-3 pt-10">
+            <div className="ml-auto h-14 w-3/5 rounded-2xl bg-[#f1f2f4]" />
+            <div className="h-20 w-4/5 rounded-2xl bg-[#f1f2f4]" />
+            <div className="ml-auto h-12 w-1/2 rounded-2xl bg-[#f1f2f4]" />
+          </div>
+          <div className="mt-32 h-14 rounded-full bg-[#f1f2f4]" />
+        </div>
       </main>
     );
   }
@@ -1353,8 +1430,13 @@ export function App() {
     return (
       <Suspense
         fallback={
-          <main className="fixed inset-0 flex items-center justify-center bg-white text-sm text-[#777a81]">
-            Loading settings…
+          <main className="fixed inset-0 flex justify-center bg-white p-4">
+            <div className="w-full max-w-[680px] animate-pulse space-y-4 pt-5">
+              <div className="h-12 w-full rounded-full bg-[#f1f2f4]" />
+              <div className="h-28 rounded-[24px] bg-[#f1f2f4]" />
+              <div className="h-36 rounded-[24px] bg-[#f1f2f4]" />
+              <div className="h-24 rounded-[24px] bg-[#f1f2f4]" />
+            </div>
           </main>
         }
       >
@@ -1656,6 +1738,18 @@ export function App() {
                       >
                         <Pencil aria-hidden="true" className="size-3.5" />
                       </button>
+                      <button
+                        type="button"
+                        aria-label="Delete this message and everything after it"
+                        disabled={isSending || isDeletingChatBranch}
+                        onClick={() => {
+                          setDeleteChatTarget({ id: chatMessage.id, text: visibleText });
+                          setActiveUserActions(null);
+                        }}
+                        className="flex size-7 items-center justify-center rounded-md text-[#b43b3b] hover:bg-red-50 disabled:opacity-40"
+                      >
+                        <Trash2 aria-hidden="true" className="size-3.5" />
+                      </button>
                     </div>
                   </article>
                 );
@@ -1770,10 +1864,24 @@ export function App() {
                 </article>
               );
             })}
-            {isLoadingHistory && (
-              <p role="status" className="text-sm text-[#858890]">
-                Loading saved chat…
-              </p>
+            {isLoadingHistory && messages.length === 0 && (
+              <div
+                role="status"
+                aria-label="Loading conversation"
+                className="animate-pulse space-y-4 pt-4"
+              >
+                {[0, 1, 2, 3].map((item) => (
+                  <div key={item} className={item % 2 === 0 ? "flex justify-end" : "flex"}>
+                    <div
+                      className={`rounded-2xl ${
+                        item % 2 === 0
+                          ? "h-14 w-3/5 bg-[#e9eaed]"
+                          : "h-20 w-4/5 bg-[#f1f2f4]"
+                      }`}
+                    />
+                  </div>
+                ))}
+              </div>
             )}
             {isSending && (
               <div role="status" aria-live="polite" className="w-full space-y-1 text-xs text-[#747780]">
@@ -2029,6 +2137,59 @@ export function App() {
           </form>
         </footer>
       </section>
+
+      {deleteChatTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-5 py-8">
+          <section
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="delete-chat-branch-title"
+            aria-describedby="delete-chat-branch-description"
+            className="w-full max-w-md rounded-3xl border border-[#e2e4e8] bg-white p-5 shadow-xl"
+          >
+            <h2 id="delete-chat-branch-title" className="text-base font-semibold text-[#22242a]">
+              Delete this conversation branch?
+            </h2>
+            <p
+              id="delete-chat-branch-description"
+              className="mt-2 text-sm leading-6 text-[#64666d]"
+            >
+              This permanently removes this user message, its reply, and every later message,
+              including their versions, insights, feedback, pending chat jobs, and any AI memories
+              learned from those messages. Earlier messages stay in the conversation.
+            </p>
+            <p className="mt-3 max-h-24 overflow-y-auto whitespace-pre-wrap break-words rounded-xl bg-[#f5f6f8] p-3 text-sm text-[#34363b]">
+              {deleteChatTarget.text.slice(0, 500)}
+            </p>
+            {isSending && (
+              <p className="mt-3 text-xs leading-5 text-amber-800">
+                Wait for the current reply to finish before deleting the conversation branch.
+              </p>
+            )}
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={isDeletingChatBranch}
+                onClick={() => setDeleteChatTarget(null)}
+                className="h-10 rounded-full border border-[#e5e6e9] px-4 text-sm font-medium text-[#34363b] hover:bg-[#f7f8fa] disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isSending || isDeletingChatBranch}
+                onClick={() => void deleteChatBranchFromMessage()}
+                className="flex h-10 items-center gap-2 rounded-full bg-[#bd3030] px-4 text-sm font-medium text-white hover:bg-[#a92929] disabled:opacity-50"
+              >
+                {isDeletingChatBranch && (
+                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                )}
+                Delete branch
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
 
       {userEditTarget && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-5 py-8">

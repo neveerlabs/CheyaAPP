@@ -5,9 +5,14 @@ type RuntimeGlobal = typeof globalThis & {
   process?: { env?: Record<string, string | undefined> };
 };
 
+export function getServerEnvironmentVariable(name: string): string | undefined {
+  return (globalThis as RuntimeGlobal).process?.env?.[name]?.trim() || undefined;
+}
+
 function requiredEnv(name: string, fallbackName?: string): string {
-  const env = (globalThis as RuntimeGlobal).process?.env;
-  const value = env?.[name]?.trim() || (fallbackName ? env?.[fallbackName]?.trim() : "");
+  const value =
+    getServerEnvironmentVariable(name) ||
+    (fallbackName ? getServerEnvironmentVariable(fallbackName) : "");
   if (!value) throw new Error(`Missing server environment variable ${name}.`);
   return value;
 }

@@ -878,12 +878,36 @@ grant select, insert, update, delete on public.message_insights to authenticated
 create table if not exists public.user_memories (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null default auth.uid() references auth.users (id) on delete cascade,
+  source_message_id uuid,
   category text not null default 'general',
   content text not null check (length(trim(content)) > 0 and length(content) <= 10000),
   embedding extensions.vector(768),
   created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
+  updated_at timestamptz not null default now(),
+  constraint user_memories_source_message_fk foreign key (user_id, source_message_id)
+    references public.chat_messages (user_id, id)
+    on delete cascade
 );
+
+alter table public.user_memories
+  add column if not exists source_message_id uuid;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_constraint
+    where conrelid = 'public.user_memories'::regclass
+      and conname = 'user_memories_source_message_fk'
+  ) then
+    alter table public.user_memories
+      add constraint user_memories_source_message_fk
+      foreign key (user_id, source_message_id)
+      references public.chat_messages (user_id, id)
+      on delete cascade;
+  end if;
+end;
+$$;
 
 create index if not exists user_memories_user_updated_idx
   on public.user_memories (user_id, updated_at desc);
@@ -1115,13 +1139,13 @@ begin
   imported_rows := imported_rows + inserted_rows;
 
   insert into public.user_memories (
-    id, user_id, category, content, embedding, created_at, updated_at
+    id, user_id, source_message_id, category, content, embedding, created_at, updated_at
   )
   select
-    id, auth.uid(), category, content, embedding, created_at, updated_at
+    id, auth.uid(), source_message_id, category, content, embedding, created_at, updated_at
   from jsonb_to_recordset(coalesce(p_data -> 'user_memories', '[]'::jsonb)) as incoming(
-    id uuid, category text, content text, embedding extensions.vector(768),
-    created_at timestamptz, updated_at timestamptz
+    id uuid, source_message_id uuid, category text, content text,
+    embedding extensions.vector(768), created_at timestamptz, updated_at timestamptz
   )
   on conflict do nothing;
   get diagnostics inserted_rows = row_count;
@@ -1278,3 +1302,185 @@ begin
   end if;
 end;
 $$;
+
+create or replace function public.delete_chat_branch_from_message(p_message_id uuid)
+returns integer
+language plpgsql
+security invoker
+set search_path = public, auth
+as $$
+declare
+  anchor_message public.chat_messages%rowtype;
+  removed_message_ids uuid[];
+  removed_count integer;
+begin
+  if auth.uid() is null then
+    raise exception 'Authentication is required.';
+  end if;
+
+  select * into anchor_message
+  from public.chat_messages
+  where id = p_message_id
+    and user_id = auth.uid()
+    and role = 'user'
+  for update;
+  if not found then
+    raise exception 'The user message to delete was not found.';
+  end if;
+
+  select array_agg(id)
+  into removed_message_ids
+  from public.chat_messages
+  where user_id = auth.uid()
+    and (created_at, id) >= (anchor_message.created_at, anchor_message.id);
+
+  delete from public.chat_conversation_branches as branch
+  where branch.user_id = auth.uid()
+    and (
+      branch.anchor_message_id = any(removed_message_ids)
+      or exists (
+        select 1
+        from jsonb_array_elements(branch.messages) as branch_message
+        where (branch_message ->> 'message_id')::uuid = any(removed_message_ids)
+      )
+    );
+
+  delete from public.chat_messages
+  where user_id = auth.uid()
+    and id = any(removed_message_ids);
+  get diagnostics removed_count = row_count;
+  return removed_count;
+end;
+$$;
+
+revoke all on function public.delete_chat_branch_from_message(uuid) from public, anon;
+grant execute on function public.delete_chat_branch_from_message(uuid) to authenticated;
+
+create table if not exists public.database_activity_state (
+  singleton boolean primary key default true check (singleton),
+  last_activity_at timestamptz not null default now(),
+  last_keepalive_at timestamptz
+);
+
+insert into public.database_activity_state (singleton, last_activity_at)
+values (true, now())
+on conflict (singleton) do nothing;
+
+revoke all on public.database_activity_state from public, anon, authenticated;
+
+create table if not exists public.database_keepalive_pulses (
+  id uuid primary key default gen_random_uuid(),
+  created_at timestamptz not null default now()
+);
+
+revoke all on public.database_keepalive_pulses from public, anon, authenticated;
+
+create or replace function public.track_database_activity()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  update public.database_activity_state
+  set last_activity_at = now()
+  where singleton;
+
+  if tg_op = 'DELETE' then
+    return old;
+  end if;
+  return new;
+end;
+$$;
+
+do $$
+declare
+  table_name text;
+begin
+  foreach table_name in array array[
+    'user_settings',
+    'ai_api_keys',
+    'chat_messages',
+    'chat_message_versions',
+    'chat_conversation_branches',
+    'chat_message_jobs',
+    'message_insights',
+    'user_memories',
+    'message_feedback'
+  ]
+  loop
+    execute format(
+      'drop trigger if exists track_database_activity on public.%I',
+      table_name
+    );
+    execute format(
+      'create trigger track_database_activity after insert or update or delete on public.%I for each row execute function public.track_database_activity()',
+      table_name
+    );
+  end loop;
+end;
+$$;
+
+create or replace function public.run_database_keepalive()
+returns table (
+  pinged boolean,
+  idle_days numeric,
+  last_activity_at timestamptz,
+  last_keepalive_at timestamptz
+)
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+declare
+  activity_state public.database_activity_state%rowtype;
+  pulse_id uuid;
+begin
+  if auth.role() <> 'service_role' then
+    raise exception 'Only the scheduled server task can run database keepalive.';
+  end if;
+
+  select * into activity_state
+  from public.database_activity_state
+  where singleton
+  for update;
+
+  if not found then
+    raise exception 'Database activity tracking is not initialized.';
+  end if;
+
+  if activity_state.last_activity_at <= now() - interval '5 days'
+    and (
+      activity_state.last_keepalive_at is null
+      or activity_state.last_keepalive_at <= now() - interval '5 days'
+    ) then
+    insert into public.database_keepalive_pulses default values
+    returning id into pulse_id;
+
+    delete from public.database_keepalive_pulses
+    where id = pulse_id;
+
+    update public.database_activity_state
+    set last_keepalive_at = now()
+    where singleton
+    returning * into activity_state;
+
+    return query
+    select
+      true,
+      round(extract(epoch from (now() - activity_state.last_activity_at)) / 86400, 2),
+      activity_state.last_activity_at,
+      activity_state.last_keepalive_at;
+  else
+    return query
+    select
+      false,
+      round(extract(epoch from (now() - activity_state.last_activity_at)) / 86400, 2),
+      activity_state.last_activity_at,
+      activity_state.last_keepalive_at;
+  end if;
+end;
+$$;
+
+revoke all on function public.run_database_keepalive() from public, anon, authenticated;
+grant execute on function public.run_database_keepalive() to service_role;
