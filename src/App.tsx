@@ -2,46 +2,113 @@ import {
   AudioLines,
   BadgeCheck,
   Bell,
+  Brain,
   Bug,
   Camera,
-  Check,
   Files,
-  Film,
   Image,
+  LoaderCircle,
   Mic,
   Plus,
-  Search,
+  X,
   Settings,
   Send,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import avatarUrl from "../assets/cheyaverse.jpg";
+import { generateGeminiReply, GeminiFailoverError } from "./lib/gemini";
+import type { AppSupabaseClient } from "./lib/supabase";
+
+const SettingsPage = lazy(() =>
+  import("./SettingsPage").then((module) => ({ default: module.SettingsPage })),
+);
 
 const headerActions = [
   { label: "Report a problem", icon: Bug },
   { label: "Settings", icon: Settings },
 ];
+const MAX_ATTACHMENTS = 10;
+
+interface ChatMessage {
+  id: number;
+  role: "user" | "assistant";
+  text: string;
+}
+
+interface AttachmentView {
+  index: number;
+  mode: "media" | "editor";
+}
+
+const textFileExtensions = new Set([
+  "c",
+  "cc",
+  "cfg",
+  "conf",
+  "cpp",
+  "cs",
+  "css",
+  "csv",
+  "go",
+  "h",
+  "hpp",
+  "htm",
+  "html",
+  "ini",
+  "java",
+  "js",
+  "json",
+  "jsx",
+  "log",
+  "md",
+  "mjs",
+  "php",
+  "py",
+  "rb",
+  "rs",
+  "sh",
+  "sql",
+  "svg",
+  "toml",
+  "ts",
+  "tsx",
+  "txt",
+  "xml",
+  "yaml",
+  "yml",
+]);
+const binaryFileExtensions = new Set(["7z", "doc", "docx", "gz", "pdf", "rar", "tar", "xls", "xlsx", "zip"]);
 
 export function App() {
+  const [pathname, setPathname] = useState(window.location.pathname);
   const [message, setMessage] = useState("");
-  const [caption, setCaption] = useState("");
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [isSending, setIsSending] = useState(false);
+  const [sendError, setSendError] = useState("");
   const [isMediaMenuOpen, setIsMediaMenuOpen] = useState(false);
-  const [isGalleryOpen, setIsGalleryOpen] = useState(false);
-  const [isGalleryExpanded, setIsGalleryExpanded] = useState(false);
-  const [galleryFiles, setGalleryFiles] = useState<File[]>([]);
-  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [attachedMedia, setAttachedMedia] = useState<File[]>([]);
+  const [attachmentView, setAttachmentView] = useState<AttachmentView | null>(null);
+  const [editorContent, setEditorContent] = useState("");
+  const [editorError, setEditorError] = useState("");
+  const [isEditorLoading, setIsEditorLoading] = useState(false);
   const [viewport, setViewport] = useState({ height: 0, top: 0 });
   const fileInputRef = useRef<HTMLInputElement>(null);
   const filesInputRef = useRef<HTMLInputElement>(null);
   const cameraCaptureInputRef = useRef<HTMLInputElement>(null);
   const messageInputRef = useRef<HTMLTextAreaElement>(null);
-  const dragStart = useRef<{ y: number; height: number } | null>(null);
-  const gallerySheetRef = useRef<HTMLElement>(null);
+  const nextApiIndexRef = useRef(0);
+  const nextMessageIdRef = useRef(0);
+  const attachmentViewRequestRef = useRef(0);
+  const wasSettingsRef = useRef(window.location.pathname === "/settings");
   const hasMessage = message.trim().length > 0 || attachedMedia.length > 0;
   const mediaPreviews = useMemo(
-    () => new Map(galleryFiles.map((file) => [file, URL.createObjectURL(file)])),
-    [galleryFiles],
+    () =>
+      new Map(
+        attachedMedia
+          .filter((file) => file.type.startsWith("image/") || file.type.startsWith("video/"))
+          .map((file) => [file, URL.createObjectURL(file)]),
+      ),
+    [attachedMedia],
   );
 
   useEffect(
@@ -71,52 +138,402 @@ export function App() {
     };
   }, []);
 
-  function openGallery() {
-    setCaption("");
-    setIsGalleryExpanded(false);
-    setIsGalleryOpen(true);
+  useEffect(() => {
+    if (!attachmentView) return;
+
+    window.history.pushState({ attachmentView: true }, "", window.location.href);
+    const closeOnBack = () => {
+      attachmentViewRequestRef.current += 1;
+      setAttachmentView(null);
+      setIsEditorLoading(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") window.history.back();
+    };
+    window.addEventListener("popstate", closeOnBack);
+    window.addEventListener("keydown", closeOnEscape);
+
+    return () => {
+      window.removeEventListener("popstate", closeOnBack);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [attachmentView]);
+
+  useEffect(() => {
+    if (window.location.pathname === "/settings") {
+      window.history.pushState({ appRoute: "settings-direct-back-guard" }, "", "/settings");
+    }
+
+    const handlePopState = () => {
+      if (wasSettingsRef.current) {
+        if (window.location.pathname === "/settings") {
+          window.location.replace("/");
+        } else {
+          window.location.reload();
+        }
+        return;
+      }
+
+      const nextPath = window.location.pathname;
+      wasSettingsRef.current = nextPath === "/settings";
+      setPathname(nextPath);
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
+
+  function navigate(path: string) {
+    if (path === "/settings") {
+      window.history.pushState({ appRoute: "settings" }, "", path);
+      wasSettingsRef.current = true;
+    } else {
+      window.location.replace(path);
+      return;
+    }
+    setPathname(path);
   }
 
-  function showPickedMedia(fileList: FileList | null) {
-    const files = Array.from(fileList ?? []).filter(
-      (file) => file.type.startsWith("image/") || file.type.startsWith("video/"),
-    );
+  function addPickedFiles(fileList: FileList | null) {
+    const files = Array.from(fileList ?? []);
     if (files.length === 0) return;
 
-    setGalleryFiles(files);
-    setSelectedFiles(files);
-    openGallery();
+    const availableSlots = Math.max(0, MAX_ATTACHMENTS - attachedMedia.length);
+    const acceptedFiles = files.slice(0, availableSlots);
+    if (acceptedFiles.length > 0) {
+      setAttachedMedia((current) => [...current, ...acceptedFiles]);
+    }
+    if (acceptedFiles.length < files.length) {
+      const rejectedCount = files.length - acceptedFiles.length;
+      setSendError(
+        availableSlots === 0
+          ? `You can attach up to ${MAX_ATTACHMENTS} files. Remove an attachment before adding more.`
+          : `Only ${MAX_ATTACHMENTS} files can be attached at once. ${rejectedCount} ${rejectedCount === 1 ? "file was" : "files were"} not added.`,
+      );
+    } else {
+      setSendError("");
+    }
   }
 
-  function closeGallery() {
-    setIsGalleryOpen(false);
-    setIsGalleryExpanded(false);
+  function removeAttachedFile(indexToRemove: number) {
+    setAttachedMedia((files) => files.filter((_, index) => index !== indexToRemove));
   }
 
-  function addCameraCapture() {
-    cameraCaptureInputRef.current?.click();
+  async function openAttachment(index: number) {
+    const file = attachedMedia[index];
+    if (!file) return;
+
+    const requestId = ++attachmentViewRequestRef.current;
+    const isMedia = file.type.startsWith("image/") || file.type.startsWith("video/");
+    setAttachmentView({ index, mode: isMedia ? "media" : "editor" });
+    setEditorContent("");
+    setEditorError("");
+
+    if (isMedia) return;
+
+    const extension = file.name.split(".").pop()?.toLowerCase() ?? "";
+    if (
+      file.type.startsWith("text/") ||
+      /\/(json|javascript|xml|x-sql|x-yaml)$/.test(file.type) ||
+      textFileExtensions.has(extension)
+    ) {
+      setIsEditorLoading(true);
+      try {
+        const content = await file.text();
+        if (content.includes("\0")) {
+          setEditorError("This file contains binary data and cannot be edited as text.");
+        } else if (requestId === attachmentViewRequestRef.current) {
+          setEditorContent(content);
+        }
+      } catch (error) {
+        if (requestId === attachmentViewRequestRef.current) {
+          setEditorError(
+            error instanceof Error ? `Could not read this file: ${error.message}` : "Could not read this file.",
+          );
+        }
+      } finally {
+        if (requestId === attachmentViewRequestRef.current) setIsEditorLoading(false);
+      }
+      return;
+    }
+
+    if (binaryFileExtensions.has(extension) || file.type.startsWith("application/")) {
+      setEditorError("This file is binary and cannot be edited in the text editor.");
+      return;
+    }
+
+    setIsEditorLoading(true);
+    try {
+      const content = await file.text();
+      if (requestId !== attachmentViewRequestRef.current) return;
+      if (content.includes("\0")) {
+        setEditorError("This file contains binary data and cannot be edited as text.");
+      } else {
+        setEditorContent(content);
+      }
+    } catch (error) {
+      if (requestId === attachmentViewRequestRef.current) {
+        setEditorError(
+          error instanceof Error ? `Could not read this file: ${error.message}` : "Could not read this file.",
+        );
+      }
+    } finally {
+      if (requestId === attachmentViewRequestRef.current) setIsEditorLoading(false);
+    }
   }
 
-  function toggleMediaSelection(file: File) {
-    setSelectedFiles((files) =>
-      files.some((item) => item === file)
-        ? files.filter((item) => item !== file)
-        : [...files, file],
+  function closeAttachmentView() {
+    if (window.history.state?.attachmentView) {
+      window.history.back();
+    } else {
+      attachmentViewRequestRef.current += 1;
+      setAttachmentView(null);
+      setIsEditorLoading(false);
+    }
+  }
+
+  function commitFileEdit() {
+    if (!attachmentView || attachmentView.mode !== "editor") return;
+
+    const originalFile = attachedMedia[attachmentView.index];
+    if (originalFile && !editorError && !isEditorLoading) {
+      const editedFile = new File([editorContent], originalFile.name, {
+        type: originalFile.type || "text/plain",
+        lastModified: Date.now(),
+      });
+      setAttachedMedia((files) =>
+        files.map((file, index) => (index === attachmentView.index ? editedFile : file)),
+      );
+    }
+    closeAttachmentView();
+  }
+
+  function formatFileSize(size: number): string {
+    if (size < 1024) return `${size} B`;
+    if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+    return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  function fileExtension(file: File): string {
+    const extension = file.name.split(".").pop();
+    return extension && extension !== file.name ? extension.slice(0, 5).toUpperCase() : "FILE";
+  }
+
+  function fileTileColor(file: File): string {
+    const extension = fileExtension(file).toLowerCase();
+    if (["py", "js", "ts", "tsx", "jsx", "html", "css", "json"].includes(extension)) {
+      return "bg-[#eaf2ff] text-[#3972bb]";
+    }
+    if (["txt", "md", "log", "csv"].includes(extension)) {
+      return "bg-[#edf7ee] text-[#43834c]";
+    }
+    if (["pdf"].includes(extension)) return "bg-[#fff0ed] text-[#c25b4f]";
+    if (["zip", "rar", "7z", "tar", "gz"].includes(extension)) {
+      return "bg-[#fff4dc] text-[#a67518]";
+    }
+    return "bg-[#f1edff] text-[#7357ba]";
+  }
+
+  async function sendMessage() {
+    const prompt = message.trim();
+    if (!prompt) {
+      setSendError("Write a message before sending it to Gemini.");
+      return;
+    }
+
+    setSendError("");
+    setIsSending(true);
+    let client: AppSupabaseClient | null = null;
+    let saveStatus: typeof import("./lib/supabase").saveApiStatus | null = null;
+
+    try {
+      const { createSupabaseClient, loadDatabaseConfig, saveApiStatus } = await import(
+        "./lib/supabase"
+      );
+      saveStatus = saveApiStatus;
+      const config = loadDatabaseConfig();
+      if (!config) {
+        throw new Error("Connect your own Supabase project in Settings before using chat.");
+      }
+      client = createSupabaseClient(config);
+
+      const {
+        data: { session },
+        error: sessionError,
+      } = await client.auth.getSession();
+      if (sessionError) throw sessionError;
+      if (!session) {
+        throw new Error("Sign in to your Supabase account in Settings before using chat.");
+      }
+
+      const { data: keys, error: keysError } = await client
+        .from("ai_api_keys")
+        .select("id, model, api_key, status, last_error, created_at")
+        .order("created_at", { ascending: true })
+        .order("id", { ascending: true });
+      if (keysError) throw keysError;
+      if (keys.length === 0) {
+        throw new Error("Add at least one Gemini API key in Settings before sending a message.");
+      }
+
+      const result = await generateGeminiReply(keys, prompt, nextApiIndexRef.current);
+      nextApiIndexRef.current = (result.keyIndex + 1) % keys.length;
+      const statusErrors: string[] = [];
+      for (const attempt of result.attempts) {
+        try {
+          await saveStatus(client, attempt);
+        } catch (error) {
+          statusErrors.push(error instanceof Error ? error.message : "Could not save API status.");
+        }
+      }
+
+      const userMessageId = nextMessageIdRef.current++;
+      const responseMessageId = nextMessageIdRef.current++;
+      setMessages((current) => [
+        ...current,
+        { id: userMessageId, role: "user", text: prompt },
+        { id: responseMessageId, role: "assistant", text: result.text },
+      ]);
+      setMessage("");
+      setAttachedMedia([]);
+      if (messageInputRef.current) messageInputRef.current.style.height = "52px";
+      if (statusErrors.length > 0) {
+        setSendError(`Reply received, but API status could not be saved: ${statusErrors.join("; ")}`);
+      }
+    } catch (error) {
+      let detail = error instanceof Error ? error.message : "An unexpected error occurred.";
+      if (client && saveStatus && error instanceof GeminiFailoverError) {
+        const statusErrors: string[] = [];
+        for (const attempt of error.attempts) {
+          try {
+            await saveStatus(client, attempt);
+          } catch (statusError) {
+            statusErrors.push(
+              statusError instanceof Error ? statusError.message : "Could not save API status.",
+            );
+          }
+        }
+        if (statusErrors.length > 0) {
+          detail += `\nAPI status could not be saved: ${statusErrors.join("; ")}`;
+        }
+      }
+      setSendError(detail);
+    } finally {
+      setIsSending(false);
+    }
+  }
+
+  if (pathname === "/settings") {
+    return (
+      <Suspense
+        fallback={
+          <main className="fixed inset-0 flex items-center justify-center bg-white text-sm text-[#777a81]">
+            Loading settings…
+          </main>
+        }
+      >
+        <SettingsPage onBack={() => navigate("/")} />
+      </Suspense>
     );
   }
 
-  function finishMediaSelection() {
-    setAttachedMedia((files) => [...files, ...selectedFiles]);
-    setMessage(caption);
-    closeGallery();
-  }
+  const viewedFile = attachmentView ? attachedMedia[attachmentView.index] : undefined;
+  const editorLines = editorContent.split(/\r\n|\r|\n/);
+  const longestEditorLine = editorLines.reduce((longest, line) => Math.max(longest, line.length), 0);
 
-  function sendMessage() {
-    setMessage("");
-    setAttachedMedia([]);
-    if (messageInputRef.current) {
-      messageInputRef.current.style.height = "52px";
-    }
+  if (attachmentView && viewedFile) {
+    const previewUrl = mediaPreviews.get(viewedFile);
+    const isMediaView = attachmentView.mode === "media";
+    const editorWidth = `calc(${Math.max(40, longestEditorLine)}ch + 1.5rem)`;
+    const editorHeight = `${Math.max(100, editorLines.length * 24 + 32)}px`;
+
+    return (
+      <main
+        aria-label={isMediaView ? `Preview: ${viewedFile.name}` : `Edit: ${viewedFile.name}`}
+        className={`fixed inset-0 z-40 flex flex-col ${
+          isMediaView ? "cursor-zoom-out bg-black" : "bg-white text-[#24252a]"
+        }`}
+        onClick={isMediaView ? closeAttachmentView : undefined}
+      >
+        {isMediaView ? (
+          viewedFile.type.startsWith("video/") && previewUrl ? (
+            <video
+              src={previewUrl}
+              aria-label={viewedFile.name}
+              autoPlay
+              muted
+              loop
+              playsInline
+              className="size-full object-contain"
+            />
+          ) : previewUrl ? (
+            <img
+              src={previewUrl}
+              alt={viewedFile.name}
+              className="size-full select-none object-contain"
+              draggable={false}
+            />
+          ) : null
+        ) : (
+          <>
+            <header className="flex h-11 shrink-0 items-center justify-between gap-3 border-b border-[#eceef0] px-3 text-xs">
+              <span className="min-w-0 truncate font-medium">{viewedFile.name}</span>
+              <span className="shrink-0 text-[#777a81]">{formatFileSize(viewedFile.size)}</span>
+            </header>
+            <section
+              aria-label="File editor"
+              className="relative min-h-0 flex-1 overflow-hidden bg-white"
+            >
+              {isEditorLoading ? (
+                <div className="flex h-full items-center justify-center gap-2 text-sm text-[#777a81]">
+                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                  Opening file…
+                </div>
+              ) : editorError ? (
+                <p role="alert" className="p-5 text-sm text-red-700">
+                  {editorError}
+                </p>
+              ) : (
+                <div className="absolute inset-0 overflow-auto overscroll-contain">
+                  <div className="flex min-h-full w-max min-w-full items-stretch font-mono text-[13px] leading-6">
+                    <div
+                      aria-hidden="true"
+                      className="sticky left-0 z-10 shrink-0 border-r border-[#eceef0] bg-[#fafafa] px-3 py-4 text-right text-[#a0a3aa] select-none"
+                    >
+                      {editorLines.map((_, index) => (
+                        <div key={index} className="h-6 leading-6">
+                          {index + 1}
+                        </div>
+                      ))}
+                    </div>
+                    <textarea
+                      aria-label={`Edit ${viewedFile.name}`}
+                      spellCheck={false}
+                      wrap="off"
+                      value={editorContent}
+                      onChange={(event) => setEditorContent(event.target.value)}
+                      style={{
+                        width: editorWidth,
+                        minWidth: "calc(100vw - 56px)",
+                        height: editorHeight,
+                      }}
+                      className="m-0 block min-h-full shrink-0 resize-none overflow-hidden border-0 bg-white px-3 py-4 font-mono text-[13px] leading-6 text-[#25262a] outline-none focus:outline-none"
+                    />
+                  </div>
+                </div>
+              )}
+              <button
+                type="button"
+                disabled={isEditorLoading}
+                onClick={commitFileEdit}
+                className="absolute bottom-[max(16px,env(safe-area-inset-bottom))] right-4 flex h-10 items-center justify-center rounded-full border border-[#e5e6e9] bg-white px-5 text-sm font-medium text-[#27282d] shadow-md transition hover:bg-[#f7f8fa] disabled:opacity-50"
+              >
+                Commit
+              </button>
+            </section>
+          </>
+        )}
+      </main>
+    );
   }
 
   return (
@@ -173,6 +590,9 @@ export function App() {
                 type="button"
                 aria-label={label}
                 title={label}
+                onClick={() => {
+                  if (label === "Settings") navigate("/settings");
+                }}
                 className="flex size-9 items-center justify-center rounded-full text-[#303238] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
               >
                 <Icon aria-hidden="true" className="size-5" strokeWidth={1.8} />
@@ -183,21 +603,108 @@ export function App() {
 
         <div
           aria-label="Conversation"
-          className="min-h-0 flex-1 overflow-y-auto overscroll-contain"
-        />
+          aria-live="polite"
+          className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain px-4 py-4 sm:px-6"
+        >
+          {messages.map((chatMessage) => (
+            <div
+              key={chatMessage.id}
+              className={`flex ${chatMessage.role === "user" ? "justify-end" : "justify-start"}`}
+            >
+              <p
+                className={`max-w-[88%] whitespace-pre-wrap rounded-[20px] px-4 py-3 text-sm leading-6 ${
+                  chatMessage.role === "user"
+                    ? "rounded-br-md bg-[#28292e] text-white"
+                    : "rounded-bl-md bg-[#f2f3f5] text-[#27282d]"
+                }`}
+              >
+                {chatMessage.text}
+              </p>
+            </div>
+          ))}
+          {isSending && (
+            <p role="status" className="text-sm text-[#858890]">
+              Gemini is thinking…
+            </p>
+          )}
+          {sendError && (
+            <p
+              role="alert"
+              className="whitespace-pre-line rounded-2xl border border-red-100 bg-red-50 px-3 py-2 text-sm text-red-800"
+            >
+              {sendError}
+            </p>
+          )}
+        </div>
 
         <footer className="shrink-0 bg-white px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-1.5 sm:px-5 sm:pb-5">
           {attachedMedia.length > 0 && (
-            <div className="mb-1.5 flex max-h-8 gap-2 overflow-x-auto px-1 text-xs text-[#686b72]">
-              {attachedMedia.map((file, index) => (
-                <span
-                  key={`${file.name}-${file.lastModified}-${index}`}
-                  className="max-w-[180px] shrink-0 truncate rounded-full bg-[#f3f4f6] px-2.5 py-1"
-                  title={file.name}
-                >
-                  {file.name}
-                </span>
-              ))}
+            <div
+              aria-label="Files ready to upload"
+              className="mb-2 grid max-w-full grid-flow-col auto-cols-[76px] gap-2 overflow-x-auto overflow-y-hidden overscroll-x-contain px-1 pb-1 pt-1 sm:auto-cols-[84px]"
+            >
+              {attachedMedia.map((file, index) => {
+                const isPreviewable =
+                  file.type.startsWith("image/") || file.type.startsWith("video/");
+                const preview = mediaPreviews.get(file);
+
+                return (
+                  <article
+                    key={`${file.name}-${file.lastModified}-${index}`}
+                    aria-label={`Attached file: ${file.name}`}
+                    className="relative aspect-square min-w-0 overflow-hidden rounded-xl border border-[#e5e6e9] bg-[#f4f5f7]"
+                    title={file.name}
+                  >
+                    <button
+                      type="button"
+                      aria-label={`Open ${file.name}`}
+                      onClick={() => void openAttachment(index)}
+                      className="absolute inset-0 flex size-full items-center justify-center overflow-hidden text-left"
+                    >
+                      {isPreviewable && preview ? (
+                        file.type.startsWith("video/") ? (
+                          <video
+                            src={preview}
+                            muted
+                            loop
+                            autoPlay
+                            playsInline
+                            preload="metadata"
+                            aria-label={`Preview of ${file.name}`}
+                            className="size-full object-cover"
+                          />
+                        ) : (
+                          <img
+                            src={preview}
+                            alt={file.name}
+                            className="size-full object-cover"
+                          />
+                        )
+                      ) : (
+                        <div
+                          className={`flex size-full items-center justify-center ${fileTileColor(file)}`}
+                        >
+                          <span className="max-w-full truncate px-1 text-center text-[11px] font-bold tracking-wide">
+                            {fileExtension(file)}
+                          </span>
+                        </div>
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={`Remove ${file.name}`}
+                      title={`Remove ${file.name}`}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        removeAttachedFile(index);
+                      }}
+                      className="absolute right-1 top-1 z-10 flex size-5 items-center justify-center rounded-full border border-black/5 bg-white/95 text-[#292b30] shadow-sm transition hover:bg-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
+                    >
+                      <X aria-hidden="true" className="size-3.5" strokeWidth={2} />
+                    </button>
+                  </article>
+                );
+              })}
             </div>
           )}
           <form
@@ -294,20 +801,25 @@ export function App() {
               <div className="flex items-center gap-2">
                 <button
                   type="button"
-                  aria-label="Search"
+                  aria-label="Think"
                   className="flex h-10 items-center gap-2 rounded-full border border-[#e5e6e9] bg-white px-3.5 text-sm font-medium text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
                 >
-                  <Search aria-hidden="true" className="size-[18px]" strokeWidth={1.8} />
-                  <span>Search</span>
+                  <Brain aria-hidden="true" className="size-[18px]" strokeWidth={1.8} />
+                  <span>Think</span>
                 </button>
                 {hasMessage ? (
                   <button
                     type="button"
                     aria-label="Send message"
                     onClick={sendMessage}
+                    disabled={isSending}
                     className="flex size-10 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
                   >
-                    <Send aria-hidden="true" className="size-[18px]" strokeWidth={1.8} />
+                    {isSending ? (
+                      <LoaderCircle aria-hidden="true" className="size-[18px] animate-spin" />
+                    ) : (
+                      <Send aria-hidden="true" className="size-[18px]" strokeWidth={1.8} />
+                    )}
                   </button>
                 ) : (
                   <>
@@ -341,7 +853,7 @@ export function App() {
         aria-label="Choose photos and videos"
         className="sr-only"
         onChange={(event) => {
-          showPickedMedia(event.currentTarget.files);
+          addPickedFiles(event.currentTarget.files);
           event.currentTarget.value = "";
         }}
       />
@@ -353,7 +865,7 @@ export function App() {
         aria-label="Choose files"
         className="sr-only"
         onChange={(event) => {
-          showPickedMedia(event.currentTarget.files);
+          addPickedFiles(event.currentTarget.files);
           event.currentTarget.value = "";
         }}
       />
@@ -365,168 +877,10 @@ export function App() {
         aria-label="Capture a photo or video"
         className="sr-only"
         onChange={(event) => {
-          showPickedMedia(event.currentTarget.files);
+          addPickedFiles(event.currentTarget.files);
           event.currentTarget.value = "";
         }}
       />
-
-      {isGalleryOpen && (
-        <div
-          className="absolute inset-0 z-50 flex items-end justify-center bg-black/55 sm:items-center sm:p-5"
-          onMouseDown={(event) => {
-            if (event.target === event.currentTarget) closeGallery();
-          }}
-        >
-          <section
-            ref={gallerySheetRef}
-            aria-label="Choose photos and videos"
-            aria-modal="true"
-            role="dialog"
-            style={{ height: isGalleryExpanded ? "100%" : "72%" }}
-            className={`flex w-full max-w-[580px] flex-col overflow-hidden bg-[#151515] text-white shadow-2xl sm:max-h-[88svh] sm:rounded-[26px] ${
-              isGalleryExpanded ? "rounded-none sm:rounded-[26px]" : "rounded-t-[22px]"
-            }`}
-          >
-            <div
-              aria-label="Drag to expand or close the gallery"
-              className="flex h-7 shrink-0 touch-none cursor-grab items-center justify-center active:cursor-grabbing"
-              onPointerDown={(event) => {
-                const height =
-                  gallerySheetRef.current?.getBoundingClientRect().height ?? 0;
-                dragStart.current = { y: event.clientY, height };
-                event.currentTarget.setPointerCapture(event.pointerId);
-              }}
-              onPointerMove={(event) => {
-                if (!dragStart.current || !gallerySheetRef.current) return;
-                const delta = event.clientY - dragStart.current.y;
-                const viewportHeight = viewport.height || window.innerHeight;
-                const minHeight = Math.round(viewportHeight * 0.4);
-                const nextHeight = Math.min(
-                  viewportHeight,
-                  Math.max(minHeight, dragStart.current.height - delta),
-                );
-                gallerySheetRef.current.style.height = `${nextHeight}px`;
-              }}
-              onPointerUp={(event) => {
-                if (dragStart.current === null) return;
-                const delta = event.clientY - dragStart.current.y;
-                if (delta < -36) {
-                  setIsGalleryExpanded(true);
-                } else if (delta > 45 && isGalleryExpanded) {
-                  setIsGalleryExpanded(false);
-                } else if (delta > 100 && !isGalleryExpanded) {
-                  closeGallery();
-                } else {
-                  gallerySheetRef.current?.style.removeProperty("height");
-                }
-                dragStart.current = null;
-              }}
-              onPointerCancel={() => {
-                dragStart.current = null;
-                gallerySheetRef.current?.style.removeProperty("height");
-              }}
-            >
-              <span className="h-1 w-8 rounded-full bg-white/35" />
-            </div>
-
-            <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
-              <div className="grid min-h-full grid-cols-3 content-start gap-0.5">
-                <button
-                  type="button"
-                  aria-label="Open device camera"
-                  onClick={addCameraCapture}
-                  className="relative aspect-square overflow-hidden bg-[#292929]"
-                >
-                  <Camera aria-hidden="true" className="absolute bottom-2 right-2 size-5 text-white drop-shadow" />
-                </button>
-
-                {galleryFiles.map((file, index) => {
-                  const isVideo = file.type.startsWith("video/");
-                  const selected = selectedFiles.includes(file);
-                  const preview = mediaPreviews.get(file);
-                  return (
-                    <button
-                      key={`${file.name}-${file.lastModified}-${index}`}
-                      type="button"
-                      aria-label={`${selected ? "Deselect" : "Select"} ${file.name}`}
-                      aria-pressed={selected}
-                      onClick={() => toggleMediaSelection(file)}
-                      className="relative aspect-square overflow-hidden rounded-lg bg-[#292929] text-left"
-                    >
-                      {isVideo ? (
-                        <video
-                          src={preview}
-                          muted
-                          playsInline
-                          preload="metadata"
-                          className="size-full object-cover"
-                        />
-                      ) : (
-                        <img
-                          src={preview}
-                          alt={file.name}
-                          className="size-full object-cover"
-                        />
-                      )}
-                      {isVideo && (
-                        <span className="absolute bottom-1.5 left-1.5 flex items-center gap-1 rounded bg-black/60 px-1.5 py-1 text-[10px]">
-                          <Film aria-hidden="true" className="size-3" />
-                          Video
-                        </span>
-                      )}
-                      <span
-                        className={`absolute right-2 top-2 flex size-6 items-center justify-center rounded-full border ${
-                          selected
-                            ? "border-[#8b5cf6] bg-[#8b5cf6] text-white"
-                            : "border-white/90 bg-black/15"
-                        }`}
-                      >
-                        {selected && <Check aria-hidden="true" className="size-4" />}
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-              {galleryFiles.length === 0 && (
-                <div
-                  aria-label="No media selected yet"
-                  tabIndex={0}
-                  className="min-h-[55vh] outline-none"
-                />
-              )}
-            </div>
-
-            {selectedFiles.length > 0 && (
-              <form
-                aria-label="Add a caption to the media"
-                className="m-2 flex min-h-12 shrink-0 items-center gap-2 rounded-full border border-white/15 bg-[#242424] px-2"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  finishMediaSelection();
-                }}
-              >
-                <textarea
-                  name="media-caption"
-                  aria-label="Media caption"
-                  placeholder="Add a caption"
-                  rows={1}
-                  value={caption}
-                  onChange={(event) => setCaption(event.target.value)}
-                  className="max-h-24 min-h-10 min-w-0 flex-1 resize-none overflow-y-auto bg-transparent px-2 py-2.5 text-sm leading-5 text-white outline-none placeholder:text-white/45"
-                />
-                <button
-                  type="submit"
-                  aria-label={`Send ${selectedFiles.length} media items`}
-                  className="flex size-9 shrink-0 items-center justify-center gap-1 rounded-full bg-[#8b5cf6] px-2 text-white"
-                >
-                  <span className="text-xs font-semibold">{selectedFiles.length}</span>
-                  <Send aria-hidden="true" className="size-4" />
-                </button>
-              </form>
-            )}
-          </section>
-        </div>
-      )}
     </main>
   );
 }
