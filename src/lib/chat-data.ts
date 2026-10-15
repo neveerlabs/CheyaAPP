@@ -315,7 +315,14 @@ export async function loadRecentInsights(
   excludeMessageId?: string,
   beforeCreatedAt?: string,
   userId?: string,
-): Promise<Array<Pick<MessageInsight, "mood" | "communication_style" | "situation" | "topics" | "support_needs" | "summary">>> {
+): Promise<
+  Array<
+    Pick<
+      MessageInsight,
+      "mood" | "communication_style" | "situation" | "topics" | "support_needs" | "summary" | "created_at"
+    >
+  >
+> {
   let messageQuery = client
     .from("chat_messages")
     .select("id")
@@ -335,7 +342,7 @@ export async function loadRecentInsights(
 
   let query = client
     .from("message_insights")
-    .select("mood, communication_style, situation, topics, support_needs, summary")
+    .select("mood, communication_style, situation, topics, support_needs, summary, created_at")
     .in("message_id", messageIds)
     .order("created_at", { ascending: false })
     .limit(limit);
@@ -448,40 +455,58 @@ export async function saveChatBranch(
   anchorVersionNumber: number,
   userId?: string,
 ): Promise<void> {
-  if (userId) {
-    const { data: activeMessages, error: messagesError } = await client
-      .from("chat_messages")
-      .select("id, version_number")
-      .eq("user_id", userId)
-      .eq("is_active", true)
-      .order("created_at", { ascending: true })
-      .order("id", { ascending: true });
-    if (messagesError) {
-      throw new Error(`Could not load active messages for this branch: ${messagesError.message}`);
-    }
-    const branchMessages = activeMessages.map((message) => ({
-      message_id: message.id,
-      version_number:
-        message.id === anchorMessageId ? anchorVersionNumber : message.version_number,
-    }));
-    if (!branchMessages.some((message) => message.message_id === anchorMessageId)) {
-      throw new Error("The branch anchor message is not active.");
-    }
-    const { error } = await client.from("chat_conversation_branches").upsert(
-      {
-        user_id: userId,
-        anchor_message_id: anchorMessageId,
-        anchor_version_number: anchorVersionNumber,
-        messages: branchMessages,
-      },
-      { onConflict: "user_id,anchor_message_id,anchor_version_number" },
-    );
-    if (error) throw new Error(`Could not save this conversation branch: ${error.message}`);
-    return;
+  let ownerId = userId;
+  if (!ownerId) {
+    const { data, error } = await client.auth.getUser();
+    if (error) throw new Error(`Could not identify the account for this branch: ${error.message}`);
+    if (!data.user) throw new Error("Sign in before saving a conversation branch.");
+    ownerId = data.user.id;
   }
-  const { error } = await client.rpc("save_chat_branch", {
-    p_anchor_message_id: anchorMessageId,
-    p_anchor_version_number: anchorVersionNumber,
+
+  const { data: activeMessages, error: messagesError } = await client
+    .from("chat_messages")
+    .select("id, version_number")
+    .eq("user_id", ownerId)
+    .eq("is_active", true)
+    .order("created_at", { ascending: true })
+    .order("id", { ascending: true });
+  if (messagesError) {
+    throw new Error(`Could not load active messages for this branch: ${messagesError.message}`);
+  }
+  const activeAnchor = activeMessages.find((message) => message.id === anchorMessageId);
+  if (!activeAnchor) throw new Error("The branch anchor message is not active.");
+  if (activeAnchor.version_number !== anchorVersionNumber) {
+    throw new Error("The branch anchor version is no longer active.");
+  }
+
+  const activeIds = activeMessages.map((message) => message.id);
+  const { data: versions, error: versionsError } = await client
+    .from("chat_message_versions")
+    .select("message_id")
+    .eq("user_id", ownerId)
+    .in("message_id", activeIds);
+  if (versionsError) {
+    throw new Error(`Could not load message versions for this branch: ${versionsError.message}`);
+  }
+  const versionCounts = new Map<string, number>();
+  for (const version of versions) {
+    versionCounts.set(version.message_id, (versionCounts.get(version.message_id) ?? 0) + 1);
+  }
+  const branchMessages = activeMessages.map((message) => ({
+    message_id: message.id,
+    version_number: message.version_number,
+  }));
+  const snapshots = activeMessages
+    .filter((message) => message.id === anchorMessageId || (versionCounts.get(message.id) ?? 0) > 1)
+    .map((message) => ({
+      user_id: ownerId,
+      anchor_message_id: message.id,
+      anchor_version_number: message.version_number,
+      messages: branchMessages,
+    }));
+
+  const { error } = await client.from("chat_conversation_branches").upsert(snapshots, {
+    onConflict: "user_id,anchor_message_id,anchor_version_number",
   });
   if (error) throw new Error(`Could not save this conversation branch: ${error.message}`);
 }

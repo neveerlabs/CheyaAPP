@@ -55,6 +55,7 @@ interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   text: string;
+  createdAt: string;
   versionNumber: number;
   thinkingSummary: string | null;
 }
@@ -254,6 +255,7 @@ export function App() {
   }
 
   async function setMessageVersion(chatMessage: ChatMessage, direction: -1 | 1) {
+    if (isSending || isRestoringVersion) return;
     setSendError("");
     setTypingAssistant(null);
     const messageIndex = messages.findIndex((item) => item.id === chatMessage.id);
@@ -261,11 +263,14 @@ export function App() {
     if (versions.length < 2) return;
     const currentNumber = displayedVersionNumber(chatMessage);
     const currentIndex = versions.findIndex((item) => item.version_number === currentNumber);
+    if (currentIndex < 0) {
+      setSendError("Could not find the currently selected message version.");
+      return;
+    }
     const nextVersion = versions[currentIndex + direction];
     if (!nextVersion) return;
 
     if (authClient) {
-      if (isRestoringVersion) return;
       setIsRestoringVersion(true);
       try {
         const { restoreChatBranch, loadMessageVersions } = await import("./lib/chat-data");
@@ -282,10 +287,11 @@ export function App() {
           branch.map((item) => item.id),
         );
         setMessages(
-          branch.map(({ id, role, content, version_number, thinking_summary }) => ({
+          branch.map(({ id, role, content, created_at, version_number, thinking_summary }) => ({
             id,
             role,
             text: content,
+            createdAt: created_at,
             versionNumber: version_number,
             thinkingSummary: thinking_summary,
           })),
@@ -544,7 +550,7 @@ export function App() {
           authClient
             .from("chat_message_jobs")
             .select("*")
-            .in("status", ["queued", "processing", "failed"])
+            .or("status.in.(queued,processing,failed),error.not.is.null")
             .order("created_at", { ascending: false })
             .limit(50),
         ]);
@@ -599,10 +605,11 @@ export function App() {
             Object.fromEntries(savedMessages.map((item) => [item.id, item.version_number])),
           );
           setMessages(
-            savedMessages.map(({ id, role, content, version_number, thinking_summary }) => ({
+            savedMessages.map(({ id, role, content, created_at, version_number, thinking_summary }) => ({
               id,
               role,
               text: content,
+              createdAt: created_at,
               versionNumber: version_number,
               thinkingSummary: thinking_summary,
             })),
@@ -944,6 +951,7 @@ export function App() {
                 id: result.messageId!,
                 role: "user",
                 text: prompt,
+                createdAt: new Date().toISOString(),
                 versionNumber: 1,
                 thinkingSummary: null,
               },
@@ -1269,7 +1277,12 @@ export function App() {
         profile ?? DEFAULT_PERSONALIZATION,
         {
           thinkingMode: showThinking,
-          history: history.map(({ role, text }) => ({ role, content: text })),
+          currentMessageAt: sourceMessage.createdAt,
+          history: history.map(({ role, text, createdAt }) => ({
+            role,
+            content: text,
+            created_at: createdAt,
+          })),
           relevantMessages: relevantContext.messages,
           memories: relevantContext.memories,
           insights,
@@ -1278,6 +1291,13 @@ export function App() {
             content: previousAnswer,
             feedback: previousFeedback.rating,
             reports: previousFeedback.reports,
+          },
+          onToolActivity: async (toolName) => {
+            setThinkingSteps([
+              toolName === "search_web"
+                ? "Searching the web and inspecting source pages…"
+                : `Using chat data tool: ${toolName}`,
+            ]);
           },
           executeTool: (name, input, key) => {
             if (name === "search_web") {
@@ -1331,6 +1351,9 @@ export function App() {
           },
         },
       );
+      regenerationWarnings.push(
+        ...result.toolErrors.map((detail) => `A tool reported an error: ${detail}`),
+      );
       let thinkingSummary: string | null = null;
       if (showThinking) {
         try {
@@ -1339,7 +1362,12 @@ export function App() {
             sourceText,
             result.text,
             {
-              history: history.map(({ role, text }) => ({ role, content: text })),
+              currentMessageAt: sourceMessage.createdAt,
+              history: history.map(({ role, text, createdAt }) => ({
+                role,
+                content: text,
+                created_at: createdAt,
+              })),
               relevantMessages: relevantContext.messages,
               memories: relevantContext.memories,
               insights,
@@ -1382,28 +1410,18 @@ export function App() {
         embedding,
         thinkingSummary,
         "regenerate",
-        true,
+        !editedSource,
       );
       if (!updatedMessage) throw new Error("This reply could not be found in the database.");
 
-      for (const anchor of [
-        {
-          id: updatedMessage.id,
-          versionNumber: updatedMessage.version_number,
-        },
-        ...(editedSource
-          ? [{ id: sourceMessage.id, versionNumber: editedSource.versionNumber }]
-          : []),
-      ]) {
-        try {
-          await saveChatBranch(client, anchor.id, anchor.versionNumber);
-        } catch (error) {
-          regenerationWarnings.push(
-            `Reply was regenerated, but its conversation branch could not be preserved: ${
-              error instanceof Error ? error.message : "Unknown database error."
-            }`,
-          );
-        }
+      try {
+        await saveChatBranch(client, updatedMessage.id, updatedMessage.version_number);
+      } catch (error) {
+        regenerationWarnings.push(
+          `Reply was regenerated, but its conversation branch could not be preserved: ${
+            error instanceof Error ? error.message : "Unknown database error."
+          }`,
+        );
       }
 
       const updatedVersions = await loadMessageVersions(client, [messageId]);
@@ -1418,6 +1436,7 @@ export function App() {
             ? {
                 ...item,
                 text: updatedMessage.content,
+                createdAt: updatedMessage.created_at,
                 versionNumber: updatedMessage.version_number,
                 thinkingSummary: updatedMessage.thinking_summary,
               }
@@ -1501,15 +1520,6 @@ export function App() {
       );
       if (!updatedMessage) throw new Error("The edited message was not found.");
       const versions = await loadMessageVersions(client, [userEditTarget]);
-      try {
-        await saveChatBranch(client, updatedMessage.id, updatedMessage.version_number);
-      } catch (error) {
-        setSendError(
-          error instanceof Error
-            ? error.message
-            : "The edited message was saved, but its conversation branch could not be saved.",
-        );
-      }
       setMessageVersions((current) => ({ ...current, ...versions }));
       setSelectedMessageVersions((current) => ({
         ...current,
@@ -1521,6 +1531,7 @@ export function App() {
             ? {
                 ...item,
                 text: updatedMessage.content,
+                createdAt: updatedMessage.created_at,
                 versionNumber: updatedMessage.version_number,
                 thinkingSummary: null,
               }
@@ -1536,6 +1547,16 @@ export function App() {
           text: updatedMessage.content,
           versionNumber: updatedMessage.version_number,
         });
+      } else {
+        try {
+          await saveChatBranch(client, updatedMessage.id, updatedMessage.version_number);
+        } catch (error) {
+          setSendError(
+            error instanceof Error
+              ? error.message
+              : "The edited message was saved, but its conversation branch could not be saved.",
+          );
+        }
       }
     } catch (error) {
       setSendError(error instanceof Error ? error.message : "Could not edit this message.");
@@ -1778,12 +1799,14 @@ export function App() {
                 typingAssistant.content === visibleText;
               const ratingKey = `${chatMessage.id}:${versionNumber}`;
               const chatJob = chatJobsByMessageId.get(chatMessage.id);
-              const versionControls = chatMessage.role === "user" && versions.length > 1 ? (
+              const versionLabel =
+                chatMessage.role === "user" ? "user message" : "assistant response";
+              const versionControls = versions.length > 1 ? (
                 <div className="flex items-center gap-0.5 text-[11px] text-[#777a82]">
                   <button
                     type="button"
-                    aria-label="Show previous message version"
-                    disabled={isRestoringVersion || versionIndex <= 0}
+                    aria-label={`Show previous ${versionLabel} version`}
+                    disabled={isSending || isRestoringVersion || versionIndex <= 0}
                     onClick={() => void setMessageVersion(chatMessage, -1)}
                     className="flex size-7 items-center justify-center rounded-md hover:bg-[#f1f2f4] disabled:opacity-30"
                   >
@@ -1792,9 +1815,12 @@ export function App() {
                   <span>{Math.max(versionIndex + 1, 1)}/{versions.length}</span>
                   <button
                     type="button"
-                    aria-label="Show newer message version"
+                    aria-label={`Show newer ${versionLabel} version`}
                     disabled={
-                      isRestoringVersion || versionIndex < 0 || versionIndex >= versions.length - 1
+                      isSending ||
+                      isRestoringVersion ||
+                      versionIndex < 0 ||
+                      versionIndex >= versions.length - 1
                     }
                     onClick={() => void setMessageVersion(chatMessage, 1)}
                     className="flex size-7 items-center justify-center rounded-md hover:bg-[#f1f2f4] disabled:opacity-30"
@@ -1830,17 +1856,23 @@ export function App() {
                         <AssistantMarkdown content={visibleText} userMessage />
                       </Suspense>
                       <Suspense fallback={null}>
-                        <LinkPreviews content={visibleText} client={authClient} userMessage />
+                        <LinkPreviews
+                          content={visibleText}
+                          client={authClient}
+                          userMessage
+                        />
                       </Suspense>
                     </div>
                     {chatJob && (
                       <p
-                        role={chatJob.status === "failed" ? "alert" : "status"}
+                        role={chatJob.status === "failed" || chatJob.error ? "alert" : "status"}
                         className={`mt-1 max-w-[88%] text-xs ${
-                          chatJob.status === "failed" ? "text-red-700" : "text-[#747780]"
+                          chatJob.status === "failed" || chatJob.error
+                            ? "text-red-700"
+                            : "text-[#747780]"
                         }`}
                       >
-                        {chatJob.status === "failed"
+                        {chatJob.status === "failed" || chatJob.error
                           ? chatJob.error || "Cheya could not complete this response."
                           : chatJob.progress || "Cheya is preparing a reply…"}
                       </p>
@@ -1946,9 +1978,11 @@ export function App() {
                         }
                       />
                     </Suspense>
-                    <Suspense fallback={null}>
-                      <LinkPreviews content={visibleText} client={authClient} />
-                    </Suspense>
+                    {!animateAssistant && (
+                      <Suspense fallback={null}>
+                        <LinkPreviews content={visibleText} client={authClient} />
+                      </Suspense>
+                    )}
                   </div>
                   <div
                     aria-label="Assistant message actions"
@@ -2042,10 +2076,17 @@ export function App() {
                 ))}
               </div>
             )}
-            {isSending && (
-              <div role="status" aria-live="polite" className="w-full space-y-1 text-xs text-[#747780]">
+            {isSending &&
+              ((activeChatJob?.thinking_mode ?? isThinkMode) ||
+                activeChatJob?.progress.startsWith("Action:") ||
+                thinkingSteps.length > 0) && (
+              <div
+                role="status"
+                aria-live="polite"
+                className="w-full space-y-1.5 rounded-2xl border border-[#ece9f5] bg-[#faf9fd] px-3.5 py-3 text-xs text-[#747780]"
+              >
                 <p className="font-medium text-[#4b4e55]">
-                  {activeChatJob?.progress || "CheyaVerse sedang menyusun jawaban…"}
+                  {activeChatJob?.progress || thinkingSteps[0] || "Reviewing the request…"}
                 </p>
                 {(activeChatJob?.thinking_mode ?? isThinkMode) &&
                   thinkingSteps.map((step) => <p key={step}>{step}</p>)}
@@ -2080,10 +2121,10 @@ export function App() {
             aria-label="Scroll to latest message"
             title="Scroll to latest message"
             onClick={() => scrollConversationToLatest()}
-            className="absolute right-4 z-30 flex size-11 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] shadow-[0_3px_14px_rgba(20,24,32,0.16)] transition hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
+            className="absolute right-4 z-30 flex size-9 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] shadow-[0_3px_14px_rgba(20,24,32,0.16)] transition hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] sm:size-10"
             style={{ bottom: `${footerHeight + 16}px` }}
           >
-            <ArrowDown aria-hidden="true" className="size-5" />
+            <ArrowDown aria-hidden="true" className="size-4" />
           </button>
         )}
 

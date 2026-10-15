@@ -54,6 +54,8 @@ insights.
    SUPABASE_PUBLISHABLE_KEY=<publishable-or-anon-key>
    SUPABASE_SERVICE_ROLE_KEY=<supabase-service-role-secret>
    CRON_SECRET=<random-secret-at-least-32-characters>
+   APP_ACCESS_CODE=<six-digit-sign-in-code>
+   TURNSTILE_SECRET_KEY=<cloudflare-turnstile-secret-key>
    TINYFISH_API_KEY=<tinyfish-api-key>
    TAVILY_API_KEY=<tavily-search-api-key>
    BRAVE_SEARCH_API_KEY=<brave-search-api-key>
@@ -64,7 +66,14 @@ insights.
    a Supabase service-role/secret key or the Turnstile secret key in Vite, the browser, or Git.
    `SUPABASE_SERVICE_ROLE_KEY` is a server-only Vercel environment variable required by durable chat
    jobs and the database keepalive; add it to Development, Preview, and Production environments as
-   needed. `CRON_SECRET` is server-only and protects the scheduled keepalive endpoint. Generate it
+   needed. `APP_ACCESS_CODE` is a server-only, exactly six-digit code required before Google sign-in;
+   configure the same value in each Vercel environment where sign-in is enabled. The code endpoint
+   verifies Turnstile server-side and limits repeated failures per server instance. `TURNSTILE_SECRET_KEY`
+   is the Cloudflare secret key for that same Turnstile widget; it is needed because CAPTCHA tokens
+   are single-use, so the login page asks for a fresh human verification after the access code has
+   been accepted and before Google sign-in. Never use a `VITE_` prefix for either server-only value.
+   The code is an additional shared sign-in gate, not a replacement for Supabase authentication or
+   row-level security. `CRON_SECRET` is server-only and protects the scheduled keepalive endpoint. Generate it
    with `openssl rand -base64 32`; add the same value to Vercel and local `.env.local`. The unprefixed
    `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY` are server-side settings (the server can fall back
    to their `VITE_*` counterparts. `TINYFISH_API_KEY`, `TAVILY_API_KEY`, and
@@ -88,13 +97,14 @@ npm run dev
 
 Restart Vite after changing environment variables. Keep `.env.local` private and never commit it.
 If you do not use the Vercel CLI, create `.env.local` with the four `VITE_*` values, the server-side
-`SUPABASE_*` values, `CRON_SECRET`, and the optional provider keys above. Keep this file private;
+`SUPABASE_*` values, `CRON_SECRET`, `APP_ACCESS_CODE`, `TURNSTILE_SECRET_KEY`, and the optional
+provider keys above. Keep this file private;
 `.env.local` is ignored by Git.
 
 ### User setup and data
 
-Every user must sign in with Google after completing Cloudflare Turnstile verification. The app
-blocks chat and Gemini configuration until the account is signed in; chat also requires at least
+Every user must enter the operator's six-digit access code and sign in with Google after completing
+Cloudflare Turnstile verification. The app blocks chat and Gemini configuration until the account is signed in; chat also requires at least
 one Gemini API key. Users add their own Gemini key in **Settings → Configure**. The key is stored
 with their Supabase account and sent directly from their browser to Google's Gemini API.
 
@@ -124,9 +134,10 @@ reporting, and copying. Fenced code blocks show syntax colors, line numbers, and
 New assistant replies render with a fast typewriter effect. On opening the chat, the conversation
 automatically scrolls to its latest message. The **Think** toggle shows progress stages and an
 optional user-facing summary of the context used; it does not expose private internal reasoning.
-Edited user messages and regenerated replies keep their earlier versions. Version navigation
-restores the associated conversation branch—including its reply and later messages—and branch
-snapshots are stored in Supabase after new replies, edits, and regenerations. Run the latest
+Edited user messages and regenerated replies keep their earlier versions. Version navigation is
+available on both user messages and assistant replies and restores the associated full conversation
+branch, including later messages. Branch snapshots are refreshed as the conversation grows so an
+older version does not restore as a short, truncated chat. Run the latest
 `supabase/schema.sql` in the shared project's SQL Editor to enable this for an existing project.
 If an older version has no snapshot, the app saves a fallback branch using the currently active
 conversation and that selected version.
@@ -141,7 +152,8 @@ entire later conversation branch. The operation also removes related versions, i
 jobs, branch snapshots, and AI memories that were learned from a deleted message. Settings → Memory
 lets users create, edit, and delete durable personal memories; Cheya can also save a clearly durable
 user fact as a memory from chat. These memories are embedded and retrieved alongside RAG conversation
-context.
+context. The **Clear chats** control in Settings → Memory removes all chat messages and their
+cascading insights while preserving durable memories by detaching their optional source-message links.
 
 Cheya automatically searches when current or verifiable web information would help. Search uses
 TinyFish when configured, Google Search grounding, DuckDuckGo's public HTML results as a no-key

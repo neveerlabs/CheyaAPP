@@ -157,7 +157,7 @@ async function processChatJob(jobId: string) {
   }
 
   await updateJob(jobId, job.user_id, {
-    progress: "Analyzing your message and finding relevant context…",
+    progress: "Analyzing the complete message and retrieving relevant context…",
   });
   const history = (await loadRecentChatMessages(client, 20, job.user_id))
     .filter((item) => item.id !== userMessage.id)
@@ -199,7 +199,8 @@ async function processChatJob(jobId: string) {
       typedKeys,
       userMessage.content,
       0,
-      history.map(({ role, content }) => ({ role, content })),
+      history.map(({ role, content, created_at }) => ({ role, content, created_at })),
+      userMessage.created_at,
     );
     currentInsight = analysis.insight;
     memoryCandidate = analysis.memory;
@@ -216,7 +217,10 @@ async function processChatJob(jobId: string) {
   if (currentInsight?.summary.trim()) {
     try {
       await saveMessageInsight(client, userMessage.id, currentInsight, job.user_id);
-      insights = [...insights, currentInsight];
+      insights = [
+        ...insights,
+        { ...currentInsight, created_at: userMessage.created_at },
+      ];
     } catch (error) {
       warnings.push(
         `Message insight could not be saved: ${
@@ -268,7 +272,7 @@ async function processChatJob(jobId: string) {
 
   await updateJob(jobId, job.user_id, {
     progress: job.thinking_mode
-      ? "Thinking through your request and preparing a reply…"
+      ? "Reviewing the full message, its timing, and relevant personal context…"
       : "Preparing Cheya's reply…",
   });
   const result = await generateGeminiConversation(
@@ -279,11 +283,19 @@ async function processChatJob(jobId: string) {
     {
       thinkingMode: job.thinking_mode,
       allowSilence: true,
-      history: history.map(({ role, content }) => ({ role, content })),
+      currentMessageAt: userMessage.created_at,
+      history: history.map(({ role, content, created_at }) => ({ role, content, created_at })),
       relevantMessages,
       memories,
       insights: insights.slice(-12),
       feedback,
+      onToolActivity: async (toolName) => {
+        const activity =
+          toolName === "search_web"
+            ? "Action: Searching the web and inspecting sources…"
+            : `Action: Using chat tool "${toolName}"…`;
+        await updateJob(jobId, job.user_id, { progress: activity });
+      },
       executeTool: (name, input, key) => {
         if (name === "search_web") {
           const query =
@@ -308,6 +320,7 @@ async function processChatJob(jobId: string) {
     },
   );
   attempts.push(...result.attempts);
+  warnings.push(...result.toolErrors.map((detail) => `A tool reported an error: ${detail}`));
 
   if (result.silent) {
     for (const attempt of attempts) {
@@ -356,7 +369,12 @@ async function processChatJob(jobId: string) {
         userMessage.content,
         result.text,
         {
-          history: history.map(({ role, content }) => ({ role, content })),
+          currentMessageAt: userMessage.created_at,
+          history: history.map(({ role, content, created_at }) => ({
+            role,
+            content,
+            created_at,
+          })),
           relevantMessages,
           memories,
           insights,
@@ -417,16 +435,14 @@ async function processChatJob(jobId: string) {
     }
   }
 
-  for (const anchor of [userMessage, savedResponse]) {
-    try {
-      await saveChatBranch(client, anchor.id, anchor.version_number, job.user_id);
-    } catch (error) {
-      warnings.push(
-        `The response was saved, but conversation history could not be snapshotted: ${
-          error instanceof Error ? error.message : "Unknown database error."
-        }`,
-      );
-    }
+  try {
+    await saveChatBranch(client, savedResponse.id, savedResponse.version_number, job.user_id);
+  } catch (error) {
+    warnings.push(
+      `The response was saved, but conversation history could not be snapshotted: ${
+        error instanceof Error ? error.message : "Unknown database error."
+      }`,
+    );
   }
 
   if (warnings.length > 0) {
@@ -434,6 +450,7 @@ async function processChatJob(jobId: string) {
       .from("chat_message_jobs")
       .update({
         progress: warnings.join("\n").slice(0, 2000),
+        error: warnings.join("\n").slice(0, 2000),
         updated_at: new Date().toISOString(),
       })
       .eq("id", jobId)

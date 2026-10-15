@@ -160,7 +160,7 @@ const markdownComponents = {
       href={href}
       target="_blank"
       rel="noreferrer"
-      className="text-[#278fca] underline underline-offset-2"
+      className="break-all text-[#278fca] underline underline-offset-2"
     >
       {children}
     </a>
@@ -285,8 +285,8 @@ export function AssistantMarkdown({
     <div
       className={
         userMessage
-          ? "text-white [&_p:first-child]:mt-0 [&_p]:my-0 [&_p]:leading-[1.35] [&_ul]:my-1 [&_ol]:my-1 [&_h1]:text-white [&_h2]:text-white [&_h3]:text-white [&_blockquote]:border-white/40 [&_blockquote]:text-white/80"
-          : "[&_p:first-child]:mt-0"
+          ? "min-w-0 text-white [&_p:first-child]:mt-0 [&_p]:my-0 [&_p]:leading-[1.35] [&_ul]:my-1 [&_ol]:my-1 [&_h1]:text-white [&_h2]:text-white [&_h3]:text-white [&_blockquote]:border-white/40 [&_blockquote]:text-white/80"
+          : "min-w-0 [&_p:first-child]:mt-0"
       }
     >
       <ReactMarkdown remarkPlugins={[remarkGfm, remarkUnderline]} components={markdownComponents}>

@@ -72,21 +72,48 @@ export interface GeminiReply {
   keyId: string;
   keyIndex: number;
   attempts: GeminiAttempt[];
+  toolErrors: string[];
 }
 
 type ConversationInsight = Omit<MessageInsight, "id" | "user_id" | "message_id" | "created_at">;
-type ContextMessage = Pick<StoredChatMessage, "role" | "content">;
+type ContextMessage = Pick<StoredChatMessage, "role" | "content"> &
+  Partial<Pick<StoredChatMessage, "created_at">>;
 type ContextMemory = Pick<UserMemory, "category" | "content">;
 type ToolExecutor = (name: string, input: unknown, key: GeminiApiKey) => Promise<unknown>;
+
+const conversationTimeFormatter = new Intl.DateTimeFormat("id-ID", {
+  weekday: "long",
+  day: "numeric",
+  month: "long",
+  year: "numeric",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+  timeZone: "Asia/Jakarta",
+});
+
+function formatConversationTime(timestamp?: string): string {
+  if (!timestamp) return "waktu tidak tersedia";
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return "waktu tidak tersedia";
+  const parts = Object.fromEntries(
+    conversationTimeFormatter.formatToParts(date).map(({ type, value }) => [type, value]),
+  );
+  return `${parts.weekday}, ${parts.day} ${parts.month} ${parts.year} | ${parts.hour}:${parts.minute}`;
+}
 
 export interface GeminiConversationContext {
   allowSilence?: boolean;
   thinkingMode?: boolean;
+  currentMessageAt?: string;
   history: ContextMessage[];
-  relevantMessages: Array<Pick<StoredChatMessage, "role" | "content">>;
+  relevantMessages: Array<
+    Pick<StoredChatMessage, "role" | "content"> & Partial<Pick<StoredChatMessage, "created_at">>
+  >;
   memories: ContextMemory[];
   insights: Array<
-    Pick<MessageInsight, "mood" | "communication_style" | "situation" | "topics" | "support_needs" | "summary">
+    Pick<MessageInsight, "mood" | "communication_style" | "situation" | "topics" | "support_needs" | "summary"> &
+      Partial<Pick<MessageInsight, "created_at">>
   >;
   feedback?: Array<{
     rating: "like" | "dislike" | "report";
@@ -100,6 +127,7 @@ export interface GeminiConversationContext {
     reports: string[];
   };
   executeTool: ToolExecutor;
+  onToolActivity?: (toolName: string) => Promise<void>;
 }
 
 const emptyPersonalization: PersonalizationSettings = {
@@ -328,7 +356,7 @@ export async function generateGeminiReply(
         throw new Error("Gemini returned no text. The request may have been blocked or filtered.");
       }
       attempts.push({ keyId: key.id, status: "active", error: null });
-      return { text, silent: false, keyId: key.id, keyIndex, attempts };
+      return { text, silent: false, keyId: key.id, keyIndex, attempts, toolErrors: [] };
     } catch (error) {
       attempts.push({ keyId: key.id, status: "error", error: errorMessage(error) });
     }
@@ -347,6 +375,7 @@ export async function analyzeGeminiMessage(
   message: string,
   startingIndex: number,
   recentContext: ContextMessage[] = [],
+  currentMessageAt?: string,
 ): Promise<{
   insight: ConversationInsight;
   memory: { category: string; content: string } | null;
@@ -358,6 +387,8 @@ export async function analyzeGeminiMessage(
   const analysisPrompt = [
     "Analyze the latest user message for a private conversation journal, using the preceding conversation only to understand its context.",
     "Focus on what happened, the user's expressed mood, important topics, and any meaningful support need. Do not infer beyond the evidence.",
+    "Read the complete latest message, including its ending and all details. For long messages, carefully account for every distinct event, question, correction, and emotional shift rather than summarizing from the opening alone.",
+    "Use the timestamp of each message to understand when it happened and how much time passed. Do not assume a new message continues an old situation when there has been a long gap.",
     "Be tentative and non-clinical; do not diagnose, infer sensitive traits, or state uncertain assumptions as facts.",
     "Return a concise JSON object with insight fields and one optional durable memory:",
     '{"mood":"...","communication_style":"...","situation":"...","topics":["..."],"support_needs":"...","summary":"...","memory":null}',
@@ -368,9 +399,11 @@ export async function analyzeGeminiMessage(
     `Recent conversation context:\n${JSON.stringify(
       recentContext.slice(-8).map((item) => ({
         role: item.role,
+        time: formatConversationTime(item.created_at),
         content: item.content.slice(0, 1500),
       })),
     )}`,
+    `Current message time: ${formatConversationTime(currentMessageAt)}`,
     "User message:",
     message,
   ].join("\n");
@@ -459,7 +492,13 @@ export async function generateThinkingSummary(
   response: string,
   context: Pick<
     GeminiConversationContext,
-    "history" | "relevantMessages" | "memories" | "insights" | "feedback" | "replacedResponse"
+    | "history"
+    | "relevantMessages"
+    | "memories"
+    | "insights"
+    | "feedback"
+    | "replacedResponse"
+    | "currentMessageAt"
   >,
   startingIndex: number,
 ): Promise<{ summary: string; keyIndex: number; attempts: GeminiAttempt[] }> {
@@ -471,10 +510,20 @@ export async function generateThinkingSummary(
     "Do not reveal hidden chain-of-thought, private internal reasoning, or step-by-step deliberation.",
     "Use 1-3 short sentences, grounded only in the supplied user request, visible conversation, saved context, feedback, and answer. If context did not materially affect the answer, say so plainly.",
     `User request:\n${userMessage.slice(0, 3000)}`,
-    `Relevant conversation:\n${JSON.stringify(context.history.slice(-6).map((item) => item.content.slice(0, 700)))}`,
-    `Relevant retrieved messages:\n${JSON.stringify(context.relevantMessages.slice(-4).map((item) => item.content.slice(0, 700)))}`,
+    `Current message time: ${formatConversationTime(context.currentMessageAt)}`,
+    `Relevant conversation:\n${JSON.stringify(context.history.slice(-6).map((item) => ({
+      time: formatConversationTime(item.created_at),
+      content: item.content.slice(0, 700),
+    })))}`,
+    `Relevant retrieved messages:\n${JSON.stringify(context.relevantMessages.slice(-4).map((item) => ({
+      time: formatConversationTime(item.created_at),
+      content: item.content.slice(0, 700),
+    })))}`,
     `Relevant memories:\n${JSON.stringify(context.memories.slice(-4).map((item) => item.content.slice(0, 500)))}`,
-    `Recent insights:\n${JSON.stringify(context.insights.slice(-4).map((item) => item.summary.slice(0, 300)))}`,
+    `Recent insights:\n${JSON.stringify(context.insights.slice(-4).map((item) => ({
+      time: formatConversationTime(item.created_at),
+      summary: item.summary.slice(0, 300),
+    })))}`,
     `Recent response ratings:\n${JSON.stringify(
       (context.feedback ?? [])
         .filter((item) => item.rating !== "report")
@@ -692,6 +741,8 @@ export async function generateGeminiConversation(
     "Use GitHub-Flavored Markdown tables for structured comparisons. Include a header row and delimiter row, for example: | Key | Title | followed by |--|--| and then data rows. Keep each row's number of cells consistent; do not put multiline paragraphs inside cells.",
     "Use Markdown headings, lists, blockquotes, links, and emphasis when they improve clarity. Use fenced code blocks with a language label for code, and never use HTML as a substitute for Markdown. Keep table cells concise and escape literal pipe characters inside cells.",
     "User messages may also include Markdown. Interpret their formatting normally while preserving the meaning of their text and symbols.",
+    "Read the user's entire latest message before responding. For long messages, account for all topics, details, questions, corrections, and emotional cues through the final sentence; do not answer only the opening or replace the message with a generic summary.",
+    "All message timestamps use Indonesian local time in the format weekday, day month year | hour:minute. Use them to understand when events and messages occurred, notice long pauses, and avoid treating a fresh topic as an uninterrupted continuation. Do not invent times.",
     "When asked to think deeply, carefully assess the user's goal, relevant context, and feedback before answering. Never expose private chain-of-thought; if requested, provide only a concise, user-facing summary of the key considerations.",
     context.thinkingMode
       ? "Thinking mode is on: spend additional internal effort checking the request, relevant context, and whether the response directly meets the user's needs. Show only the final answer and a concise user-facing rationale if requested."
@@ -709,9 +760,11 @@ export async function generateGeminiConversation(
     `Relevant past messages:\n${JSON.stringify(
       context.relevantMessages.slice(-8).map((item) => ({
         role: item.role,
+        time: formatConversationTime(item.created_at),
         content: item.content.slice(0, 1800),
       })),
     )}`,
+    `Current user message time: ${formatConversationTime(context.currentMessageAt)}`,
     `Saved memories:\n${JSON.stringify(
       context.memories.slice(-8).map((item) => ({
         category: item.category,
@@ -726,6 +779,7 @@ export async function generateGeminiConversation(
         topics: item.topics.slice(0, 8),
         support_needs: item.support_needs.slice(0, 300),
         summary: item.summary.slice(0, 500),
+        time: formatConversationTime(item.created_at),
       })),
     )}`,
     `Recent response ratings:\n${JSON.stringify(
@@ -761,13 +815,21 @@ export async function generateGeminiConversation(
   const contents: GeminiContent[] = [
     ...context.history.slice(-12).map((item) => ({
       role: item.role === "assistant" ? "model" as const : "user" as const,
-      parts: [{ text: item.content.slice(0, 3000) }],
+      parts: [{
+        text: `[Message time: ${formatConversationTime(item.created_at)}]\n${item.content.slice(0, 5000)}`,
+      }],
     })),
-    { role: "user", parts: [{ text: prompt }] },
+    {
+      role: "user",
+      parts: [{
+        text: `[Message time: ${formatConversationTime(context.currentMessageAt)}]\n${prompt}`,
+      }],
+    },
   ];
   const attempts: GeminiAttempt[] = [];
   const attemptedKeyIds = new Set<string>();
   const failedKeyIds = new Set<string>();
+  const toolErrors: string[] = [];
   let activeIndex = ((startingIndex % keys.length) + keys.length) % keys.length;
   let completedTools = 0;
   let completedWebSearch = false;
@@ -824,6 +886,7 @@ export async function generateGeminiConversation(
         keyId: currentKey.id,
         keyIndex: activeIndex,
         attempts,
+        toolErrors,
       };
     }
 
@@ -836,6 +899,7 @@ export async function generateGeminiConversation(
           keyId: currentKey.id,
           keyIndex: activeIndex,
           attempts,
+          toolErrors,
         };
       }
       contents.push(candidate);
@@ -870,7 +934,18 @@ export async function generateGeminiConversation(
           }
           completedWebSearch = true;
         }
+        await context.onToolActivity?.(call.name);
         const result = await context.executeTool(call.name, call.args ?? {}, currentKey);
+        if (
+          typeof result === "object" &&
+          result !== null &&
+          "diagnostics" in result &&
+          Array.isArray(result.diagnostics)
+        ) {
+          for (const diagnostic of result.diagnostics) {
+            if (typeof diagnostic === "string") toolErrors.push(diagnostic);
+          }
+        }
         functionResponses.push({
           functionResponse: {
             name: call.name,
@@ -878,6 +953,8 @@ export async function generateGeminiConversation(
           },
         });
       } catch (error) {
+        const detail = `${call.name}: ${errorMessage(error)}`;
+        toolErrors.push(detail);
         functionResponses.push({
           functionResponse: {
             name: call.name,

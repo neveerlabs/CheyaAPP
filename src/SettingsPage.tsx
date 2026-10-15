@@ -125,6 +125,7 @@ export function SettingsPage({
   const [editingMemoryId, setEditingMemoryId] = useState<string | null>(null);
   const [isLoadingMemories, setIsLoadingMemories] = useState(false);
   const [isSavingMemory, setIsSavingMemory] = useState(false);
+  const [isClearingChats, setIsClearingChats] = useState(false);
   const settingsContentRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -594,6 +595,52 @@ export function SettingsPage({
       setNotice("Long-term memory deleted.");
     } catch (error) {
       setErrorMessage(`Could not delete this memory: ${getErrorMessage(error)}`);
+    }
+  }
+
+  async function clearChats() {
+    if (
+      isClearingChats ||
+      !window.confirm(
+        "Delete all chat messages and their conversation insights?\n\nLong-term memories, API keys, and settings will be kept. This cannot be undone.",
+      )
+    ) {
+      return;
+    }
+    clearMessages();
+    setIsClearingChats(true);
+    let memoryReferencesDetached = false;
+    try {
+      const { data, error } = await client.auth.getUser();
+      if (error) throw error;
+      if (!data.user) throw new Error("Sign in before clearing chat history.");
+
+      const { error: memoryError } = await client
+        .from("user_memories")
+        .update({ source_message_id: null })
+        .eq("user_id", data.user.id)
+        .not("source_message_id", "is", null);
+      if (memoryError) throw memoryError;
+      memoryReferencesDetached = true;
+
+      const { data: deletedMessages, error: deleteError } = await client
+        .from("chat_messages")
+        .delete()
+        .eq("user_id", data.user.id)
+        .select("id");
+      if (deleteError) throw deleteError;
+      setNotice(
+        `Deleted ${deletedMessages.length} chat message${deletedMessages.length === 1 ? "" : "s"} and their insights. Long-term memories were preserved.`,
+      );
+    } catch (error) {
+      const detail = getErrorMessage(error);
+      setErrorMessage(
+        memoryReferencesDetached
+          ? `Could not delete chat history after protecting long-term memories. Those memories are safe; retry clearing chats. ${detail}`
+          : `Could not clear chat history: ${detail}`,
+      );
+    } finally {
+      setIsClearingChats(false);
     }
   }
 
@@ -1165,6 +1212,27 @@ export function SettingsPage({
                     </article>
                   ))
                 )}
+              </div>
+
+              <div className="mt-6 border-t border-[#eceef0] pt-5">
+                <h3 className="text-sm font-semibold text-[#34363b]">Chat history</h3>
+                <p className="mt-1 text-sm leading-5 text-[#777a81]">
+                  Clear all chat messages and their insights without removing long-term memories,
+                  API keys, or settings.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => void clearChats()}
+                  disabled={isClearingChats || !isDatabaseReady}
+                  className="mt-3 flex h-10 items-center justify-center gap-2 rounded-full border border-red-200 px-4 text-sm font-medium text-red-700 transition hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {isClearingChats ? (
+                    <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                  ) : (
+                    <Trash2 aria-hidden="true" className="size-4" />
+                  )}
+                  {isClearingChats ? "Clearing chats…" : "Clear chats"}
+                </button>
               </div>
             </section>
           )}

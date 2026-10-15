@@ -15,6 +15,7 @@ export interface WebSearchResult {
   refinementPasses: number;
   sources: WebSearchSource[];
   findings: string[];
+  diagnostics: string[];
 }
 
 type SearchResponse = {
@@ -314,7 +315,12 @@ async function googleGroundedSearch(
 async function searchAlternativeProviders(
   query: string,
   keys: GeminiApiKey[],
-): Promise<{ providers: string[]; sources: WebSearchSource[]; findings: string[] }> {
+): Promise<{
+  providers: string[];
+  sources: WebSearchSource[];
+  findings: string[];
+  diagnostics: string[];
+}> {
   const providers: Array<{ name: string; search: (query: string) => Promise<SearchResponse> }> = [
     ...(getServerEnvironmentVariable("TINYFISH_API_KEY")
       ? [{ name: "TinyFish", search: tinyFishSearch }]
@@ -373,7 +379,12 @@ async function searchAlternativeProviders(
         refinedQuery = await retryProvider("Gemini query refinement", () =>
           refineGeminiWebQuery(keys, query, refinedQuery, findings),
         );
-      } catch {
+      } catch (error) {
+        providerErrors.push(
+          `Gemini query refinement after pass ${pass}: ${
+            error instanceof Error ? error.message : "Unknown refinement error."
+          }`,
+        );
         refinedQuery = `${query} ${fallbackModifiers[pass - 1]}`.slice(0, 1200);
       }
     }
@@ -389,6 +400,7 @@ async function searchAlternativeProviders(
     providers: [...usedProviders],
     sources: unique,
     findings,
+    diagnostics: providerErrors.slice(-15),
   };
 }
 
@@ -409,6 +421,7 @@ export async function searchWebWithFallback(
       refinementPasses: 5,
       sources: result.sources.slice(0, 15),
       findings: result.findings.slice(0, 15),
+      diagnostics: result.diagnostics,
     };
   } catch (error) {
     errors.push(

@@ -13,11 +13,28 @@ interface PagePreview {
 
 function extractUrls(content: string): string[] {
   const urls = new Set<string>();
-  for (const match of content.matchAll(/https?:\/\/[^\s<>"']+/gi)) {
-    const candidate = match[0].replace(/[),.;!?]+$/, "");
+  const visibleMarkdown = content
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/~~~[\s\S]*?~~~/g, " ")
+    .replace(/`[^`\n]*`/g, " ");
+  for (const match of visibleMarkdown.matchAll(/https?:\/\/[^\s<>"']+/gi)) {
+    let candidate = match[0].replace(/[.,;!?]+$/, "");
+    while (candidate.endsWith(")")) {
+      const openCount = (candidate.match(/\(/g) ?? []).length;
+      const closeCount = (candidate.match(/\)/g) ?? []).length;
+      if (closeCount <= openCount) break;
+      candidate = candidate.slice(0, -1);
+    }
     try {
       const url = new URL(candidate);
-      if (!url.hostname.includes(".") || url.username || url.password) continue;
+      if (
+        !["http:", "https:"].includes(url.protocol) ||
+        !url.hostname.includes(".") ||
+        url.username ||
+        url.password
+      ) {
+        continue;
+      }
       urls.add(url.href);
     } catch {
       continue;
@@ -99,7 +116,7 @@ function LinkPreview({
   if (loading) {
     return (
       <div
-        className={`mt-2 flex items-center gap-2 rounded-xl border px-3 py-2 text-xs ${
+        className={`flex w-full min-w-0 items-center gap-2 overflow-hidden rounded-xl border px-3 py-2 text-xs ${
           userMessage
             ? "border-white/15 bg-white/5 text-white/70"
             : "border-[#e5e6e9] bg-[#f7f8fa] text-[#747780]"
@@ -116,14 +133,14 @@ function LinkPreview({
         href={url}
         target="_blank"
         rel="noreferrer"
-        className={`mt-2 flex items-center gap-2 rounded-xl border px-3 py-2 text-xs ${
+        className={`flex w-full min-w-0 items-center gap-2 overflow-hidden rounded-xl border px-3 py-2 text-xs ${
           userMessage
             ? "border-white/15 bg-white/5 text-white/80"
             : "border-[#e5e6e9] bg-[#f7f8fa] text-[#555861]"
         }`}
       >
         <Link2 aria-hidden="true" className="size-4 shrink-0" />
-        <span className="min-w-0 flex-1 truncate">{error || url}</span>
+        <span className="min-w-0 flex-1 break-all line-clamp-2">{url}</span>
         <ExternalLink aria-hidden="true" className="size-3.5 shrink-0" />
       </a>
     );
@@ -133,7 +150,7 @@ function LinkPreview({
     preview.videoUrl && /\.(mp4|webm|ogv)(?:$|[?#])/i.test(preview.videoUrl);
   return (
     <div
-      className={`mt-2 block max-w-full overflow-hidden rounded-xl border text-left ${
+      className={`w-full min-w-0 max-w-full overflow-hidden rounded-xl border text-left ${
         userMessage
           ? "border-white/20 bg-black/10 text-white"
           : "border-[#e5e6e9] bg-[#f7f8fa] text-[#282a30]"
@@ -145,7 +162,7 @@ function LinkPreview({
           poster={preview.imageUrl ?? undefined}
           controls
           preload="metadata"
-          className="max-h-48 w-full bg-black object-contain"
+          className="block max-h-48 w-full bg-black object-contain"
         />
       ) : preview.imageUrl ? (
         <img
@@ -153,7 +170,7 @@ function LinkPreview({
           alt=""
           loading="lazy"
           referrerPolicy="no-referrer"
-          className="max-h-48 w-full bg-black/10 object-cover"
+          className="block max-h-48 w-full bg-black/10 object-cover"
         />
       ) : null}
       <div className="p-2.5">
@@ -164,9 +181,19 @@ function LinkPreview({
           href={preview.url}
           target="_blank"
           rel="noreferrer"
-          className="mt-0.5 block line-clamp-2 text-xs font-semibold leading-4 underline underline-offset-2"
+          className="mt-0.5 block break-words line-clamp-2 text-xs font-semibold leading-4 underline underline-offset-2"
         >
           {preview.title}
+        </a>
+        <a
+          href={preview.url}
+          target="_blank"
+          rel="noreferrer"
+          className={`mt-1 block break-all line-clamp-2 text-[10px] leading-4 underline underline-offset-2 ${
+            userMessage ? "text-white/60" : "text-[#858890]"
+          }`}
+        >
+          {preview.url}
         </a>
         {preview.description && (
           <p className={`mt-1 line-clamp-2 text-[11px] leading-4 ${userMessage ? "text-white/75" : "text-[#62656d]"}`}>
@@ -190,7 +217,10 @@ export function LinkPreviews({
   const urls = extractUrls(content);
   if (!client || urls.length === 0) return null;
   return (
-    <div className="max-w-full">
+    <div
+      aria-label="Link previews"
+      className="mt-2 grid w-full min-w-0 max-w-full grid-cols-1 gap-2 overflow-hidden"
+    >
       {urls.map((url) => (
         <LinkPreview key={url} url={url} client={client} userMessage={userMessage} />
       ))}
