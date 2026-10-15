@@ -437,12 +437,16 @@ export function App() {
   useEffect(() => {
     const footer = footerRef.current;
     if (!footer) return;
-    const updateHeight = () => setFooterHeight(footer.offsetHeight);
+    const updateHeight = () => setFooterHeight(footer.getBoundingClientRect().height);
     updateHeight();
     const observer = new ResizeObserver(updateHeight);
     observer.observe(footer);
     return () => observer.disconnect();
-  }, [attachedMedia.length, hasMessage, viewport.height]);
+  }, []);
+
+  useEffect(() => {
+    if (followLatestRef.current) scrollConversationToLatest("auto");
+  }, [footerHeight]);
 
   useEffect(() => {
     let isMounted = true;
@@ -1781,7 +1785,7 @@ export function App() {
           aria-live="polite"
           onScroll={handleConversationScroll}
           className="absolute inset-0 overflow-y-auto overscroll-contain px-4 pt-[72px] sm:px-6"
-          style={{ paddingBottom: `${footerHeight + 12}px` }}
+          style={{ paddingBottom: `${footerHeight + 24}px` }}
         >
           <div className="space-y-3">
             {messages.map((chatMessage) => {
@@ -2135,7 +2139,7 @@ export function App() {
             {attachedMedia.length > 0 && (
               <div
                 aria-label="Files ready to upload"
-                className="grid max-w-full grid-flow-col auto-cols-[76px] gap-2 overflow-x-auto overflow-y-hidden overscroll-x-contain px-2 pb-1 pt-2 sm:auto-cols-[84px]"
+                className="grid max-w-full grid-flow-col auto-cols-[64px] gap-1.5 overflow-x-auto overflow-y-hidden overscroll-x-contain px-2 pb-1 pt-2 sm:auto-cols-[80px] sm:gap-2"
               >
                 {attachedMedia.map((file, index) => {
                   const isPreviewable =
