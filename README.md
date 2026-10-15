@@ -54,6 +54,7 @@ insights.
    SUPABASE_PUBLISHABLE_KEY=<publishable-or-anon-key>
    SUPABASE_SERVICE_ROLE_KEY=<supabase-service-role-secret>
    CRON_SECRET=<random-secret-at-least-32-characters>
+   TINYFISH_API_KEY=<tinyfish-api-key>
    TAVILY_API_KEY=<tavily-search-api-key>
    BRAVE_SEARCH_API_KEY=<brave-search-api-key>
    ```
@@ -66,9 +67,12 @@ insights.
    needed. `CRON_SECRET` is server-only and protects the scheduled keepalive endpoint. Generate it
    with `openssl rand -base64 32`; add the same value to Vercel and local `.env.local`. The unprefixed
    `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY` are server-side settings (the server can fall back
-   to their `VITE_*` counterparts. `TAVILY_API_KEY` and `BRAVE_SEARCH_API_KEY` are server-only search
-   provider keys. Configure both in Vercel to enable independent provider failover; get them from
-   the Tavily and Brave Search developer dashboards. Never use a `VITE_` prefix for these keys.
+   to their `VITE_*` counterparts. `TINYFISH_API_KEY`, `TAVILY_API_KEY`, and
+   `BRAVE_SEARCH_API_KEY` are server-only search provider keys. Get the TinyFish key from its API
+   keys dashboard; never expose it with a `VITE_` prefix. DuckDuckGo requires no key and is used as
+   a best-effort HTML search fallback; it may rate-limit automated requests. TinyFish is preferred
+   when configured, then Google Search grounding, DuckDuckGo, and any configured Tavily/Brave
+   providers are tried across refined search passes.
 
 ### Local development
 
@@ -139,14 +143,13 @@ lets users create, edit, and delete durable personal memories; Cheya can also sa
 user fact as a memory from chat. These memories are embedded and retrieved alongside RAG conversation
 context.
 
-Cheya can automatically use Google Search grounding for requests that need current or verifiable
-web information. If grounding is unavailable or fails, the server retries and falls back to Tavily
-and then Brave Search, with query refinement across five passes and at least three distinct source
-URLs required. Configure both optional provider keys in Vercel for independent failover. Search
-results include source URLs and page text; Tavily returns extracted page content, while Brave
-results are supplemented by safely fetched public pages. Google Search grounding availability and
-billing depend on the model and Gemini API account; five refinement passes may consume multiple
-search requests, so account for applicable provider charges.
+Cheya automatically searches when current or verifiable web information would help. Search uses
+TinyFish when configured, Google Search grounding, DuckDuckGo's public HTML results as a no-key
+fallback, and optional Tavily/Brave providers across refined query passes. Results are inspected
+through the safe public-page fetcher where possible, and the search requires at least three distinct
+source URLs. DuckDuckGo's Instant Answer API is not a general web-results API; the HTML fallback can
+be rate-limited, so configure `TINYFISH_API_KEY` in Vercel for a structured search API. Search may
+make multiple provider requests; account for applicable provider quotas and charges.
 
 Messages containing up to two public HTTPS links can show a preview with page title, description,
 site name, and available image/video metadata. Preview loading is authenticated, rejects local or

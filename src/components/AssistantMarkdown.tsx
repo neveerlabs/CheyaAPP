@@ -285,7 +285,7 @@ export function AssistantMarkdown({
     <div
       className={
         userMessage
-          ? "text-white [&_p:first-child]:mt-0 [&_h1]:text-white [&_h2]:text-white [&_h3]:text-white [&_blockquote]:border-white/40 [&_blockquote]:text-white/80"
+          ? "text-white [&_p:first-child]:mt-0 [&_p]:my-0 [&_p]:leading-[1.35] [&_ul]:my-1 [&_ol]:my-1 [&_h1]:text-white [&_h2]:text-white [&_h3]:text-white [&_blockquote]:border-white/40 [&_blockquote]:text-white/80"
           : "[&_p:first-child]:mt-0"
       }
     >

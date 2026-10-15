@@ -1778,7 +1778,7 @@ export function App() {
                 typingAssistant.content === visibleText;
               const ratingKey = `${chatMessage.id}:${versionNumber}`;
               const chatJob = chatJobsByMessageId.get(chatMessage.id);
-              const versionControls = versions.length > 1 ? (
+              const versionControls = chatMessage.role === "user" && versions.length > 1 ? (
                 <div className="flex items-center gap-0.5 text-[11px] text-[#777a82]">
                   <button
                     type="button"
@@ -1823,7 +1823,7 @@ export function App() {
                         setActiveUserActions(chatMessage.id);
                       }}
                       onDragStart={(event) => event.preventDefault()}
-                      className="max-w-[88%] select-none rounded-[18px] rounded-br-md bg-[#28292e] px-3 py-2 text-[13px] leading-5 text-white [webkit-touch-callout:none] sm:max-w-[82%]"
+                      className="max-w-[94%] select-none rounded-[18px] rounded-br-md bg-[#28292e] px-3.5 py-1.5 text-[13px] leading-[1.35] text-white [webkit-touch-callout:none] sm:max-w-[88%]"
                       style={{ WebkitTouchCallout: "none" }}
                     >
                       <Suspense fallback={<p className="m-0 whitespace-pre-wrap">{visibleText}</p>}>

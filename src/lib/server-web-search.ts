@@ -42,6 +42,74 @@ function uniqueSources(sources: WebSearchSource[]): WebSearchSource[] {
   return [...unique.values()];
 }
 
+function decodeHtml(value: string): string {
+  return value
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&#(\d+);/g, (entity, code: string) => {
+      const point = Number(code);
+      return point <= 0x10ffff ? String.fromCodePoint(point) : entity;
+    })
+    .replace(/&#x([\da-f]+);/gi, (entity, code: string) => {
+      const point = Number.parseInt(code, 16);
+      return point <= 0x10ffff ? String.fromCodePoint(point) : entity;
+    });
+}
+
+function stripHtml(value: string): string {
+  return decodeHtml(
+    value
+      .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim(),
+  );
+}
+
+function attributeValue(tag: string, name: string): string {
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = tag.match(new RegExp(`\\b${escapedName}\\s*=\\s*(["'])(.*?)\\1`, "i"));
+  return match ? decodeHtml(match[2]) : "";
+}
+
+function duckDuckGoResultUrl(value: string): string | null {
+  try {
+    const url = new URL(value, "https://html.duckduckgo.com");
+    const destination = url.searchParams.get("uddg");
+    const resultUrl = destination ? new URL(destination) : url;
+    if (resultUrl.hostname === "duckduckgo.com" || resultUrl.hostname.endsWith(".duckduckgo.com")) {
+      return null;
+    }
+    if (resultUrl.protocol !== "http:" && resultUrl.protocol !== "https:") return null;
+    return resultUrl.href;
+  } catch {
+    return null;
+  }
+}
+
+async function inspectSearchSources(sources: WebSearchSource[]): Promise<WebSearchSource[]> {
+  const inspected = await Promise.allSettled(
+    sources.slice(0, 5).map(async (source) => {
+      const page = await getPageMetadata(source.url);
+      return {
+        ...source,
+        title: page.title || source.title,
+        excerpt: page.content || page.description || source.excerpt,
+      };
+    }),
+  );
+  const inspectedByUrl = new Map(
+    inspected.flatMap((result) =>
+      result.status === "fulfilled" ? [[result.value.url, result.value] as const] : [],
+    ),
+  );
+  return uniqueSources(sources.map((source) => inspectedByUrl.get(source.url) ?? source));
+}
+
 async function retryProvider<T>(label: string, operation: () => Promise<T>): Promise<T> {
   let lastError: unknown;
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -61,6 +129,75 @@ async function retryProvider<T>(label: string, operation: () => Promise<T>): Pro
       lastError instanceof Error ? lastError.message : "Unknown provider error."
     }`,
   );
+}
+
+async function tinyFishSearch(query: string): Promise<SearchResponse> {
+  const apiKey = getServerEnvironmentVariable("TINYFISH_API_KEY");
+  if (!apiKey) throw new Error("TinyFish is not configured.");
+  return retryProvider("TinyFish", async () => {
+    const url = new URL("https://api.search.tinyfish.ai");
+    url.searchParams.set("query", query);
+    url.searchParams.set("location", "ID");
+    const response = await fetch(url, {
+      headers: { Accept: "application/json", "X-API-Key": apiKey },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!response.ok) throw new Error(`TinyFish returned HTTP ${response.status}.`);
+    const payload: unknown = await response.json();
+    if (!isObject(payload) || !Array.isArray(payload.results)) {
+      throw new Error("TinyFish returned an invalid search response.");
+    }
+    const results: WebSearchSource[] = payload.results.flatMap((result) => {
+      if (!isObject(result) || typeof result.url !== "string") return [];
+      return [{
+        title: typeof result.title === "string" ? result.title : result.url,
+        url: result.url,
+        excerpt: typeof result.snippet === "string" ? result.snippet : "",
+      }];
+    });
+    const sources = await inspectSearchSources(uniqueSources(results));
+    return {
+      sources,
+      findings: sources.map((source) => `${source.title}: ${source.excerpt}`).filter(Boolean),
+    };
+  });
+}
+
+async function duckDuckGoSearch(query: string): Promise<SearchResponse> {
+  return retryProvider("DuckDuckGo", async () => {
+    const url = new URL("https://html.duckduckgo.com/html/");
+    url.searchParams.set("q", query);
+    const response = await fetch(url, {
+      headers: {
+        Accept: "text/html",
+        "User-Agent": "Mozilla/5.0 (compatible; CheyaVerseSearch/1.0)",
+      },
+      signal: AbortSignal.timeout(12000),
+    });
+    if (!response.ok) throw new Error(`DuckDuckGo returned HTTP ${response.status}.`);
+    const html = (await response.text()).slice(0, 1_500_000);
+    const resultBlocks = html.match(/<div\b[^>]*class=["'][^"']*\bresult\b[^"']*["'][^>]*>[\s\S]*?(?=<div\b[^>]*class=["'][^"']*\bresult\b|$)/gi) ?? [];
+    const sources = resultBlocks.flatMap((block) => {
+      const titleTag = block.match(/<a\b[^>]*class=["'][^"']*\bresult__a\b[^"']*["'][^>]*>[\s\S]*?<\/a>/i)?.[0];
+      if (!titleTag) return [];
+      const rawUrl = attributeValue(titleTag, "href");
+      const resultUrl = duckDuckGoResultUrl(rawUrl);
+      if (!resultUrl) return [];
+      const title = stripHtml(titleTag);
+      const snippet = block.match(/<a\b[^>]*class=["'][^"']*\bresult__snippet\b[^"']*["'][^>]*>([\s\S]*?)<\/a>/i)?.[1]
+        ?? block.match(/<td\b[^>]*class=["'][^"']*\bresult__snippet\b[^"']*["'][^>]*>([\s\S]*?)<\/td>/i)?.[1]
+        ?? "";
+      return [{ title: title || resultUrl, url: resultUrl, excerpt: stripHtml(snippet) }];
+    });
+    if (sources.length === 0) {
+      throw new Error("DuckDuckGo returned no parseable results (the request may be rate-limited).");
+    }
+    const inspected = await inspectSearchSources(uniqueSources(sources));
+    return {
+      sources: inspected,
+      findings: inspected.map((source) => `${source.title}: ${source.excerpt}`).filter(Boolean),
+    };
+  });
 }
 
 async function tavilySearch(query: string): Promise<SearchResponse> {
@@ -136,20 +273,7 @@ async function braveSearch(query: string): Promise<SearchResponse> {
         },
       ];
     });
-    const inspected = await Promise.allSettled(
-      rawSources.slice(0, 5).map(async (source) => {
-        const page = await getPageMetadata(source.url);
-        return {
-          ...source,
-          title: page.title || source.title,
-          excerpt: page.content || source.excerpt,
-        };
-      }),
-    );
-    const sources = uniqueSources([
-      ...inspected.flatMap((result) => (result.status === "fulfilled" ? [result.value] : [])),
-      ...rawSources,
-    ]);
+    const sources = await inspectSearchSources(uniqueSources(rawSources));
     return {
       sources,
       findings: sources.map((source) => `${source.title}: ${source.excerpt}`).filter(Boolean),
@@ -192,6 +316,11 @@ async function searchAlternativeProviders(
   keys: GeminiApiKey[],
 ): Promise<{ providers: string[]; sources: WebSearchSource[]; findings: string[] }> {
   const providers: Array<{ name: string; search: (query: string) => Promise<SearchResponse> }> = [
+    ...(getServerEnvironmentVariable("TINYFISH_API_KEY")
+      ? [{ name: "TinyFish", search: tinyFishSearch }]
+      : []),
+    { name: "Google Search grounding", search: (query) => googleGroundedSearch(query, keys) },
+    { name: "DuckDuckGo", search: duckDuckGoSearch },
     ...(getServerEnvironmentVariable("TAVILY_API_KEY")
       ? [{ name: "Tavily", search: tavilySearch }]
       : []),
@@ -217,7 +346,8 @@ async function searchAlternativeProviders(
 
   for (let pass = 1; pass <= 5; pass += 1) {
     let passCompleted = false;
-    for (const provider of providers) {
+    for (let offset = 0; offset < providers.length; offset += 1) {
+      const provider = providers[(pass - 1 + offset) % providers.length];
       try {
         const result = await provider.search(refinedQuery);
         if (result.sources.length === 0) {
@@ -269,34 +399,7 @@ export async function searchWebWithFallback(
   const normalizedQuery = query.trim().slice(0, 1200);
   if (!normalizedQuery) throw new Error("Provide a non-empty web search query.");
 
-  const providers: Array<{ name: string; search: () => Promise<SearchResponse> }> = [
-    { name: "Google Search", search: () => googleGroundedSearch(normalizedQuery, keys) },
-  ];
   const errors: string[] = [];
-
-  for (const provider of providers) {
-    try {
-      const result = await provider.search();
-      const sources = uniqueSources(result.sources);
-      if (sources.length < 3) {
-        errors.push(`${provider.name} returned fewer than three distinct sources.`);
-        continue;
-      }
-      return {
-        query: normalizedQuery,
-        providers: [provider.name],
-        refinementPasses: 5,
-        sources: sources.slice(0, 15),
-        findings: result.findings.slice(0, 15),
-      };
-    } catch (error) {
-      errors.push(
-        `${provider.name}: ${
-          error instanceof Error ? error.message : "Unknown provider error."
-        }`,
-      );
-    }
-  }
 
   try {
     const result = await searchAlternativeProviders(normalizedQuery, keys);

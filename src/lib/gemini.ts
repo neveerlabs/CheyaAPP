@@ -121,7 +121,7 @@ const functionDeclarations = [
   {
     name: "search_web",
     description:
-      "Search the live web and inspect source pages when the user needs current, verifiable, or specialized information. This performs five grounded query-refinement passes and returns source links.",
+      "Search the live web and inspect source pages when the user needs current, verifiable, or specialized information. Uses TinyFish, Google Search grounding, DuckDuckGo, and configured backup providers with refined queries and returns source links.",
     parameters: {
       type: "OBJECT",
       properties: {
