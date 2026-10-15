@@ -1,0 +1,20 @@
+{
+  "runId": "wrun_01M4ZXZ609TZZ4A5455TR9KD6S",
+  "stepId": "step_01M4ZXZ609GHVSSRX35BSGCWEY",
+  "stepName": "step//./workflows/chat-response//processChatJob",
+  "status": "completed",
+  "input": {
+    "__type": "Uint8Array",
+    "data": "ZGV2bFt7ImFyZ3MiOjEsImNsb3N1cmVWYXJzIjotMSwidGhpc1ZhbCI6LTF9LFsyXSwiNjRiYWIzYjgtMWU2Mi00Zjc0LThlNTEtNjFmZDI3OWNmZTI2Il0="
+  },
+  "attempt": 1,
+  "startedAt": "2026-10-15T14:03:00.532Z",
+  "createdAt": "2026-10-15T14:03:00.532Z",
+  "updatedAt": "2026-10-15T14:04:10.321Z",
+  "specVersion": 8,
+  "output": {
+    "__type": "Uint8Array",
+    "data": "ZGV2bC0x"
+  },
+  "completedAt": "2026-10-15T14:04:10.321Z"
+}

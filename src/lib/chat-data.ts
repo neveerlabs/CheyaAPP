@@ -5,6 +5,7 @@ import type {
   StoredChatMessage,
   UserMemory,
 } from "./supabase";
+import { CHAT_ATTACHMENT_BUCKET, type ChatAttachment } from "./chat-attachments";
 
 const EMBEDDING_MODEL = "gemini-embedding-001";
 const EMBEDDING_DIMENSIONS = 768;
@@ -206,6 +207,28 @@ export async function loadRecentChatMessages(
     );
   }
   return data.reverse();
+}
+
+export async function loadMessageAttachments(
+  client: AppSupabaseClient,
+  messageIds: string[],
+): Promise<Record<string, ChatAttachment[]>> {
+  if (messageIds.length === 0) return {};
+  const { data, error } = await client
+    .from("chat_message_attachments")
+    .select("id, user_id, message_id, file_name, mime_type, size_bytes, created_at, expires_at, deleted_at")
+    .in("message_id", messageIds)
+    .order("created_at", { ascending: true });
+  if (error) {
+    throw new Error(
+      `Could not load chat attachments. Confirm the latest supabase/schema.sql has been run. ${error.message}`,
+    );
+  }
+  return data.reduce<Record<string, ChatAttachment[]>>((grouped, attachment) => {
+    if (!attachment.message_id) return grouped;
+    (grouped[attachment.message_id] ??= []).push(attachment);
+    return grouped;
+  }, {});
 }
 
 export async function loadMessageCreatedAt(
@@ -629,12 +652,24 @@ async function searchUserData(
   args: Record<string, unknown>,
   userId?: string,
 ): Promise<unknown> {
-  const query = requiredString(args.query, "search query", 200);
   const category = args.category;
-  if (category !== "all" && category !== "chat" && category !== "memories" && category !== "insights") {
-    throw new Error("Choose all, chat, memories, or insights as the search category.");
+  if (
+    category !== "all" &&
+    category !== "chat" &&
+    category !== "memories" &&
+    category !== "insights" &&
+    category !== "attachments"
+  ) {
+    throw new Error("Choose all, chat, memories, insights, or attachments as the search category.");
   }
-  const pattern = searchPattern(query);
+  const query =
+    category === "attachments" && (args.query === undefined || args.query === null)
+      ? ""
+      : requiredString(args.query, "search query", 200);
+  const pattern =
+    category === "attachments" && (!query || query.toLowerCase() === "all")
+      ? "%"
+      : searchPattern(query);
   const searches: Array<PromiseLike<unknown>> = [];
 
   if (category === "all" || category === "chat") {
@@ -699,7 +734,92 @@ async function searchUserData(
       };
     })());
   }
+  if (category === "all" || category === "attachments") {
+    let search = client
+      .from("chat_message_attachments")
+      .select("id, message_id, file_name, mime_type, size_bytes, created_at, expires_at")
+      .ilike("file_name", pattern)
+      .is("deleted_at", null)
+      .gt("expires_at", new Date().toISOString())
+      .order("created_at", { ascending: false })
+      .limit(SEARCH_RESULT_LIMIT);
+    if (userId) search = search.eq("user_id", userId);
+    searches.push(
+      search.then(({ data, error }) => {
+        if (error) throw new Error(`Could not search uploaded attachments: ${error.message}`);
+        return { category: "attachments", records: data };
+      }),
+    );
+  }
   return Promise.all(searches);
+}
+
+async function deleteChatAttachment(
+  client: AppSupabaseClient,
+  id: string,
+  confirmDelete: (label: string, preview: string) => boolean | Promise<boolean>,
+  userId?: string,
+  deleteAttachment?: (id: string) => Promise<unknown>,
+): Promise<unknown> {
+  let query = client
+    .from("chat_message_attachments")
+    .select("id, user_id, message_id, storage_path, file_name, deleted_at")
+    .eq("id", id)
+    .is("deleted_at", null);
+  if (userId) query = query.eq("user_id", userId);
+  const { data: attachment, error: lookupError } = await query.maybeSingle();
+  if (lookupError) throw new Error(`Could not load the attachment to delete: ${lookupError.message}`);
+  if (!attachment) {
+    throw new Error("That attachment is no longer available or does not belong to this account.");
+  }
+
+  const label = `uploaded attachment "${attachment.file_name}"`;
+  const preview = `This permanently removes "${attachment.file_name}" from private file storage. Its message and chat history will remain.`;
+  if (!(await confirmDelete(label, preview))) {
+    return { deleted: false, cancelled: true, fileName: attachment.file_name };
+  }
+
+  if (deleteAttachment) {
+    await deleteAttachment(attachment.id);
+  } else if (userId) {
+    await releaseStoredChatAttachment(client, attachment.id, userId);
+  } else {
+    throw new Error("Could not securely determine the owner of this attachment.");
+  }
+  return { deleted: true, fileName: attachment.file_name };
+}
+
+export async function releaseStoredChatAttachment(
+  client: AppSupabaseClient,
+  attachmentId: string,
+  userId: string,
+  expiredOnly = false,
+): Promise<{ deleted: boolean; removedStorageObject: boolean }> {
+  const { data, error } = await client.rpc("release_chat_attachment_reference", {
+    p_attachment_id: attachmentId,
+    p_user_id: userId,
+    p_expired_only: expiredOnly,
+  });
+  if (error) throw new Error(`Could not release attachment reference: ${error.message}`);
+  const released = data[0];
+  if (!released) throw new Error("Attachment reference was not found.");
+  if (!released.should_delete || !released.storage_path) {
+    return { deleted: true, removedStorageObject: false };
+  }
+
+  const { error: storageError } = await client.storage
+    .from(CHAT_ATTACHMENT_BUCKET)
+    .remove([released.storage_path]);
+  if (storageError) {
+    throw new Error(`Could not remove attachment from private storage: ${storageError.message}`);
+  }
+  const { data: purged, error: purgeError } = await client.rpc(
+    "purge_released_chat_attachment_references",
+    { p_user_id: userId, p_storage_path: released.storage_path },
+  );
+  if (purgeError) throw new Error(`Could not remove attachment metadata: ${purgeError.message}`);
+  if (!purged) throw new Error("Attachment references changed while deleting the stored file.");
+  return { deleted: true, removedStorageObject: true };
 }
 
 async function deduplicateUserMemories(
@@ -776,6 +896,7 @@ export async function executeChatDataTool(
   confirmDelete: (label: string, preview: string) => boolean | Promise<boolean>,
   userId?: string,
   sourceMessageId?: string,
+  deleteAttachment?: (id: string) => Promise<unknown>,
 ): Promise<unknown> {
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
     throw new Error("The AI provided invalid database tool input.");
@@ -783,6 +904,15 @@ export async function executeChatDataTool(
   const args = input as Record<string, unknown>;
 
   if (name === "search_user_data") return searchUserData(client, args, userId);
+  if (name === "delete_chat_attachment") {
+    return deleteChatAttachment(
+      client,
+      requiredId(args.id, "attachment ID"),
+      confirmDelete,
+      userId,
+      deleteAttachment,
+    );
+  }
   if (name === "deduplicate_memories") {
     return deduplicateUserMemories(client, confirmDelete, userId);
   }

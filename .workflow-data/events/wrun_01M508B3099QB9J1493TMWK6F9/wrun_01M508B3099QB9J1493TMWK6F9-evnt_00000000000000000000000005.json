@@ -1,0 +1,24 @@
+{
+  "eventType": "step_completed",
+  "specVersion": 8,
+  "correlationId": "step_01M508B3091G75EYV5PJBFAV4H",
+  "eventData": {
+    "stepName": "step//./workflows/chat-response//processChatJob",
+    "workflowName": "workflow//./workflows/chat-response//createChatResponseWorkflow",
+    "result": {
+      "__type": "Uint8Array",
+      "data": "ZGV2bC0x"
+    },
+    "ttfs": 33,
+    "finalSchedulingReplay": 6,
+    "optimizations": [
+      "turbo",
+      "lazyStepStart",
+      "optimisticStart"
+    ],
+    "rsfs": 14
+  },
+  "runId": "wrun_01M508B3099QB9J1493TMWK6F9",
+  "eventId": "evnt_00000000000000000000000005",
+  "createdAt": "2026-10-15T17:04:42.834Z"
+}

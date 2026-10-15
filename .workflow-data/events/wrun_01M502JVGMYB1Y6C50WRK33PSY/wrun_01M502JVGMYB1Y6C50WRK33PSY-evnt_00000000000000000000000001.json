@@ -1,0 +1,24 @@
+{
+  "eventType": "run_created",
+  "specVersion": 8,
+  "eventData": {
+    "deploymentId": "dpl_local@5.1.1",
+    "workflowName": "workflow//./workflows/chat-response//createChatResponseWorkflow",
+    "input": {
+      "__type": "Uint8Array",
+      "data": "ZGV2bFtbMV0sIjlmYzRjMzcxLTI4YWItNDMyNS1hOTE4LWMwNDExYWU0NjQzZiJd"
+    },
+    "executionContext": {
+      "traceCarrier": {},
+      "workflowCoreVersion": "5.2.2",
+      "nodeVersion": "24.21.0",
+      "features": {
+        "encryption": false
+      },
+      "hookResumeInputVersion": 1
+    }
+  },
+  "runId": "wrun_01M502JVGMYB1Y6C50WRK33PSY",
+  "eventId": "evnt_00000000000000000000000001",
+  "createdAt": "2026-10-15T15:23:39.455Z"
+}

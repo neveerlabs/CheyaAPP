@@ -1,4 +1,5 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import type { ChatAttachment } from "./chat-attachments";
 
 export const DATABASE_CONFIG_KEY = "cheyaverse.supabase.bootstrap";
 export const GEMINI_MODELS = [
@@ -274,6 +275,28 @@ export type Database = {
         }>;
         Relationships: never[];
       };
+      chat_message_attachments: {
+        Row: ChatAttachment & { storage_path: string; sha256: string | null };
+        Insert: {
+          id?: string;
+          user_id?: string;
+          message_id?: string | null;
+          storage_path: string;
+          sha256?: string | null;
+          file_name: string;
+          mime_type: string;
+          size_bytes: number;
+          created_at?: string;
+          expires_at?: string;
+          deleted_at?: string | null;
+        };
+        Update: Partial<{
+          message_id: string | null;
+          sha256: string | null;
+          deleted_at: string | null;
+        }>;
+        Relationships: never[];
+      };
       message_insights: {
         Row: MessageInsight;
         Insert: {
@@ -394,6 +417,38 @@ export type Database = {
       create_chat_job: {
         Args: { p_content: string; p_thinking_mode: boolean };
         Returns: Array<{ job_id: string; message_id: string }>;
+      };
+      create_chat_job_with_attachments: {
+        Args: {
+          p_content: string;
+          p_thinking_mode: boolean;
+          p_attachment_ids: string[];
+        };
+        Returns: Array<{ job_id: string; message_id: string }>;
+      };
+      register_chat_attachment_reference: {
+        Args: {
+          p_id: string;
+          p_user_id: string;
+          p_sha256: string;
+          p_storage_path: string | null;
+          p_file_name: string;
+          p_mime_type: string;
+          p_size_bytes: number;
+        };
+        Returns: Array<ChatAttachment & { storage_path: string; reused: boolean }>;
+      };
+      release_chat_attachment_reference: {
+        Args: {
+          p_attachment_id: string;
+          p_user_id: string;
+          p_expired_only?: boolean;
+        };
+        Returns: Array<{ storage_path: string | null; should_delete: boolean }>;
+      };
+      purge_released_chat_attachment_references: {
+        Args: { p_user_id: string; p_storage_path: string };
+        Returns: boolean;
       };
       complete_chat_job: {
         Args: {

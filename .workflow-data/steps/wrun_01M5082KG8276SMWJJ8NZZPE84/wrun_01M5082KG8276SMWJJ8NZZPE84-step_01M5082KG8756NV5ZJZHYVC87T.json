@@ -1,0 +1,20 @@
+{
+  "runId": "wrun_01M5082KG8276SMWJJ8NZZPE84",
+  "stepId": "step_01M5082KG8756NV5ZJZHYVC87T",
+  "stepName": "step//./workflows/expire-chat-attachment//loadAttachmentExpiry",
+  "status": "completed",
+  "input": {
+    "__type": "Uint8Array",
+    "data": "ZGV2bFt7ImFyZ3MiOjEsImNsb3N1cmVWYXJzIjotMSwidGhpc1ZhbCI6LTF9LFsyXSwiMjZhMWMxNmUtNDEzZC00YjFhLWI5ZmQtYzI3OWZmNTY1Mjc2Il0="
+  },
+  "attempt": 1,
+  "startedAt": "2026-10-15T16:59:39.155Z",
+  "createdAt": "2026-10-15T16:59:39.155Z",
+  "updatedAt": "2026-10-15T16:59:39.222Z",
+  "specVersion": 8,
+  "output": {
+    "__type": "Uint8Array",
+    "data": "ZGV2bFt7ImV4cGlyZXNBdCI6MSwidXNlcklkIjoyfSwiMjAyNi0xMC0xNlQxNjo1OTozOC4zMzA4NzIrMDA6MDAiLCI3YTE5NDI2MC05ZjFiLTQwZWUtODU4Mi05MzkxNGI5YmJjNzgiXQ=="
+  },
+  "completedAt": "2026-10-15T16:59:39.222Z"
+}

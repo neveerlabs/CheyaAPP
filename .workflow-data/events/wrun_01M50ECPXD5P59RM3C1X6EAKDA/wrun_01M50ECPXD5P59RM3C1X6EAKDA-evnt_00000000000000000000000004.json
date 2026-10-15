@@ -1,0 +1,13 @@
+{
+  "eventType": "step_started",
+  "specVersion": 8,
+  "correlationId": "step_01M50ECPXDHSRQZY3YHGTBTX9Q",
+  "eventData": {
+    "stepName": "step//./workflows/expire-chat-attachment//loadAttachmentExpiry",
+    "workflowName": "workflow//./workflows/expire-chat-attachment//expireChatAttachmentWorkflow",
+    "ownerMessageId": "msg_01M50ECPXD64DVTZ8MY160R3KD"
+  },
+  "runId": "wrun_01M50ECPXD5P59RM3C1X6EAKDA",
+  "eventId": "evnt_00000000000000000000000004",
+  "createdAt": "2026-10-15T18:50:01.096Z"
+}

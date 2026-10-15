@@ -15,8 +15,11 @@ import {
   generateGeminiConversation,
   generateThinkingSummary,
   GeminiFailoverError,
+  prepareGeminiAttachments,
+  type GeminiAttachmentReference,
   type GeminiAttempt,
 } from "../src/lib/gemini";
+import { CHAT_ATTACHMENT_BUCKET, MAX_GEMINI_CONTEXT_ATTACHMENTS } from "../src/lib/chat-attachments";
 import { searchWebWithFallback } from "../src/lib/server-web-search";
 import {
   DEFAULT_PERSONALIZATION,
@@ -36,9 +39,13 @@ function hasExplicitDeleteIntent(message: string, label: string): boolean {
       ? /\b(memory|memories|memori|ingatan)\b/i
       : /\binsight\b/i.test(label)
         ? /\b(insight|insights|analisis|catatan)\b/i
-        : /\b(message|chat|conversation|pesan|obrolan)\b/i;
+        : /\battachment\b/i.test(label)
+          ? /\b(file|files|attachment|attachments|media|lampiran|berkas|foto|photo|picture|gambar|video|document|dokumen)\b/i
+          : /\b(message|chat|conversation|pesan|obrolan)\b/i;
+  const attachmentName = label.match(/attachment "([^"]+)"/i)?.[1];
   return (
     targetPattern.test(message) ||
+    Boolean(attachmentName && message.toLocaleLowerCase().includes(attachmentName.toLocaleLowerCase())) ||
     /\b(this|that|it|these|those|itu|ini|tersebut|yang tadi)\b/i.test(message)
   );
 }
@@ -162,6 +169,35 @@ async function processChatJob(jobId: string) {
   const history = (await loadRecentChatMessages(client, 20, job.user_id))
     .filter((item) => item.id !== userMessage.id)
     .slice(-12);
+  const attachmentMessageIds = [...history.map((item) => item.id), userMessage.id];
+  const { data: savedAttachments, error: attachmentsError } = await client
+    .from("chat_message_attachments")
+    .select("id, file_name, mime_type, storage_path, message_id, created_at, expires_at, deleted_at")
+    .in("message_id", attachmentMessageIds)
+    .is("deleted_at", null)
+    .gt("expires_at", new Date().toISOString())
+    .order("created_at", { ascending: false });
+  if (attachmentsError) {
+    throw new Error(`Could not load unexpired chat attachments: ${attachmentsError.message}`);
+  }
+  const currentAttachments = savedAttachments.filter(
+    (attachment) => attachment.message_id === userMessage.id,
+  );
+  const earlierAttachments = savedAttachments.filter(
+    (attachment) => attachment.message_id !== userMessage.id,
+  );
+  const attachmentsForModel = [...currentAttachments, ...earlierAttachments]
+    .slice(0, MAX_GEMINI_CONTEXT_ATTACHMENTS)
+    .map<GeminiAttachmentReference>((attachment) => {
+      const sourceMessage = history.find((item) => item.id === attachment.message_id);
+      return {
+        id: attachment.id,
+        fileName: attachment.file_name,
+        mimeType: attachment.mime_type,
+        storagePath: attachment.storage_path,
+        messageCreatedAt: sourceMessage?.created_at ?? userMessage.created_at,
+      };
+    });
   const assistantIds = history
     .filter((item) => item.role === "assistant")
     .map((item) => item.id);
@@ -289,6 +325,19 @@ async function processChatJob(jobId: string) {
       memories,
       insights: insights.slice(-12),
       feedback,
+      attachments: attachmentsForModel,
+      prepareAttachments: (key, attachments) =>
+        prepareGeminiAttachments(key, attachments, async (attachment) => {
+          const { data, error } = await client.storage
+            .from(CHAT_ATTACHMENT_BUCKET)
+            .download(attachment.storagePath);
+          if (error) {
+            throw new Error(
+              `Could not read "${attachment.fileName}" from private storage: ${error.message}`,
+            );
+          }
+          return data;
+        }),
       onToolActivity: async (toolName) => {
         const activity =
           toolName === "search_web"

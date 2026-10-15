@@ -1,0 +1,13 @@
+{
+  "eventType": "step_started",
+  "specVersion": 8,
+  "correlationId": "step_01M4ZXZ609GHVSSRX35BSGCWEY",
+  "eventData": {
+    "stepName": "step//./workflows/chat-response//processChatJob",
+    "workflowName": "workflow//./workflows/chat-response//createChatResponseWorkflow",
+    "ownerMessageId": "msg_01M4ZXZ609DTPSFTJEJKZCJ803"
+  },
+  "runId": "wrun_01M4ZXZ609TZZ4A5455TR9KD6S",
+  "eventId": "evnt_00000000000000000000000004",
+  "createdAt": "2026-10-15T14:03:00.532Z"
+}

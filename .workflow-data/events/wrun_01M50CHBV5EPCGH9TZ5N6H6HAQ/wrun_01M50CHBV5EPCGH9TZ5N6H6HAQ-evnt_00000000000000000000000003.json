@@ -1,0 +1,15 @@
+{
+  "eventType": "step_created",
+  "runId": "wrun_01M50CHBV5EPCGH9TZ5N6H6HAQ",
+  "eventId": "evnt_00000000000000000000000003",
+  "createdAt": "2026-10-15T18:17:36.407Z",
+  "specVersion": 8,
+  "correlationId": "step_01M50CHBV55BX0GZA7G91FX1VR",
+  "eventData": {
+    "stepName": "step//./workflows/expire-chat-attachment//loadAttachmentExpiry",
+    "input": {
+      "__type": "Uint8Array",
+      "data": "ZGV2bFt7ImFyZ3MiOjEsImNsb3N1cmVWYXJzIjotMSwidGhpc1ZhbCI6LTF9LFsyXSwiZmFkNjIwNzMtYmE3Ny00NDZjLTkyMzQtMDAyZWEzMjY4N2M2Il0="
+    }
+  }
+}

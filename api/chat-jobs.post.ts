@@ -6,6 +6,7 @@ import { createAuthenticatedServerClient, createServiceRoleClient } from "../src
 type ChatJobRequest = {
   content?: unknown;
   thinkingMode?: unknown;
+  attachmentIds?: unknown;
 };
 
 export default defineEventHandler(async (event) => {
@@ -25,11 +26,30 @@ export default defineEventHandler(async (event) => {
   }
 
   const body = await readBody<ChatJobRequest>(event);
-  if (typeof body?.content !== "string" || !body.content.trim() || body.content.length > 50000) {
+  if (!body || typeof body !== "object") {
+    throw createError({ statusCode: 400, statusMessage: "A chat request body is required." });
+  }
+  if (body?.content !== undefined && typeof body.content !== "string") {
+    throw createError({ statusCode: 400, statusMessage: "Message content must be text." });
+  }
+  if (typeof body?.content === "string" && body.content.length > 50000) {
     throw createError({ statusCode: 400, statusMessage: "Message must contain 1–50,000 characters." });
   }
   if (body.thinkingMode !== undefined && typeof body.thinkingMode !== "boolean") {
     throw createError({ statusCode: 400, statusMessage: "Thinking mode must be a boolean." });
+  }
+  if (
+    body.attachmentIds !== undefined &&
+    (!Array.isArray(body.attachmentIds) ||
+      body.attachmentIds.length > 10 ||
+      body.attachmentIds.some((id) => typeof id !== "string"))
+  ) {
+    throw createError({ statusCode: 400, statusMessage: "Attachment IDs are invalid." });
+  }
+  const content = typeof body?.content === "string" ? body.content.trim() : "";
+  const attachmentIds = (body.attachmentIds ?? []) as string[];
+  if (!content && attachmentIds.length === 0) {
+    throw createError({ statusCode: 400, statusMessage: "Write a message or attach a file." });
   }
 
   const { data: keys, error: keysError } = await requestClient
@@ -43,9 +63,10 @@ export default defineEventHandler(async (event) => {
     throw createError({ statusCode: 400, statusMessage: "Add a Gemini API key in Settings first." });
   }
 
-  const { data: jobs, error: jobError } = await requestClient.rpc("create_chat_job", {
-    p_content: body.content.trim(),
+  const { data: jobs, error: jobError } = await requestClient.rpc("create_chat_job_with_attachments", {
+    p_content: content || "Please review the attached files.",
     p_thinking_mode: body.thinkingMode === true,
+    p_attachment_ids: attachmentIds,
   });
   if (jobError) {
     throw createError({ statusCode: 500, statusMessage: `Could not save your message: ${jobError.message}` });

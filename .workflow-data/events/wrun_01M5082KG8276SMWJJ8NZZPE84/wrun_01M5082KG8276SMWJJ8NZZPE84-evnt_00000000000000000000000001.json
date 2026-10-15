@@ -1,0 +1,24 @@
+{
+  "eventType": "run_created",
+  "specVersion": 8,
+  "eventData": {
+    "deploymentId": "dpl_local@5.1.1",
+    "workflowName": "workflow//./workflows/expire-chat-attachment//expireChatAttachmentWorkflow",
+    "input": {
+      "__type": "Uint8Array",
+      "data": "ZGV2bFtbMV0sIjI2YTFjMTZlLTQxM2QtNGIxYS1iOWZkLWMyNzlmZjU2NTI3NiJd"
+    },
+    "executionContext": {
+      "traceCarrier": {},
+      "workflowCoreVersion": "5.2.2",
+      "nodeVersion": "24.21.0",
+      "features": {
+        "encryption": false
+      },
+      "hookResumeInputVersion": 1
+    }
+  },
+  "runId": "wrun_01M5082KG8276SMWJJ8NZZPE84",
+  "eventId": "evnt_00000000000000000000000001",
+  "createdAt": "2026-10-15T16:59:38.379Z"
+}

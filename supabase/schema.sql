@@ -260,6 +260,313 @@ create policy "Users can create their own chat message jobs"
 
 grant select, insert on public.chat_message_jobs to authenticated;
 
+create table if not exists public.chat_message_attachments (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null default auth.uid() references auth.users (id) on delete cascade,
+  message_id uuid,
+  storage_path text not null,
+  sha256 text check (sha256 is null or sha256 ~ '^[0-9a-f]{64}$'),
+  file_name text not null check (length(trim(file_name)) between 1 and 255),
+  mime_type text not null,
+  size_bytes bigint not null check (size_bytes between 1 and 18874368),
+  created_at timestamptz not null default now(),
+  expires_at timestamptz not null default (now() + interval '24 hours'),
+  deleted_at timestamptz,
+  unique (user_id, id),
+  foreign key (user_id, message_id)
+    references public.chat_messages (user_id, id)
+    on delete cascade
+);
+
+alter table public.chat_message_attachments
+  drop constraint if exists chat_message_attachments_storage_path_key;
+alter table public.chat_message_attachments
+  add column if not exists sha256 text
+  check (sha256 is null or sha256 ~ '^[0-9a-f]{64}$');
+
+create index if not exists chat_message_attachments_user_message_idx
+  on public.chat_message_attachments (user_id, message_id, created_at);
+create index if not exists chat_message_attachments_dedupe_idx
+  on public.chat_message_attachments (user_id, sha256, expires_at)
+  where deleted_at is null and sha256 is not null;
+
+alter table public.chat_message_attachments enable row level security;
+
+drop policy if exists "Users can read their own chat attachments"
+  on public.chat_message_attachments;
+create policy "Users can read their own chat attachments"
+  on public.chat_message_attachments
+  for select
+  to authenticated
+  using (auth.uid() = user_id);
+
+grant select on public.chat_message_attachments to authenticated;
+revoke update (deleted_at) on public.chat_message_attachments from authenticated;
+revoke delete on public.chat_message_attachments from authenticated;
+
+drop policy if exists "Users can mark their own chat attachments deleted"
+  on public.chat_message_attachments;
+drop policy if exists "Users can delete their own chat attachments"
+  on public.chat_message_attachments;
+
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values (
+  'chat-attachments',
+  'chat-attachments',
+  false,
+  18874368,
+  array[
+    'image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/heic', 'image/heif',
+    'video/mp4', 'video/mpeg', 'video/quicktime', 'video/x-msvideo', 'video/x-flv',
+    'video/webm', 'video/3gpp', 'video/x-matroska',
+    'audio/flac', 'audio/mp4', 'audio/mpeg', 'audio/ogg', 'audio/wav',
+    'application/pdf', 'application/json', 'application/xml',
+    'text/plain', 'text/csv', 'text/markdown', 'text/html'
+  ]
+)
+on conflict (id) do update
+set public = false,
+    file_size_limit = excluded.file_size_limit,
+    allowed_mime_types = excluded.allowed_mime_types;
+
+drop policy if exists "Users can upload their own chat attachments" on storage.objects;
+create policy "Users can upload their own chat attachments"
+  on storage.objects
+  for insert
+  to authenticated
+  with check (
+    bucket_id = 'chat-attachments'
+    and (storage.foldername(name))[1] = auth.uid()::text
+  );
+
+drop policy if exists "Users can read their unexpired chat attachments" on storage.objects;
+create policy "Users can read their unexpired chat attachments"
+  on storage.objects
+  for select
+  to authenticated
+  using (
+    bucket_id = 'chat-attachments'
+    and exists (
+      select 1
+      from public.chat_message_attachments as attachment
+      where attachment.user_id = auth.uid()
+        and attachment.storage_path = storage.objects.name
+        and attachment.expires_at > now()
+        and attachment.deleted_at is null
+    )
+  );
+
+drop policy if exists "Users can delete their own chat attachments" on storage.objects;
+create policy "Users can delete their own chat attachments"
+  on storage.objects
+  for delete
+  to authenticated
+  using (
+    bucket_id = 'chat-attachments'
+    and (storage.foldername(name))[1] = auth.uid()::text
+  );
+
+create or replace function public.register_chat_attachment_reference(
+  p_id uuid,
+  p_user_id uuid,
+  p_sha256 text,
+  p_storage_path text,
+  p_file_name text,
+  p_mime_type text,
+  p_size_bytes bigint
+)
+returns table (
+  id uuid,
+  user_id uuid,
+  message_id uuid,
+  storage_path text,
+  file_name text,
+  mime_type text,
+  size_bytes bigint,
+  created_at timestamptz,
+  expires_at timestamptz,
+  deleted_at timestamptz,
+  reused boolean
+)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  canonical_path text;
+  canonical_mime_type text;
+  canonical_size bigint;
+  did_reuse boolean := false;
+begin
+  if p_id is null
+    or p_user_id is null
+    or p_sha256 is null
+    or p_sha256 !~ '^[0-9a-f]{64}$'
+    or p_size_bytes not between 1 and 18874368
+    or p_file_name is null
+    or length(trim(p_file_name)) not between 1 and 255
+    or p_mime_type is null
+    or length(trim(p_mime_type)) = 0 then
+    raise exception 'Invalid attachment metadata.';
+  end if;
+
+  if p_storage_path is not null
+    and p_storage_path <> (p_user_id::text || '/' || p_id::text) then
+    raise exception 'Invalid attachment storage path.';
+  end if;
+
+  perform pg_advisory_xact_lock(
+    hashtextextended(p_user_id::text || ':' || p_sha256, 0)
+  );
+
+  select attachment.storage_path, attachment.mime_type, attachment.size_bytes
+  into canonical_path, canonical_mime_type, canonical_size
+  from public.chat_message_attachments as attachment
+  where attachment.user_id = p_user_id
+    and attachment.sha256 = p_sha256
+    and attachment.expires_at > now()
+    and attachment.deleted_at is null
+  order by attachment.created_at desc
+  limit 1;
+
+  if canonical_path is not null then
+    did_reuse := true;
+    if canonical_size <> p_size_bytes then
+      raise exception 'Attachment hash matched a file with a different size.';
+    end if;
+  elsif p_storage_path is not null then
+    canonical_path := p_storage_path;
+    canonical_mime_type := p_mime_type;
+    canonical_size := p_size_bytes;
+  else
+    return;
+  end if;
+
+  return query
+  insert into public.chat_message_attachments as attachment (
+    id, user_id, storage_path, sha256, file_name, mime_type, size_bytes
+  )
+  values (
+    p_id, p_user_id, canonical_path, p_sha256, trim(p_file_name),
+    canonical_mime_type, canonical_size
+  )
+  returning
+    attachment.id,
+    attachment.user_id,
+    attachment.message_id,
+    attachment.storage_path,
+    attachment.file_name,
+    attachment.mime_type,
+    attachment.size_bytes,
+    attachment.created_at,
+    attachment.expires_at,
+    attachment.deleted_at,
+    did_reuse;
+end;
+$$;
+
+create or replace function public.release_chat_attachment_reference(
+  p_attachment_id uuid,
+  p_user_id uuid,
+  p_expired_only boolean default false
+)
+returns table (storage_path text, should_delete boolean)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  target_path text;
+  target_hash text;
+  target_expiry timestamptz;
+begin
+  select attachment.storage_path, attachment.sha256, attachment.expires_at
+  into target_path, target_hash, target_expiry
+  from public.chat_message_attachments as attachment
+  where attachment.id = p_attachment_id
+    and attachment.user_id = p_user_id
+  for update;
+
+  if target_path is null or (p_expired_only and target_expiry > now()) then
+    return query select null::text, false;
+    return;
+  end if;
+
+  perform pg_advisory_xact_lock(
+    hashtextextended(p_user_id::text || ':' || coalesce(target_hash, target_path), 0)
+  );
+
+  update public.chat_message_attachments
+  set deleted_at = coalesce(deleted_at, now())
+  where id = p_attachment_id
+    and user_id = p_user_id;
+
+  if exists (
+    select 1
+    from public.chat_message_attachments as attachment
+    where attachment.user_id = p_user_id
+      and attachment.storage_path = target_path
+      and attachment.id <> p_attachment_id
+      and attachment.expires_at > now()
+      and attachment.deleted_at is null
+  ) then
+    delete from public.chat_message_attachments
+    where id = p_attachment_id
+      and user_id = p_user_id;
+    return query select null::text, false;
+    return;
+  end if;
+
+  return query select target_path, true;
+end;
+$$;
+
+create or replace function public.purge_released_chat_attachment_references(
+  p_user_id uuid,
+  p_storage_path text
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  perform pg_advisory_xact_lock(
+    hashtextextended(p_user_id::text || ':' || p_storage_path, 0)
+  );
+
+  if exists (
+    select 1
+    from public.chat_message_attachments as attachment
+    where attachment.user_id = p_user_id
+      and attachment.storage_path = p_storage_path
+      and attachment.expires_at > now()
+      and attachment.deleted_at is null
+  ) then
+    return false;
+  end if;
+
+  delete from public.chat_message_attachments
+  where user_id = p_user_id
+    and storage_path = p_storage_path;
+
+  return true;
+end;
+$$;
+
+revoke all on function public.register_chat_attachment_reference(uuid, uuid, text, text, text, text, bigint)
+  from public, anon, authenticated;
+revoke all on function public.release_chat_attachment_reference(uuid, uuid, boolean)
+  from public, anon, authenticated;
+revoke all on function public.purge_released_chat_attachment_references(uuid, text)
+  from public, anon, authenticated;
+grant execute on function public.register_chat_attachment_reference(uuid, uuid, text, text, text, text, bigint)
+  to service_role;
+grant execute on function public.release_chat_attachment_reference(uuid, uuid, boolean)
+  to service_role;
+grant execute on function public.purge_released_chat_attachment_references(uuid, text)
+  to service_role;
+
 create or replace function public.record_chat_message_version()
 returns trigger
 language plpgsql
@@ -592,6 +899,72 @@ begin
 end;
 $$;
 
+create or replace function public.create_chat_job_with_attachments(
+  p_content text,
+  p_thinking_mode boolean default false,
+  p_attachment_ids uuid[] default '{}'
+)
+returns table (job_id uuid, message_id uuid)
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+declare
+  new_message_id uuid;
+  new_job_id uuid;
+  attachment_count integer := coalesce(cardinality(p_attachment_ids), 0);
+  owned_attachment_count integer;
+  attachment_bytes bigint;
+begin
+  if auth.uid() is null then
+    raise exception 'Authentication is required to send a chat message.';
+  end if;
+  if length(trim(coalesce(p_content, ''))) = 0 or length(p_content) > 50000 then
+    raise exception 'Message content must be between 1 and 50000 characters.';
+  end if;
+  if attachment_count > 10 then
+    raise exception 'A message can include at most 10 attachments.';
+  end if;
+  if attachment_count <> (
+    select count(distinct attachment_id)
+    from unnest(coalesce(p_attachment_ids, '{}'::uuid[])) as requested(attachment_id)
+  ) then
+    raise exception 'Attachment IDs must be unique.';
+  end if;
+
+  select count(*), coalesce(sum(attachment.size_bytes), 0)
+  into owned_attachment_count, attachment_bytes
+  from public.chat_message_attachments as attachment
+  where attachment.id = any(coalesce(p_attachment_ids, '{}'::uuid[]))
+    and attachment.user_id = auth.uid()
+    and attachment.message_id is null
+    and attachment.expires_at > now()
+    and attachment.deleted_at is null;
+
+  if owned_attachment_count <> attachment_count then
+    raise exception 'One or more attachments are missing, expired, or already used.';
+  end if;
+  if attachment_bytes > 52428800 then
+    raise exception 'Attachments for one message cannot exceed 50 MB in total.';
+  end if;
+
+  insert into public.chat_messages (user_id, role, content)
+  values (auth.uid(), 'user', p_content)
+  returning id into new_message_id;
+
+  insert into public.chat_message_jobs (user_id, message_id, thinking_mode)
+  values (auth.uid(), new_message_id, coalesce(p_thinking_mode, false))
+  returning id into new_job_id;
+
+  update public.chat_message_attachments
+  set message_id = new_message_id
+  where id = any(coalesce(p_attachment_ids, '{}'::uuid[]))
+    and user_id = auth.uid();
+
+  return query select new_job_id, new_message_id;
+end;
+$$;
+
 create or replace function public.complete_chat_job(
   p_job_id uuid,
   p_content text,
@@ -780,6 +1153,10 @@ $$;
 
 revoke all on function public.create_chat_job(text, boolean) from public, anon;
 grant execute on function public.create_chat_job(text, boolean) to authenticated;
+revoke all on function public.create_chat_job_with_attachments(text, boolean, uuid[])
+  from public, anon;
+grant execute on function public.create_chat_job_with_attachments(text, boolean, uuid[])
+  to authenticated;
 revoke all on function public.complete_chat_job(uuid, text, extensions.vector, text)
   from public, anon, authenticated;
 grant execute on function public.complete_chat_job(uuid, text, extensions.vector, text)
@@ -1279,6 +1656,7 @@ begin
       'chat_message_versions',
       'chat_conversation_branches',
       'chat_message_jobs',
+      'chat_message_attachments',
       'message_feedback',
       'message_insights',
       'user_memories',

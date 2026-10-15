@@ -40,3 +40,53 @@ input {
 .chat-composer:has(textarea:not(:placeholder-shown)) .chat-composer-send {
   display: flex;
 }
+
+@keyframes chat-loading-shimmer {
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+.chat-loading-skeleton {
+  background: linear-gradient(
+    105deg,
+    #f0f1f3 25%,
+    #e7e9ed 42%,
+    #f5f6f8 58%,
+    #f0f1f3 75%
+  );
+  background-size: 200% 100%;
+  animation: chat-loading-shimmer 1.8s ease-in-out infinite;
+}
+
+@keyframes chat-attachment-upload-fill {
+  from {
+    height: 0%;
+  }
+
+  to {
+    height: 100%;
+  }
+}
+
+.attachment-upload-progress {
+  height: 0%;
+  background: linear-gradient(
+    to top,
+    rgb(34 159 227 / 48%),
+    rgb(120 208 245 / 30%)
+  );
+  box-shadow: 0 -2px 10px rgb(34 159 227 / 24%);
+  animation: chat-attachment-upload-fill 1.6s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .attachment-upload-progress {
+    height: 100%;
+    animation: none;
+  }
+
+  .chat-loading-skeleton {
+    animation: none;
+  }
+}

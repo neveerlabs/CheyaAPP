@@ -1,0 +1,24 @@
+{
+  "eventType": "step_completed",
+  "specVersion": 8,
+  "correlationId": "step_01M508V829KMZT2P6A6Y5GZMYS",
+  "eventData": {
+    "stepName": "step//./workflows/expire-chat-attachment//loadAttachmentExpiry",
+    "workflowName": "workflow//./workflows/expire-chat-attachment//expireChatAttachmentWorkflow",
+    "result": {
+      "__type": "Uint8Array",
+      "data": "ZGV2bFt7ImV4cGlyZXNBdCI6MSwidXNlcklkIjoyfSwiMjAyNi0xMC0xNlQxNzoxMzowNS43ODkyNiswMDowMCIsIjdhMTk0MjYwLTlmMWItNDBlZS04NTgyLTkzOTE0YjliYmM3OCJd"
+    },
+    "ttfs": 31,
+    "finalSchedulingReplay": 4,
+    "optimizations": [
+      "turbo",
+      "lazyStepStart",
+      "optimisticStart"
+    ],
+    "rsfs": 8
+  },
+  "runId": "wrun_01M508V829KCTJX5V6TMKDTQFE",
+  "eventId": "evnt_00000000000000000000000005",
+  "createdAt": "2026-10-15T17:13:06.032Z"
+}
