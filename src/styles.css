@@ -32,3 +32,11 @@ button,
 input {
   font: inherit;
 }
+
+.chat-composer:has(textarea:not(:placeholder-shown)) .chat-composer-idle-control {
+  display: none;
+}
+
+.chat-composer:has(textarea:not(:placeholder-shown)) .chat-composer-send {
+  display: flex;
+}

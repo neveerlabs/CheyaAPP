@@ -27,7 +27,7 @@ import {
   TriangleAlert,
   Trash2,
 } from "lucide-react";
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, memo, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import cheyaLogo from "../assets/circle.png";
 import { AccountLogin } from "./AccountLogin";
 import { LinkPreviews } from "./components/LinkPreviews";
@@ -45,6 +45,47 @@ const AssistantMarkdown = lazy(() =>
     default: module.AssistantMarkdown,
   })),
 );
+
+const ChatMessageInput = memo(function ChatMessageInput({
+  inputRef,
+  disabled,
+  placeholder,
+  onSubmitMessage,
+}: {
+  inputRef: React.RefObject<HTMLTextAreaElement | null>;
+  disabled: boolean;
+  placeholder: string;
+  onSubmitMessage: () => void;
+}) {
+  return (
+    <textarea
+      ref={inputRef}
+      aria-label="Message"
+      name="message"
+      placeholder={placeholder}
+      rows={1}
+      disabled={disabled}
+      inputMode="text"
+      enterKeyHint="enter"
+      autoCapitalize="sentences"
+      autoCorrect="on"
+      spellCheck
+      onKeyDown={(event) => {
+        if (
+          event.key !== "Enter" ||
+          event.shiftKey ||
+          event.nativeEvent.isComposing ||
+          window.matchMedia("(pointer: coarse)").matches
+        ) {
+          return;
+        }
+        event.preventDefault();
+        onSubmitMessage();
+      }}
+      className="h-11 min-h-11 max-h-32 min-w-0 flex-1 resize-none overflow-y-auto bg-transparent py-2 text-base leading-6 text-[#25262a] caret-[#229fe3] outline-none placeholder:text-[#a2a3a7] selection:bg-[#bfe6f7] selection:text-[#25262a] [-webkit-user-select:text] sm:h-[52px] sm:min-h-[52px] sm:py-3 sm:leading-[26px]"
+    />
+  );
+});
 
 const headerActions = [
   { label: "Report a problem", icon: Bug },
@@ -129,7 +170,6 @@ export function App() {
   const [authUser, setAuthUser] = useState<{ id: string; email: string | null } | null>(null);
   const [isAuthLoading, setIsAuthLoading] = useState(true);
   const [authError, setAuthError] = useState("");
-  const [message, setMessage] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatJobs, setChatJobs] = useState<ChatMessageJob[]>([]);
   const [messageVersions, setMessageVersions] = useState<Record<string, ChatMessageVersion[]>>({});
@@ -170,8 +210,6 @@ export function App() {
   const pendingAssistantAnchorRef = useRef<string | null>(null);
   const shouldScrollToLatestRef = useRef(true);
   const followLatestRef = useRef(true);
-  const footerRef = useRef<HTMLElement>(null);
-  const [footerHeight, setFooterHeight] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const filesInputRef = useRef<HTMLInputElement>(null);
   const cameraCaptureInputRef = useRef<HTMLInputElement>(null);
@@ -181,7 +219,6 @@ export function App() {
   const deleteConfirmationResolverRef = useRef<((approved: boolean) => void) | null>(null);
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wasSettingsRef = useRef(window.location.pathname === "/settings");
-  const hasMessage = message.trim().length > 0 || attachedMedia.length > 0;
   const chatJobsByMessageId = useMemo(() => {
     const result = new Map<string, ChatMessageJob>();
     for (const job of chatJobs) {
@@ -357,19 +394,18 @@ export function App() {
   useEffect(() => {
     const visualViewport = window.visualViewport;
     const updateViewport = () => {
-      setViewport({
-        height: visualViewport?.height ?? window.innerHeight,
-        top: visualViewport?.offsetTop ?? 0,
-      });
+      const height = Math.round(visualViewport?.height ?? window.innerHeight);
+      const top = Math.round(visualViewport?.offsetTop ?? 0);
+      setViewport((current) =>
+        current.height === height && current.top === top ? current : { height, top },
+      );
     };
     updateViewport();
     visualViewport?.addEventListener("resize", updateViewport);
-    visualViewport?.addEventListener("scroll", updateViewport);
     window.addEventListener("resize", updateViewport);
 
     return () => {
       visualViewport?.removeEventListener("resize", updateViewport);
-      visualViewport?.removeEventListener("scroll", updateViewport);
       window.removeEventListener("resize", updateViewport);
     };
   }, []);
@@ -433,20 +469,6 @@ export function App() {
     pendingAssistantAnchorRef.current = null;
     setTypingAssistant({ id: response.id, content: displayedMessageText(response) });
   }, [messages]);
-
-  useEffect(() => {
-    const footer = footerRef.current;
-    if (!footer) return;
-    const updateHeight = () => setFooterHeight(footer.getBoundingClientRect().height);
-    updateHeight();
-    const observer = new ResizeObserver(updateHeight);
-    observer.observe(footer);
-    return () => observer.disconnect();
-  }, []);
-
-  useEffect(() => {
-    if (followLatestRef.current) scrollConversationToLatest("auto");
-  }, [footerHeight]);
 
   useEffect(() => {
     let isMounted = true;
@@ -897,7 +919,7 @@ export function App() {
       setSendError("Add a Gemini API key in Settings → Configure before using chat.");
       return;
     }
-    const prompt = message.trim();
+    const prompt = messageInputRef.current?.value.trim() ?? "";
     if (!prompt) {
       setSendError("Write a message before sending it.");
       return;
@@ -959,9 +981,10 @@ export function App() {
               },
             ],
       );
-      setMessage("");
+      if (messageInputRef.current) {
+        messageInputRef.current.value = "";
+      }
       setAttachedMedia([]);
-      if (messageInputRef.current) messageInputRef.current.style.height = "52px";
       setThinkingSteps(showThinking ? ["Membaca pesan dan konteks percakapan…"] : []);
       setRealtimeRevision((revision) => revision + 1);
     } catch (error) {
@@ -1784,8 +1807,7 @@ export function App() {
           aria-label="Conversation"
           aria-live="polite"
           onScroll={handleConversationScroll}
-          className="absolute inset-0 overflow-y-auto overscroll-contain px-4 pt-[72px] sm:px-6"
-          style={{ paddingBottom: `${footerHeight + 24}px` }}
+          className="relative min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pb-3 pt-[72px] sm:px-6"
         >
           <div className="space-y-3">
             {messages.map((chatMessage) => {
@@ -2112,26 +2134,24 @@ export function App() {
           </div>
         </div>
 
-        {showScrollToLatest && pathname === "/" && (
-          <button
-            type="button"
-            aria-label="Scroll to latest message"
-            title="Scroll to latest message"
-            onClick={() => scrollConversationToLatest()}
-            className="absolute right-4 z-30 flex size-9 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] shadow-[0_3px_14px_rgba(20,24,32,0.16)] transition hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] sm:size-10"
-            style={{ bottom: `${footerHeight + 16}px` }}
-          >
-            <ArrowDown aria-hidden="true" className="size-4" />
-          </button>
-        )}
-
         <footer
-          ref={footerRef}
-          className="absolute inset-x-0 bottom-0 z-20 bg-transparent px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-1.5 sm:px-5 sm:pb-5"
+          className="relative z-20 shrink-0 bg-transparent px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-1.5 sm:px-5 sm:pb-5"
         >
+          {showScrollToLatest && pathname === "/" && (
+            <button
+              type="button"
+              aria-label="Scroll to latest message"
+              title="Scroll to latest message"
+              onClick={() => scrollConversationToLatest()}
+              className="absolute right-4 z-30 flex size-9 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] shadow-[0_3px_14px_rgba(20,24,32,0.16)] transition hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] sm:size-10"
+              style={{ bottom: "calc(100% + 12px)" }}
+            >
+              <ArrowDown aria-hidden="true" className="size-4" />
+            </button>
+          )}
           <form
             aria-label="Send message"
-            className="rounded-[25px] border border-[#e5e6e9] bg-white p-1 shadow-[0_2px_10px_rgba(20,24,32,0.05)]"
+            className="chat-composer rounded-[25px] border border-[#e5e6e9] bg-white p-1 shadow-[0_2px_10px_rgba(20,24,32,0.05)]"
             onSubmit={(event) => {
               event.preventDefault();
             }}
@@ -2139,7 +2159,7 @@ export function App() {
             {attachedMedia.length > 0 && (
               <div
                 aria-label="Files ready to upload"
-                className="grid max-w-full grid-flow-col auto-cols-[64px] gap-1.5 overflow-x-auto overflow-y-hidden overscroll-x-contain px-2 pb-1 pt-2 sm:auto-cols-[80px] sm:gap-2"
+                className="grid max-w-full grid-flow-col auto-cols-[60px] gap-1.5 overflow-x-auto overflow-y-hidden overscroll-x-contain px-2 pb-0 pt-1 sm:auto-cols-[80px] sm:gap-2 sm:pb-1 sm:pt-2"
               >
                 {attachedMedia.map((file, index) => {
                   const isPreviewable =
@@ -2205,25 +2225,14 @@ export function App() {
                 })}
               </div>
             )}
-            <div className="flex min-h-[52px] items-center px-3">
-              <textarea
-                ref={messageInputRef}
-                aria-label="Message"
-                name="message"
+            <div className="flex min-h-11 items-center px-3 sm:min-h-[52px]">
+              <ChatMessageInput
+                inputRef={messageInputRef}
+                disabled={!hasGeminiApiKey || isLoadingHistory}
+                onSubmitMessage={() => void sendMessage()}
                 placeholder={
                   hasGeminiApiKey ? "Ask anything..." : "Add a Gemini API key in Settings first"
                 }
-                rows={1}
-                value={message}
-                disabled={!hasGeminiApiKey || isLoadingHistory}
-                inputMode="text"
-                enterKeyHint="enter"
-                onChange={(event) => {
-                  setMessage(event.target.value);
-                  event.currentTarget.style.height = "52px";
-                  event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 128)}px`;
-                }}
-                className="min-h-[52px] max-h-32 min-w-0 flex-1 resize-none overflow-y-auto bg-transparent py-3 text-base leading-[26px] text-[#25262a] outline-none placeholder:text-[#a2a3a7]"
               />
             </div>
 
@@ -2236,7 +2245,7 @@ export function App() {
                   aria-expanded={isMediaMenuOpen}
                   aria-haspopup="menu"
                   onClick={() => setIsMediaMenuOpen((open) => !open)}
-                  className="flex size-10 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] disabled:cursor-not-allowed disabled:opacity-40"
+                  className="flex size-9 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] disabled:cursor-not-allowed disabled:opacity-40 sm:size-10"
                 >
                   <Plus aria-hidden="true" className="size-[21px]" strokeWidth={1.8} />
                 </button>
@@ -2301,7 +2310,7 @@ export function App() {
                   title={isThinkMode ? "Turn off thinking summary" : "Turn on thinking summary"}
                   disabled={!hasGeminiApiKey || isLoadingHistory}
                   onClick={() => setIsThinkMode((enabled) => !enabled)}
-                  className={`flex h-10 items-center gap-2 rounded-full border px-3.5 text-sm font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] disabled:cursor-not-allowed disabled:opacity-40 ${
+                  className={`flex h-9 items-center gap-2 rounded-full border px-3 text-sm font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] disabled:cursor-not-allowed disabled:opacity-40 sm:h-10 sm:px-3.5 ${
                     isThinkMode
                       ? "border-[#b9dff2] bg-[#edf8fd] text-[#1678a8]"
                       : "border-[#e5e6e9] bg-white text-[#34363b] hover:bg-[#f7f8fa]"
@@ -2310,13 +2319,13 @@ export function App() {
                   <Brain aria-hidden="true" className="size-[18px]" strokeWidth={1.8} />
                   <span>Think</span>
                 </button>
-                {hasMessage ? (
+                {attachedMedia.length > 0 ? (
                   <button
                     type="button"
                     aria-label="Send message"
                     onClick={sendMessage}
                     disabled={isSending || isLoadingHistory || !hasGeminiApiKey}
-                    className="flex size-10 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
+                    className="flex size-9 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] sm:size-10"
                   >
                     {isSending ? (
                       <LoaderCircle aria-hidden="true" className="size-[18px] animate-spin" />
@@ -2329,16 +2338,29 @@ export function App() {
                     <button
                       type="button"
                       aria-label="Use microphone"
-                      className="flex size-10 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
+                      className="chat-composer-idle-control flex size-9 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] sm:size-10"
                     >
                       <Mic aria-hidden="true" className="size-[19px]" strokeWidth={1.8} />
                     </button>
                     <button
                       type="button"
                       aria-label="Visualize"
-                      className="flex size-10 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
+                      className="chat-composer-idle-control flex size-9 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] sm:size-10"
                     >
                       <AudioLines aria-hidden="true" className="size-5" strokeWidth={1.8} />
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="Send message"
+                      onClick={sendMessage}
+                      disabled={isSending || isLoadingHistory || !hasGeminiApiKey}
+                      className="chat-composer-send hidden size-9 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] disabled:opacity-40 sm:size-10"
+                    >
+                      {isSending ? (
+                        <LoaderCircle aria-hidden="true" className="size-[18px] animate-spin" />
+                      ) : (
+                        <Send aria-hidden="true" className="size-[18px]" strokeWidth={1.8} />
+                      )}
                     </button>
                   </>
                 )}
