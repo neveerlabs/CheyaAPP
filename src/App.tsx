@@ -2125,75 +2125,6 @@ export function App() {
           ref={footerRef}
           className="absolute inset-x-0 bottom-0 z-20 bg-transparent px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-1.5 sm:px-5 sm:pb-5"
         >
-          {attachedMedia.length > 0 && (
-            <div
-              aria-label="Files ready to upload"
-              className="mb-2 grid max-w-full grid-flow-col auto-cols-[76px] gap-2 overflow-x-auto overflow-y-hidden overscroll-x-contain px-1 pb-1 pt-1 sm:auto-cols-[84px]"
-            >
-              {attachedMedia.map((file, index) => {
-                const isPreviewable =
-                  file.type.startsWith("image/") || file.type.startsWith("video/");
-                const preview = mediaPreviews.get(file);
-
-                return (
-                  <article
-                    key={`${file.name}-${file.lastModified}-${index}`}
-                    aria-label={`Attached file: ${file.name}`}
-                    className="relative aspect-square min-w-0 overflow-hidden rounded-xl border border-[#e5e6e9] bg-[#f4f5f7]"
-                    title={file.name}
-                  >
-                    <button
-                      type="button"
-                      aria-label={`Open ${file.name}`}
-                      onClick={() => void openAttachment(index)}
-                      className="absolute inset-0 flex size-full items-center justify-center overflow-hidden text-left"
-                    >
-                      {isPreviewable && preview ? (
-                        file.type.startsWith("video/") ? (
-                          <video
-                            src={preview}
-                            muted
-                            loop
-                            autoPlay
-                            playsInline
-                            preload="metadata"
-                            aria-label={`Preview of ${file.name}`}
-                            className="size-full object-cover"
-                          />
-                        ) : (
-                          <img
-                            src={preview}
-                            alt={file.name}
-                            className="size-full object-cover"
-                          />
-                        )
-                      ) : (
-                        <div
-                          className={`flex size-full items-center justify-center ${fileTileColor(file)}`}
-                        >
-                          <span className="max-w-full truncate px-1 text-center text-[11px] font-bold tracking-wide">
-                            {fileExtension(file)}
-                          </span>
-                        </div>
-                      )}
-                    </button>
-                    <button
-                      type="button"
-                      aria-label={`Remove ${file.name}`}
-                      title={`Remove ${file.name}`}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        removeAttachedFile(index);
-                      }}
-                      className="absolute right-1 top-1 z-10 flex size-5 items-center justify-center rounded-full border border-black/5 bg-white/95 text-[#292b30] shadow-sm transition hover:bg-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
-                    >
-                      <X aria-hidden="true" className="size-3.5" strokeWidth={2} />
-                    </button>
-                  </article>
-                );
-              })}
-            </div>
-          )}
           <form
             aria-label="Send message"
             className="rounded-[25px] border border-[#e5e6e9] bg-white p-1 shadow-[0_2px_10px_rgba(20,24,32,0.05)]"
@@ -2201,6 +2132,75 @@ export function App() {
               event.preventDefault();
             }}
           >
+            {attachedMedia.length > 0 && (
+              <div
+                aria-label="Files ready to upload"
+                className="grid max-w-full grid-flow-col auto-cols-[76px] gap-2 overflow-x-auto overflow-y-hidden overscroll-x-contain px-2 pb-1 pt-2 sm:auto-cols-[84px]"
+              >
+                {attachedMedia.map((file, index) => {
+                  const isPreviewable =
+                    file.type.startsWith("image/") || file.type.startsWith("video/");
+                  const preview = mediaPreviews.get(file);
+
+                  return (
+                    <article
+                      key={`${file.name}-${file.lastModified}-${index}`}
+                      aria-label={`Attached file: ${file.name}`}
+                      className="relative aspect-square min-w-0 overflow-hidden rounded-xl border border-[#e5e6e9] bg-[#f4f5f7]"
+                      title={file.name}
+                    >
+                      <button
+                        type="button"
+                        aria-label={`Open ${file.name}`}
+                        onClick={() => void openAttachment(index)}
+                        className="absolute inset-0 flex size-full items-center justify-center overflow-hidden text-left"
+                      >
+                        {isPreviewable && preview ? (
+                          file.type.startsWith("video/") ? (
+                            <video
+                              src={preview}
+                              muted
+                              loop
+                              autoPlay
+                              playsInline
+                              preload="metadata"
+                              aria-label={`Preview of ${file.name}`}
+                              className="size-full object-cover"
+                            />
+                          ) : (
+                            <img
+                              src={preview}
+                              alt={file.name}
+                              className="size-full object-cover"
+                            />
+                          )
+                        ) : (
+                          <div
+                            className={`flex size-full items-center justify-center ${fileTileColor(file)}`}
+                          >
+                            <span className="max-w-full truncate px-1 text-center text-[11px] font-bold tracking-wide">
+                              {fileExtension(file)}
+                            </span>
+                          </div>
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Remove ${file.name}`}
+                        title={`Remove ${file.name}`}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          removeAttachedFile(index);
+                        }}
+                        className="absolute right-1 top-1 z-10 flex size-5 items-center justify-center rounded-full border border-black/5 bg-white/95 text-[#292b30] shadow-sm transition hover:bg-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
+                      >
+                        <X aria-hidden="true" className="size-3.5" strokeWidth={2} />
+                      </button>
+                    </article>
+                  );
+                })}
+              </div>
+            )}
             <div className="flex min-h-[52px] items-center px-3">
               <textarea
                 ref={messageInputRef}
