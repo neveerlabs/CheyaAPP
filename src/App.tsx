@@ -30,6 +30,7 @@ import {
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import cheyaLogo from "../assets/circle.png";
 import { AccountLogin } from "./AccountLogin";
+import { LinkPreviews } from "./components/LinkPreviews";
 import {
   generateThinkingSummary,
   generateGeminiConversation,
@@ -145,9 +146,6 @@ export function App() {
   const [isThinkMode, setIsThinkMode] = useState(false);
   const [thinkingSteps, setThinkingSteps] = useState<string[]>([]);
   const [expandedThinkingIds, setExpandedThinkingIds] = useState<Set<string>>(() => new Set());
-  const LinkPreviews = lazy(() =>
-    import("./components/LinkPreviews").then((module) => ({ default: module.LinkPreviews })),
-  );
   const [ratings, setRatings] = useState<Record<string, AssistantRating>>({});
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [reportTarget, setReportTarget] = useState<ReportTarget | null>(null);
@@ -1855,26 +1853,18 @@ export function App() {
                       <Suspense fallback={<p className="m-0 whitespace-pre-wrap">{visibleText}</p>}>
                         <AssistantMarkdown content={visibleText} userMessage />
                       </Suspense>
-                      <Suspense fallback={null}>
-                        <LinkPreviews
-                          content={visibleText}
-                          client={authClient}
-                          userMessage
-                        />
-                      </Suspense>
+                      <LinkPreviews
+                        content={visibleText}
+                        client={authClient}
+                        userMessage
+                      />
                     </div>
-                    {chatJob && (
+                    {chatJob && (chatJob.status === "failed" || chatJob.error) && (
                       <p
-                        role={chatJob.status === "failed" || chatJob.error ? "alert" : "status"}
-                        className={`mt-1 max-w-[88%] text-xs ${
-                          chatJob.status === "failed" || chatJob.error
-                            ? "text-red-700"
-                            : "text-[#747780]"
-                        }`}
+                        role="alert"
+                        className="mt-1 max-w-[88%] text-xs text-red-700"
                       >
-                        {chatJob.status === "failed" || chatJob.error
-                          ? chatJob.error || "Cheya could not complete this response."
-                          : chatJob.progress || "Cheya is preparing a reply…"}
+                        {chatJob.error || "Cheya could not complete this response."}
                       </p>
                     )}
                     {versionControls && (
@@ -1979,9 +1969,7 @@ export function App() {
                       />
                     </Suspense>
                     {!animateAssistant && (
-                      <Suspense fallback={null}>
-                        <LinkPreviews content={visibleText} client={authClient} />
-                      </Suspense>
+                      <LinkPreviews content={visibleText} client={authClient} />
                     )}
                   </div>
                   <div
@@ -2076,20 +2064,25 @@ export function App() {
                 ))}
               </div>
             )}
-            {isSending &&
-              ((activeChatJob?.thinking_mode ?? isThinkMode) ||
-                activeChatJob?.progress.startsWith("Action:") ||
-                thinkingSteps.length > 0) && (
+            {isSending && (
               <div
                 role="status"
                 aria-live="polite"
-                className="w-full space-y-1.5 rounded-2xl border border-[#ece9f5] bg-[#faf9fd] px-3.5 py-3 text-xs text-[#747780]"
+                className={`w-full min-w-0 text-xs text-[#747780] ${
+                  activeChatJob?.thinking_mode ?? isThinkMode
+                    ? "space-y-1.5 rounded-2xl border border-[#ece9f5] bg-[#faf9fd] px-3.5 py-3"
+                    : "flex justify-start px-1 py-1"
+                }`}
               >
-                <p className="font-medium text-[#4b4e55]">
-                  {activeChatJob?.progress || thinkingSteps[0] || "Reviewing the request…"}
-                </p>
-                {(activeChatJob?.thinking_mode ?? isThinkMode) &&
-                  thinkingSteps.map((step) => <p key={step}>{step}</p>)}
+                {activeChatJob?.thinking_mode ?? isThinkMode ? (
+                  <p className="font-medium text-[#4b4e55]">
+                    {activeChatJob?.progress ||
+                      thinkingSteps[thinkingSteps.length - 1] ||
+                      "Reviewing the request…"}
+                  </p>
+                ) : (
+                  <p>{activeChatJob?.progress || "Cheya is preparing a reply…"}</p>
+                )}
               </div>
             )}
             {!hasGeminiApiKey && !isLoadingHistory && (

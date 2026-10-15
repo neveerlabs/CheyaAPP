@@ -116,14 +116,21 @@ function LinkPreview({
   if (loading) {
     return (
       <div
-        className={`flex w-full min-w-0 items-center gap-2 overflow-hidden rounded-xl border px-3 py-2 text-xs ${
+        className={`min-h-[19rem] w-full min-w-0 overflow-hidden rounded-xl border text-xs ${
           userMessage
             ? "border-white/15 bg-white/5 text-white/70"
             : "border-[#e5e6e9] bg-[#f7f8fa] text-[#747780]"
         }`}
       >
-        <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
-        Loading link preview…
+        <div className="flex h-40 w-full items-center justify-center bg-black/5">
+          <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+        </div>
+        <div className="space-y-2 p-2.5">
+          <div className="h-2 w-1/4 rounded bg-current opacity-15" />
+          <div className="h-3 w-3/4 rounded bg-current opacity-15" />
+          <div className="h-2 w-1/2 rounded bg-current opacity-15" />
+          <div className="h-2 w-2/3 rounded bg-current opacity-15" />
+        </div>
       </div>
     );
   }
@@ -133,15 +140,19 @@ function LinkPreview({
         href={url}
         target="_blank"
         rel="noreferrer"
-        className={`flex w-full min-w-0 items-center gap-2 overflow-hidden rounded-xl border px-3 py-2 text-xs ${
+        className={`flex min-h-[19rem] w-full min-w-0 flex-col overflow-hidden rounded-xl border text-xs ${
           userMessage
             ? "border-white/15 bg-white/5 text-white/80"
             : "border-[#e5e6e9] bg-[#f7f8fa] text-[#555861]"
         }`}
       >
-        <Link2 aria-hidden="true" className="size-4 shrink-0" />
-        <span className="min-w-0 flex-1 break-all line-clamp-2">{url}</span>
-        <ExternalLink aria-hidden="true" className="size-3.5 shrink-0" />
+        <div className="flex h-40 w-full items-center justify-center bg-black/5">
+          <Link2 aria-hidden="true" className="size-5 opacity-60" />
+        </div>
+        <div className="flex min-h-24 min-w-0 flex-1 items-center gap-2 p-2.5">
+          <span className="min-w-0 flex-1 break-all line-clamp-2">{url}</span>
+          <ExternalLink aria-hidden="true" className="size-3.5 shrink-0" />
+        </div>
       </a>
     );
   }
@@ -150,29 +161,33 @@ function LinkPreview({
     preview.videoUrl && /\.(mp4|webm|ogv)(?:$|[?#])/i.test(preview.videoUrl);
   return (
     <div
-      className={`w-full min-w-0 max-w-full overflow-hidden rounded-xl border text-left ${
+      className={`min-h-[19rem] w-full min-w-0 max-w-full overflow-hidden rounded-xl border text-left ${
         userMessage
           ? "border-white/20 bg-black/10 text-white"
           : "border-[#e5e6e9] bg-[#f7f8fa] text-[#282a30]"
       }`}
     >
-      {isPlayableVideo ? (
-        <video
-          src={preview.videoUrl ?? undefined}
-          poster={preview.imageUrl ?? undefined}
-          controls
-          preload="metadata"
-          className="block max-h-48 w-full bg-black object-contain"
-        />
-      ) : preview.imageUrl ? (
-        <img
-          src={preview.imageUrl}
-          alt=""
-          loading="lazy"
-          referrerPolicy="no-referrer"
-          className="block max-h-48 w-full bg-black/10 object-cover"
-        />
-      ) : null}
+      <div className="relative flex h-40 w-full items-center justify-center overflow-hidden bg-black/5">
+        {isPlayableVideo ? (
+          <video
+            src={preview.videoUrl ?? undefined}
+            poster={preview.imageUrl ?? undefined}
+            controls
+            preload="metadata"
+            className="absolute inset-0 block h-full w-full bg-black object-contain"
+          />
+        ) : preview.imageUrl ? (
+          <img
+            src={preview.imageUrl}
+            alt=""
+            loading="lazy"
+            referrerPolicy="no-referrer"
+            className="absolute inset-0 block h-full w-full object-cover"
+          />
+        ) : (
+          <Link2 aria-hidden="true" className="size-5 opacity-40" />
+        )}
+      </div>
       <div className="p-2.5">
         <p className={`truncate text-[10px] ${userMessage ? "text-white/65" : "text-[#777a82]"}`}>
           {preview.siteName}
