@@ -936,16 +936,6 @@ export async function generateGeminiConversation(
         }
         await context.onToolActivity?.(call.name);
         const result = await context.executeTool(call.name, call.args ?? {}, currentKey);
-        if (
-          typeof result === "object" &&
-          result !== null &&
-          "diagnostics" in result &&
-          Array.isArray(result.diagnostics)
-        ) {
-          for (const diagnostic of result.diagnostics) {
-            if (typeof diagnostic === "string") toolErrors.push(diagnostic);
-          }
-        }
         functionResponses.push({
           functionResponse: {
             name: call.name,

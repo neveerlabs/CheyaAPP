@@ -300,14 +300,13 @@ async function googleGroundedSearch(
         findings: result.findings,
       };
     } catch (error) {
-      errors.push(
-        `${key.id}: ${error instanceof Error ? error.message : "Unknown provider error."}`,
-      );
+      errors.push(error instanceof Error ? error.message : "Unknown provider error.");
     }
   }
+  const uniqueErrors = [...new Set(errors)];
   throw new Error(
-    errors.length > 0
-      ? `Google Search grounding failed for every configured Gemini key. ${errors.join(" ")}`
+    uniqueErrors.length > 0
+      ? `Google Search grounding failed for every configured Gemini key. ${uniqueErrors.join(" ")}`
       : "Google Search grounding has no configured Gemini keys.",
   );
 }
@@ -325,7 +324,14 @@ async function searchAlternativeProviders(
     ...(getServerEnvironmentVariable("TINYFISH_API_KEY")
       ? [{ name: "TinyFish", search: tinyFishSearch }]
       : []),
-    { name: "Google Search grounding", search: (query) => googleGroundedSearch(query, keys) },
+    ...(keys.length > 0
+      ? [
+          {
+            name: "Google Search grounding",
+            search: (query: string) => googleGroundedSearch(query, keys),
+          },
+        ]
+      : []),
     { name: "DuckDuckGo", search: duckDuckGoSearch },
     ...(getServerEnvironmentVariable("TAVILY_API_KEY")
       ? [{ name: "Tavily", search: tavilySearch }]
@@ -341,7 +347,8 @@ async function searchAlternativeProviders(
   const usedProviders = new Set<string>();
   const sources: WebSearchSource[] = [];
   const findings: string[] = [];
-  const providerErrors: string[] = [];
+  const providerErrors = new Map<string, string>();
+  const unavailableProviders = new Set<string>();
   const fallbackModifiers = [
     "official documentation and primary sources",
     "latest verified details and dates",
@@ -354,6 +361,7 @@ async function searchAlternativeProviders(
     let passCompleted = false;
     for (let offset = 0; offset < providers.length; offset += 1) {
       const provider = providers[(pass - 1 + offset) % providers.length];
+      if (unavailableProviders.has(provider.name)) continue;
       try {
         const result = await provider.search(refinedQuery);
         if (result.sources.length === 0) {
@@ -365,22 +373,29 @@ async function searchAlternativeProviders(
         passCompleted = true;
         break;
       } catch (error) {
-        providerErrors.push(
-          `${provider.name} pass ${pass}: ${
-            error instanceof Error ? error.message : "Unknown provider error."
-          }`,
+        const message = error instanceof Error ? error.message : "Unknown provider error.";
+        providerErrors.set(
+          provider.name,
+          `${provider.name} pass ${pass}: ${message}`,
         );
+        if (/HTTP (?:401|403|429)\b|quota|rate.?limit|billing/i.test(message)) {
+          unavailableProviders.add(provider.name);
+        }
         continue;
       }
     }
-    if (!passCompleted) continue;
+    if (!passCompleted) {
+      if (providers.every((provider) => unavailableProviders.has(provider.name))) break;
+      continue;
+    }
     if (pass < 5) {
       try {
         refinedQuery = await retryProvider("Gemini query refinement", () =>
           refineGeminiWebQuery(keys, query, refinedQuery, findings),
         );
       } catch (error) {
-        providerErrors.push(
+        providerErrors.set(
+          "Gemini query refinement",
           `Gemini query refinement after pass ${pass}: ${
             error instanceof Error ? error.message : "Unknown refinement error."
           }`,
@@ -393,14 +408,14 @@ async function searchAlternativeProviders(
   const unique = uniqueSources(sources);
   if (unique.length < 3) {
     throw new Error(
-      `Alternative providers returned only ${unique.length} distinct source(s) across five refinement passes. ${providerErrors.slice(-6).join(" ")}`,
+      `Alternative providers returned only ${unique.length} distinct source(s) across five refinement passes. ${[...providerErrors.values()].join(" ")}`,
     );
   }
   return {
     providers: [...usedProviders],
     sources: unique,
     findings,
-    diagnostics: providerErrors.slice(-15),
+    diagnostics: [...providerErrors.values()],
   };
 }
 
