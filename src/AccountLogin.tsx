@@ -216,10 +216,10 @@ export function AccountLogin({ client, error: initialError }: AccountLoginProps)
   }
 
   return (
-    <main className="fixed inset-0 flex items-center justify-center bg-[#f5f6f8] p-4">
+    <main className="fixed inset-0 flex flex-col items-center justify-start gap-4 overflow-y-auto bg-[#f5f6f8] px-4 py-6 sm:justify-center">
       <section
         aria-labelledby="account-login-title"
-        className="w-full max-w-md rounded-[28px] border border-[#e7e8eb] bg-white p-6 shadow-sm sm:p-8"
+        className="w-full max-w-md shrink-0 rounded-[28px] border border-[#e7e8eb] bg-white p-6 shadow-sm sm:p-8"
       >
         <div className="mx-auto size-14 overflow-hidden rounded-full border border-[#e7e8eb] bg-white shadow-sm">
           <img
@@ -345,6 +345,14 @@ export function AccountLogin({ client, error: initialError }: AccountLoginProps)
           </div>
         )}
       </section>
+      <nav aria-label="Legal information" className="flex shrink-0 items-center gap-4 pb-2 text-xs text-[#777a81]">
+        <a href="/privacy" className="hover:text-[#25262a] hover:underline">
+          Kebijakan Privasi
+        </a>
+        <a href="/terms" className="hover:text-[#25262a] hover:underline">
+          Ketentuan Layanan
+        </a>
+      </nav>
     </main>
   );
 }
