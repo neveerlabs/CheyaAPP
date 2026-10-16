@@ -4,14 +4,11 @@ import {
   executeChatDataTool,
   findRelevantContext,
   loadRecentAssistantFeedback,
-  loadRecentChatMessages,
-  loadRecentInsights,
-  saveUserMemory,
+  loadChatMessagePage,
+  loadInsightsForMessages,
   saveChatBranch,
-  saveMessageInsight,
 } from "../src/lib/chat-data";
 import {
-  analyzeGeminiMessage,
   generateGeminiConversation,
   generateThinkingSummary,
   GeminiFailoverError,
@@ -134,42 +131,90 @@ async function processChatJob(jobId: string) {
   const attempts: GeminiAttempt[] = [];
   const warnings: string[] = [];
 
-  let messageEmbedding: number[] | null = null;
-  try {
-    messageEmbedding = await createEmbedding(
-      typedKeys[0].api_key,
-      userMessage.content,
-      "RETRIEVAL_DOCUMENT",
-    );
-    const serialized = `[${messageEmbedding.join(",")}]`;
-    const { error: messageUpdateError } = await client
-      .from("chat_messages")
-      .update({ embedding: serialized })
-      .eq("id", userMessage.id)
-      .eq("user_id", job.user_id);
-    if (messageUpdateError) throw messageUpdateError;
-    const { error: versionUpdateError } = await client
-      .from("chat_message_versions")
-      .update({ embedding: serialized })
-      .eq("message_id", userMessage.id)
-      .eq("user_id", job.user_id)
-      .eq("version_number", userMessage.version_number);
-    if (versionUpdateError) throw versionUpdateError;
-  } catch (error) {
+  const [documentEmbeddingResult, queryEmbeddingResult] = await Promise.allSettled([
+    createEmbedding(typedKeys[0].api_key, userMessage.content, "RETRIEVAL_DOCUMENT"),
+    createEmbedding(typedKeys[0].api_key, userMessage.content, "RETRIEVAL_QUERY"),
+  ]);
+  const messageEmbedding: number[] | null =
+    documentEmbeddingResult.status === "fulfilled" ? documentEmbeddingResult.value : null;
+  const queryEmbedding =
+    queryEmbeddingResult.status === "fulfilled"
+      ? queryEmbeddingResult.value
+      : messageEmbedding;
+  if (documentEmbeddingResult.status === "fulfilled") {
+    try {
+      const serialized = `[${documentEmbeddingResult.value.join(",")}]`;
+      const { error: messageUpdateError } = await client
+        .from("chat_messages")
+        .update({ embedding: serialized })
+        .eq("id", userMessage.id)
+        .eq("user_id", job.user_id);
+      if (messageUpdateError) throw messageUpdateError;
+      const { error: versionUpdateError } = await client
+        .from("chat_message_versions")
+        .update({ embedding: serialized })
+        .eq("message_id", userMessage.id)
+        .eq("user_id", job.user_id)
+        .eq("version_number", userMessage.version_number);
+      if (versionUpdateError) throw versionUpdateError;
+    } catch (error) {
+      warnings.push(
+        `The message was saved without a searchable embedding: ${
+          error instanceof Error ? error.message : "Could not save its embedding."
+        }`,
+      );
+    }
+  } else {
     warnings.push(
       `The message was saved without a searchable embedding: ${
-        error instanceof Error ? error.message : "Could not create its embedding."
+        documentEmbeddingResult.reason instanceof Error
+          ? documentEmbeddingResult.reason.message
+          : "Could not create its embedding."
+      }`,
+    );
+  }
+  if (queryEmbeddingResult.status === "rejected" && messageEmbedding) {
+    warnings.push("Personal context retrieval is using the message embedding as a fallback.");
+  }
+
+  await updateJob(jobId, job.user_id, {
+    progress: "Checking the active conversation and matching relevant personal context…",
+  });
+  const history = (await loadChatMessagePage(client, { limit: 20, userId: job.user_id })).messages
+    .filter((item) => item.id !== userMessage.id)
+    .slice(-12);
+  const contextResult: PromiseSettledResult<Awaited<ReturnType<typeof findRelevantContext>>> =
+    queryEmbedding
+      ? await Promise.allSettled([
+          findRelevantContext(client, queryEmbedding, userMessage.id, undefined, job.user_id),
+        ]).then(([result]) => result)
+      : {
+          status: "rejected",
+          reason: new Error("No query embedding was available for personal context retrieval."),
+        };
+  let retrievedMessages: Awaited<ReturnType<typeof findRelevantContext>>["messages"] = [];
+  let memories: Awaited<ReturnType<typeof findRelevantContext>>["memories"] = [];
+  if (contextResult.status === "fulfilled") {
+    retrievedMessages = contextResult.value.messages;
+    memories = contextResult.value.memories;
+  } else {
+    warnings.push(
+      `Semantic chat context could not be loaded: ${
+        contextResult.reason instanceof Error
+          ? contextResult.reason.message
+          : "Unknown retrieval error."
       }`,
     );
   }
 
-  await updateJob(jobId, job.user_id, {
-    progress: "Analyzing the complete message and retrieving relevant context…",
-  });
-  const history = (await loadRecentChatMessages(client, 20, job.user_id))
-    .filter((item) => item.id !== userMessage.id)
-    .slice(-12);
-  const attachmentMessageIds = [...history.map((item) => item.id), userMessage.id];
+  const relevantUserMessageIds = retrievedMessages
+    .filter((item) => item.role === "user")
+    .slice(0, 4)
+    .map((item) => item.id);
+  const attachmentMessageIds = [
+    userMessage.id,
+    ...relevantUserMessageIds,
+  ];
   const { data: savedAttachments, error: attachmentsError } = await client
     .from("chat_message_attachments")
     .select("id, file_name, mime_type, storage_path, message_id, created_at, expires_at, deleted_at")
@@ -183,27 +228,51 @@ async function processChatJob(jobId: string) {
   const currentAttachments = savedAttachments.filter(
     (attachment) => attachment.message_id === userMessage.id,
   );
-  const earlierAttachments = savedAttachments.filter(
-    (attachment) => attachment.message_id !== userMessage.id,
+  const messageRelevance = new Map(relevantUserMessageIds.map((id, index) => [id, index]));
+  const relevantMediaAttachments = savedAttachments.filter(
+    (attachment) =>
+      attachment.message_id !== null &&
+      attachment.message_id !== userMessage.id &&
+      /^(image|video)\//i.test(attachment.mime_type),
+  )
+    .sort(
+      (first, second) =>
+        (messageRelevance.get(first.message_id ?? "") ?? Number.MAX_SAFE_INTEGER) -
+          (messageRelevance.get(second.message_id ?? "") ?? Number.MAX_SAFE_INTEGER) ||
+        second.created_at.localeCompare(first.created_at),
+    )
+    .slice(0, 3);
+  const relevantMessageTime = new Map(
+    retrievedMessages.map((item) => [item.id, item.created_at]),
   );
-  const attachmentsForModel = [...currentAttachments, ...earlierAttachments]
+  const attachmentsForModel = [
+    ...currentAttachments,
+    ...relevantMediaAttachments,
+  ]
     .slice(0, MAX_GEMINI_CONTEXT_ATTACHMENTS)
-    .map<GeminiAttachmentReference>((attachment) => {
-      const sourceMessage = history.find((item) => item.id === attachment.message_id);
-      return {
-        id: attachment.id,
-        fileName: attachment.file_name,
-        mimeType: attachment.mime_type,
-        storagePath: attachment.storage_path,
-        messageCreatedAt: sourceMessage?.created_at ?? userMessage.created_at,
-      };
-    });
-  const assistantIds = history
-    .filter((item) => item.role === "assistant")
-    .map((item) => item.id);
+    .map<GeminiAttachmentReference>((attachment) => ({
+      id: attachment.id,
+      fileName: attachment.file_name,
+      mimeType: attachment.mime_type,
+      storagePath: attachment.storage_path,
+      messageCreatedAt:
+        attachment.message_id === userMessage.id
+          ? userMessage.created_at
+          : (attachment.message_id
+              ? relevantMessageTime.get(attachment.message_id)
+              : undefined) ?? attachment.created_at,
+    }));
+  const candidateMessageIds = [
+    ...retrievedMessages.map((item) => item.id),
+    ...history.map((item) => item.id),
+  ];
+  const assistantIds = [
+    ...retrievedMessages.filter((item) => item.role === "assistant").map((item) => item.id),
+    ...history.filter((item) => item.role === "assistant").map((item) => item.id),
+  ];
   const [feedbackResult, insightsResult] = await Promise.allSettled([
-    loadRecentAssistantFeedback(client, assistantIds, 8, job.user_id),
-    loadRecentInsights(client, 12, userMessage.id, undefined, job.user_id),
+    loadRecentAssistantFeedback(client, [...new Set(assistantIds)], 32, job.user_id),
+    loadInsightsForMessages(client, [...new Set(candidateMessageIds)], job.user_id, 20),
   ]);
 
   let feedback: Awaited<ReturnType<typeof loadRecentAssistantFeedback>> = [];
@@ -216,7 +285,7 @@ async function processChatJob(jobId: string) {
     );
   }
 
-  let insights: Awaited<ReturnType<typeof loadRecentInsights>> = [];
+  let insights: Awaited<ReturnType<typeof loadInsightsForMessages>> = [];
   if (insightsResult.status === "fulfilled") insights = insightsResult.value;
   else {
     warnings.push(
@@ -225,86 +294,35 @@ async function processChatJob(jobId: string) {
       }`,
     );
   }
-  let currentInsight:
-    | Awaited<ReturnType<typeof analyzeGeminiMessage>>["insight"]
-    | undefined;
-  let memoryCandidate: Awaited<ReturnType<typeof analyzeGeminiMessage>>["memory"] = null;
-  let insightKeyIndex = 0;
-  try {
-    const analysis = await analyzeGeminiMessage(
-      typedKeys,
-      userMessage.content,
-      0,
-      history.map(({ role, content, created_at }) => ({ role, content, created_at })),
-      userMessage.created_at,
-    );
-    currentInsight = analysis.insight;
-    memoryCandidate = analysis.memory;
-    insightKeyIndex = analysis.keyIndex;
-    attempts.push(...analysis.attempts);
-  } catch (error) {
-    if (error instanceof GeminiFailoverError) attempts.push(...error.attempts);
-    warnings.push(
-      `Message insight and memory analysis failed: ${
-        error instanceof Error ? error.message : "Unknown analysis error."
-      }`,
-    );
-  }
-  if (currentInsight?.summary.trim()) {
-    try {
-      await saveMessageInsight(client, userMessage.id, currentInsight, job.user_id);
-      insights = [
-        ...insights,
-        { ...currentInsight, created_at: userMessage.created_at },
-      ];
-    } catch (error) {
-      warnings.push(
-        `Message insight could not be saved: ${
-          error instanceof Error ? error.message : "Unknown database error."
-        }`,
-      );
-    }
-  }
-  if (memoryCandidate) {
-    try {
-      await saveUserMemory(
-        client,
-        typedKeys[insightKeyIndex].api_key,
-        memoryCandidate.content,
-        memoryCandidate.category,
-        job.user_id,
-        userMessage.id,
-      );
-    } catch (error) {
-      warnings.push(
-        `A durable memory was identified but could not be saved: ${
-          error instanceof Error ? error.message : "Unknown database error."
-        }`,
-      );
+  if (feedbackResult.status === "fulfilled" && insightsResult.status === "fulfilled") {
+    const candidateMessageIdSet = new Set(candidateMessageIds);
+    const ratedRequestIds = [
+      ...new Set(
+        feedbackResult.value
+          .map((item) => item.requestMessageId)
+          .filter((id): id is string => id !== null && !candidateMessageIdSet.has(id)),
+      ),
+    ];
+    if (ratedRequestIds.length > 0) {
+      try {
+        const ratedInsights = await loadInsightsForMessages(
+          client,
+          ratedRequestIds,
+          job.user_id,
+          8,
+        );
+        insights = [...ratedInsights, ...insights];
+      } catch (error) {
+        warnings.push(
+          `Insights linked to rated replies could not be loaded: ${
+            error instanceof Error ? error.message : "Unknown error."
+          }`,
+        );
+      }
     }
   }
 
-  let relevantMessages: Array<{ role: "user" | "assistant"; content: string }> = [];
-  let memories: Array<{ category: string; content: string }> = [];
-  if (messageEmbedding) {
-    try {
-      const context = await findRelevantContext(
-        client,
-        messageEmbedding,
-        userMessage.id,
-        undefined,
-        job.user_id,
-      );
-      relevantMessages = context.messages;
-      memories = context.memories;
-    } catch (error) {
-      warnings.push(
-        `Semantic chat context could not be loaded: ${
-          error instanceof Error ? error.message : "Unknown retrieval error."
-        }`,
-      );
-    }
-  }
+  const relevantMessages = retrievedMessages;
 
   await updateJob(jobId, job.user_id, {
     progress: job.thinking_mode
@@ -314,7 +332,7 @@ async function processChatJob(jobId: string) {
   const result = await generateGeminiConversation(
     typedKeys,
     userMessage.content,
-    insightKeyIndex,
+    0,
     personalization,
     {
       thinkingMode: job.thinking_mode,
@@ -323,7 +341,7 @@ async function processChatJob(jobId: string) {
       history: history.map(({ role, content, created_at }) => ({ role, content, created_at })),
       relevantMessages,
       memories,
-      insights: insights.slice(-12),
+      insights: insights.slice(0, 12),
       feedback,
       attachments: attachmentsForModel,
       prepareAttachments: (key, attachments) =>

@@ -63,10 +63,9 @@ function loadGoogleIdentitySdk(): Promise<void> {
 interface AccountLoginProps {
   client: AppSupabaseClient | null;
   error: string;
-  onBack?: () => void;
 }
 
-export function AccountLogin({ client, error: initialError, onBack }: AccountLoginProps) {
+export function AccountLogin({ client, error: initialError }: AccountLoginProps) {
   const [captchaToken, setCaptchaToken] = useState<string | null>(null);
   const [captchaRound, setCaptchaRound] = useState(0);
   const [accessCode, setAccessCode] = useState<string[]>(Array(6).fill(""));
@@ -346,17 +345,12 @@ export function AccountLogin({ client, error: initialError, onBack }: AccountLog
           </div>
         )}
       </section>
-      <nav aria-label="Account and legal links" className="flex shrink-0 items-center gap-4 pb-2 text-xs text-[#777a81]">
-        {onBack && (
-          <button type="button" onClick={onBack} className="hover:text-[#25262a] hover:underline">
-            Back
-          </button>
-        )}
+      <nav aria-label="Legal links" className="flex shrink-0 items-center justify-center gap-5 pb-2 text-xs text-[#777a81]">
         <a href="/privacy" className="hover:text-[#25262a] hover:underline">
-          Kebijakan Privasi
+          Privacy Policy
         </a>
         <a href="/terms" className="hover:text-[#25262a] hover:underline">
-          Ketentuan Layanan
+          Terms of Service
         </a>
       </nav>
     </main>

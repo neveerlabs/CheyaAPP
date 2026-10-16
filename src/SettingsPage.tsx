@@ -21,7 +21,7 @@ import { generateGeminiReply, GeminiFailoverError } from "./lib/gemini";
 import {
   DEFAULT_PERSONALIZATION,
   ensureSupabaseSession,
-  GEMINI_MODELS,
+  MULTIMODAL_GEMINI_MODELS,
   saveApiStatus,
   type ApiStatus,
   type AppSupabaseClient,
@@ -106,7 +106,7 @@ export function SettingsPage({
   const [personalization, setPersonalization] =
     useState<PersonalizationSettings>(DEFAULT_PERSONALIZATION);
   const [personalizationError, setPersonalizationError] = useState("");
-  const [selectedModel, setSelectedModel] = useState<GeminiModel>(GEMINI_MODELS[0]);
+  const selectedModel: GeminiModel = MULTIMODAL_GEMINI_MODELS[0];
   const [newApiKey, setNewApiKey] = useState("");
   const [isHelpOpen, setIsHelpOpen] = useState(false);
   const [isSavingPersonalization, setIsSavingPersonalization] = useState(false);
@@ -126,6 +126,7 @@ export function SettingsPage({
   const [isLoadingMemories, setIsLoadingMemories] = useState(false);
   const [isSavingMemory, setIsSavingMemory] = useState(false);
   const [isClearingChats, setIsClearingChats] = useState(false);
+  const [isClearChatsConfirmationOpen, setIsClearChatsConfirmationOpen] = useState(false);
   const settingsContentRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -599,14 +600,7 @@ export function SettingsPage({
   }
 
   async function clearChats() {
-    if (
-      isClearingChats ||
-      !window.confirm(
-        "Delete all chat messages and their conversation insights?\n\nLong-term memories, API keys, and settings will be kept. This cannot be undone.",
-      )
-    ) {
-      return;
-    }
+    if (isClearingChats) return;
     clearMessages();
     setIsClearingChats(true);
     let memoryReferencesDetached = false;
@@ -645,10 +639,10 @@ export function SettingsPage({
   }
 
   return (
-    <main className="fixed inset-0 flex justify-center bg-white">
+    <main className="fixed inset-0 flex justify-center bg-[#f5f6f8]">
       <section
         aria-label="Settings"
-        className="relative h-full w-full max-w-[680px] overflow-hidden bg-white sm:my-5 sm:h-[calc(100%-40px)] sm:rounded-[30px]"
+        className="relative h-full w-full max-w-4xl overflow-hidden bg-[#f5f6f8] sm:my-5 sm:h-[calc(100%-40px)]"
       >
         <header className="absolute inset-x-0 top-0 z-20 flex h-[68px] items-center gap-2 border-0 bg-transparent px-1 shadow-none sm:px-4">
           <button
@@ -659,7 +653,7 @@ export function SettingsPage({
           >
             <ArrowLeft aria-hidden="true" className="size-[21px]" />
           </button>
-          <h1 className="flex h-11 min-w-0 flex-1 items-center rounded-full border border-[#e5e6e9] bg-white px-4 text-lg font-semibold text-[#17181b]">
+          <h1 className="flex h-11 min-w-0 flex-1 items-center gap-2 rounded-full border border-[#e5e6e9] bg-white px-4 text-lg font-semibold text-[#17181b]">
             {activeSection === "home"
               ? "Settings"
               : settingsSections.find((section) => section.id === activeSection)?.label}
@@ -692,18 +686,18 @@ export function SettingsPage({
 
         <div
           ref={settingsContentRef}
-          className="absolute inset-0 overflow-y-auto overscroll-contain bg-transparent px-4 pb-6 pt-[88px] sm:px-6 sm:pb-8"
+          className="absolute inset-0 overflow-y-auto overscroll-contain bg-transparent px-5 pb-8 pt-[68px] sm:px-8 sm:pb-10"
         >
           {activeSection === "home" && (
-            <nav aria-label="Settings pages" className="space-y-3">
+            <nav aria-label="Settings pages" className="divide-y divide-[#dfe2e7]">
               {settingsSections.map(({ id, label, description, icon: Icon }) => (
                 <button
                   key={id}
                   type="button"
                   onClick={() => openSection(id)}
-                  className="flex w-full items-center gap-3 rounded-[22px] border border-[#e6e8eb] bg-white p-4 text-left transition hover:bg-[#f8f9fb] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#9380dc] sm:p-5"
+                  className="flex w-full items-center gap-4 py-5 text-left transition hover:bg-white/50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#9380dc] sm:py-6"
                 >
-                  <span className="flex size-11 shrink-0 items-center justify-center rounded-2xl bg-[#f3efff] text-[#7754ce]">
+                  <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-white text-[#7754ce]">
                     <Icon aria-hidden="true" className="size-5" />
                   </span>
                   <span className="min-w-0 flex-1">
@@ -721,7 +715,7 @@ export function SettingsPage({
           {activeSection === "personal" && (
             <section
               aria-labelledby="personal-settings-title"
-              className="rounded-[24px] border border-[#e6e8eb] p-4 sm:p-5"
+              className="py-6 sm:py-8"
             >
               <div className="mb-4">
                 <h2 id="personal-settings-title" className="font-semibold text-[#202126]">
@@ -753,7 +747,7 @@ export function SettingsPage({
                 <div
                   role="status"
                   aria-label="Loading personal settings"
-                  className="animate-pulse space-y-4"
+                  className="space-y-4"
                 >
                   <div className="h-11 rounded-xl bg-[#f1f2f4]" />
                   <div className="h-28 rounded-xl bg-[#f1f2f4]" />
@@ -853,10 +847,10 @@ export function SettingsPage({
 
           <section
             aria-labelledby="ai-settings-title"
-            className="rounded-[24px] border border-[#e6e8eb] p-4 sm:p-5"
+            className="py-6 sm:py-8"
           >
             <div className="mb-4 flex items-start gap-3">
-              <div className="flex size-10 shrink-0 items-center justify-center rounded-2xl bg-[#f3efff] text-[#7754ce]">
+              <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-white text-[#7754ce]">
                 <KeyRound aria-hidden="true" className="size-5" />
               </div>
               <div className="min-w-0 flex-1">
@@ -882,28 +876,15 @@ export function SettingsPage({
               <>
                 <form
                   aria-label="Add Gemini API key"
-                  className="space-y-3 rounded-2xl bg-[#f7f8fa] p-3.5"
+                  className="space-y-3"
                   onSubmit={addApiKey}
                 >
-                  <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto]">
+                  <div className="flex flex-wrap items-end justify-between gap-3">
                     <label className="block text-xs font-medium text-[#656870]">
                       Gemini model
-                      <select
-                        value={selectedModel}
-                        onChange={(event) => {
-                          const model = GEMINI_MODELS.find(
-                            (candidate) => candidate === event.currentTarget.value,
-                          );
-                          if (model) setSelectedModel(model);
-                        }}
-                        className="mt-1.5 h-11 w-full rounded-xl border border-[#e1e3e7] bg-white px-3 text-sm text-[#26272c] outline-none focus:border-[#9380dc]"
-                      >
-                        {GEMINI_MODELS.map((model) => (
-                          <option key={model} value={model}>
-                            {model}
-                          </option>
-                        ))}
-                      </select>
+                      <p className="mt-1.5 text-sm font-medium text-[#26272c]">
+                        {selectedModel}
+                      </p>
                     </label>
                     <div className="flex items-end text-xs text-[#777a81]">
                       Provider: <span className="ml-1 font-medium text-[#34363b]">Google Gemini</span>
@@ -954,20 +935,20 @@ export function SettingsPage({
                     <div
                       role="status"
                       aria-label="Loading Gemini API keys"
-                      className="animate-pulse space-y-2"
+                      className="space-y-2"
                     >
                       <div className="h-16 rounded-2xl bg-[#f1f2f4]" />
                       <div className="h-16 rounded-2xl bg-[#f1f2f4]" />
                     </div>
                   ) : apiKeys.length === 0 ? (
-                    <p className="rounded-2xl border border-dashed border-[#dfe1e5] px-3 py-4 text-center text-sm text-[#858890]">
+                    <p className="py-4 text-center text-sm text-[#858890]">
                       No Gemini API keys added yet.
                     </p>
                   ) : (
                     apiKeys.map((apiKey, index) => (
                       <article
                         key={apiKey.id}
-                        className="rounded-2xl border border-[#eceef0] px-3.5 py-3"
+                        className="py-4"
                       >
                         <div className="flex items-start gap-2">
                           <div className="min-w-0 flex-1">
@@ -1026,7 +1007,7 @@ export function SettingsPage({
 
           <section
             aria-labelledby="account-settings-title"
-            className="rounded-[24px] border border-[#e6e8eb] p-4 sm:p-5"
+            className="py-6 sm:py-8"
           >
             <div className="mb-4">
               <h2 id="account-settings-title" className="font-semibold text-[#202126]">
@@ -1072,7 +1053,7 @@ export function SettingsPage({
           {activeSection === "memory" && (
             <section
               aria-labelledby="long-term-memory-title"
-              className="rounded-[24px] border border-[#e6e8eb] p-4 sm:p-5"
+              className="py-6 sm:py-8"
             >
               <div className="mb-4">
                 <h2 id="long-term-memory-title" className="font-semibold text-[#202126]">
@@ -1099,12 +1080,12 @@ export function SettingsPage({
               )}
 
               {!isDatabaseReady ? (
-                <div className="animate-pulse space-y-3" aria-label="Loading long-term memories">
+                <div className="space-y-3" aria-label="Loading long-term memories">
                   <div className="h-11 rounded-xl bg-[#f1f2f4]" />
                   <div className="h-24 rounded-2xl bg-[#f1f2f4]" />
                 </div>
               ) : (
-                <form className="space-y-3 rounded-2xl bg-[#f7f8fa] p-3.5" onSubmit={saveMemory}>
+                <form className="space-y-3" onSubmit={saveMemory}>
                   <label className="block text-xs font-medium text-[#656870]">
                     Category
                     <input
@@ -1165,22 +1146,19 @@ export function SettingsPage({
                   <span className="text-xs text-[#888b91]">{memories.length} total</span>
                 </div>
                 {isLoadingMemories ? (
-                  <div className="animate-pulse space-y-2" aria-label="Loading saved memories">
+                  <div className="space-y-2" aria-label="Loading saved memories">
                     {[0, 1, 2].map((item) => (
                       <div key={item} className="h-20 rounded-2xl bg-[#f1f2f4]" />
                     ))}
                   </div>
                 ) : memories.length === 0 ? (
-                  <p className="rounded-2xl border border-dashed border-[#dfe1e5] px-3 py-4 text-center text-sm text-[#858890]">
+                  <p className="py-4 text-center text-sm text-[#858890]">
                     No long-term memories saved yet.
                   </p>
                 ) : (
                   memories.map((memory) => (
-                    <article
-                      key={memory.id}
-                      className="flex items-start gap-3 rounded-2xl border border-[#eceef0] px-3.5 py-3"
-                    >
-                      <div className="min-w-0 flex-1">
+                    <article key={memory.id} className="relative py-4">
+                      <div>
                         <p className="text-[11px] font-medium uppercase tracking-wide text-[#858890]">
                           {memory.category}
                         </p>
@@ -1197,7 +1175,7 @@ export function SettingsPage({
                           setMemoryCategory(memory.category);
                           settingsContentRef.current?.scrollTo({ top: 0, behavior: "smooth" });
                         }}
-                        className="flex size-9 shrink-0 items-center justify-center rounded-full border border-[#e6e8eb] text-[#45474e] hover:bg-[#f7f8fa]"
+                        className="absolute right-11 top-3 flex size-9 items-center justify-center rounded-full border border-[#e6e8eb] bg-white/90 text-[#45474e] shadow-sm hover:bg-white"
                       >
                         <Pencil aria-hidden="true" className="size-4" />
                       </button>
@@ -1205,7 +1183,7 @@ export function SettingsPage({
                         type="button"
                         aria-label={`Delete memory: ${memory.content.slice(0, 40)}`}
                         onClick={() => void deleteMemory(memory)}
-                        className="flex size-9 shrink-0 items-center justify-center rounded-full border border-[#e6e8eb] text-[#777a81] hover:bg-red-50 hover:text-red-700"
+                        className="absolute right-0 top-3 flex size-9 items-center justify-center rounded-full border border-[#e6e8eb] bg-white/90 text-[#777a81] shadow-sm hover:bg-red-50 hover:text-red-700"
                       >
                         <Trash2 aria-hidden="true" className="size-4" />
                       </button>
@@ -1214,7 +1192,7 @@ export function SettingsPage({
                 )}
               </div>
 
-              <div className="mt-6 border-t border-[#eceef0] pt-5">
+              <div className="mt-6 pt-5">
                 <h3 className="text-sm font-semibold text-[#34363b]">Chat history</h3>
                 <p className="mt-1 text-sm leading-5 text-[#777a81]">
                   Clear all chat messages and their insights without removing long-term memories,
@@ -1222,7 +1200,7 @@ export function SettingsPage({
                 </p>
                 <button
                   type="button"
-                  onClick={() => void clearChats()}
+                  onClick={() => setIsClearChatsConfirmationOpen(true)}
                   disabled={isClearingChats || !isDatabaseReady}
                   className="mt-3 flex h-10 items-center justify-center gap-2 rounded-full border border-red-200 px-4 text-sm font-medium text-red-700 transition hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50"
                 >
@@ -1239,6 +1217,55 @@ export function SettingsPage({
         </div>
       </section>
 
+      {isClearChatsConfirmationOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !isClearingChats) {
+              setIsClearChatsConfirmationOpen(false);
+            }
+          }}
+        >
+          <section
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="clear-chats-title"
+            aria-describedby="clear-chats-description"
+            className="w-full max-w-md rounded-[26px] border border-[#e2e4e8] bg-white p-5 shadow-2xl"
+          >
+            <h2 id="clear-chats-title" className="text-base font-semibold text-[#22242a]">
+              Clear all chats?
+            </h2>
+            <p id="clear-chats-description" className="mt-2 text-sm leading-6 text-[#64666d]">
+              This permanently deletes all chat messages and their insights. Long-term memories,
+              API keys, and settings will be kept. This action cannot be undone.
+            </p>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={isClearingChats}
+                onClick={() => setIsClearChatsConfirmationOpen(false)}
+                className="h-10 rounded-full border border-[#e5e6e9] px-4 text-sm font-medium text-[#34363b] hover:bg-[#f7f8fa] disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isClearingChats || !isDatabaseReady}
+                onClick={() => {
+                  setIsClearChatsConfirmationOpen(false);
+                  void clearChats();
+                }}
+                className="flex h-10 items-center gap-2 rounded-full bg-red-700 px-4 text-sm font-medium text-white hover:bg-red-800 disabled:opacity-50"
+              >
+                {isClearingChats && <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />}
+                Clear chats
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
       {isHelpOpen && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4"
@@ -1250,7 +1277,7 @@ export function SettingsPage({
             aria-labelledby="setup-help-title"
             aria-modal="true"
             role="dialog"
-            className="max-h-[min(90dvh,900px)] w-full max-w-[680px] overflow-y-auto rounded-[26px] bg-white p-5 shadow-2xl sm:p-6"
+            className="max-h-[min(90dvh,900px)] w-full max-w-[680px] overflow-y-auto rounded-2xl border border-[#dfe3e8] bg-white p-5 shadow-[0_24px_72px_rgba(20,28,40,0.22)] sm:p-7"
           >
             <header className="mb-5">
               <h2 id="setup-help-title" className="text-lg font-semibold text-[#202126]">
@@ -1262,7 +1289,7 @@ export function SettingsPage({
               </p>
             </header>
 
-            <ol className="space-y-4 text-sm leading-6 text-[#55575e]">
+            <ol className="space-y-3 text-sm leading-6 text-[#55575e]">
               <li>
                 <strong className="text-[#27282d]">1. Create a Gemini API key.</strong>
                 <p className="mt-1">
@@ -1287,15 +1314,20 @@ export function SettingsPage({
               </li>
             </ol>
 
-            <div className="mt-5 rounded-2xl border border-amber-100 bg-amber-50 px-3.5 py-3 text-xs leading-5 text-amber-900">
-              Do not paste Google OAuth credentials, database credentials, or service-role keys
-              here. Account sign-in, bot protection, and database infrastructure are managed by
-              CheyaVerse.
+            <div className="mt-5 rounded-lg border border-amber-200 bg-[#fff9eb] p-4">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-amber-900">
+                Keep credentials private
+              </p>
+              <p className="mt-1.5 text-xs leading-5 text-amber-900">
+                Do not paste Google OAuth credentials, database credentials, or service-role keys
+                here. Account sign-in, bot protection, and database infrastructure are managed by
+                CheyaVerse.
+              </p>
             </div>
             <button
               type="button"
               onClick={() => setIsHelpOpen(false)}
-              className="mt-5 h-11 w-full rounded-xl bg-[#26272c] text-sm font-medium text-white hover:bg-[#3a3b41]"
+              className="mt-5 h-11 w-full rounded-lg bg-[#26272c] text-sm font-medium text-white hover:bg-[#3a3b41]"
             >
               Got it
             </button>

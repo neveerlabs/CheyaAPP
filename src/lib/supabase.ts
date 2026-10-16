@@ -2,10 +2,11 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { ChatAttachment } from "./chat-attachments";
 
 export const DATABASE_CONFIG_KEY = "cheyaverse.supabase.bootstrap";
-export const GEMINI_MODELS = [
-  "gemini-3.1-flash-lite",
+export const MULTIMODAL_GEMINI_MODELS = [
   "gemini-3.5-flash-lite",
 ] as const;
+
+export const GEMINI_MODELS = MULTIMODAL_GEMINI_MODELS;
 
 export type GeminiModel = (typeof GEMINI_MODELS)[number];
 export type ApiStatus = "untested" | "active" | "error";
@@ -850,7 +851,13 @@ export function createSupabaseClient(config: DatabaseConfig): AppSupabaseClient 
   const cachedClient = clients.get(cacheKey);
   if (cachedClient) return cachedClient;
 
-  const client = createClient<Database, "public">(config.url, config.publishableKey);
+  const client = createClient<Database, "public">(config.url, config.publishableKey, {
+    auth: {
+      autoRefreshToken: true,
+      persistSession: true,
+      detectSessionInUrl: true,
+    },
+  });
   clients.set(cacheKey, client);
   return client;
 }

@@ -15,6 +15,33 @@
 
 * {
   box-sizing: border-box;
+  scrollbar-color: rgb(148 153 163 / 55%) transparent;
+  scrollbar-width: thin;
+}
+
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: rgb(148 153 163 / 45%);
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: rgb(116 123 136 / 72%);
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 body {
@@ -22,10 +49,112 @@ body {
   height: 100%;
   margin: 0;
   overflow: hidden;
+  touch-action: pan-x pan-y;
 }
 
 #root {
   height: 100%;
+  touch-action: pan-x pan-y;
+}
+
+.media-preview-stage {
+  touch-action: none;
+}
+
+.media-preview-stage video,
+.media-preview-stage img {
+  transform-origin: center;
+  will-change: transform;
+  backface-visibility: hidden;
+}
+
+.media-seek-feedback {
+  animation-duration: 520ms;
+  animation-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+  animation-fill-mode: both;
+}
+
+.media-seek-feedback-back {
+  animation-name: media-seek-feedback-back;
+}
+
+.media-seek-feedback-forward {
+  animation-name: media-seek-feedback-forward;
+}
+
+@keyframes media-seek-feedback-back {
+  0% {
+    opacity: 0;
+    scale: 0.72;
+    translate: 26px 0;
+  }
+
+  30% {
+    opacity: 1;
+    scale: 1.12;
+    translate: 0 0;
+  }
+
+  70% {
+    opacity: 1;
+    scale: 1;
+    translate: -3px 0;
+  }
+
+  100% {
+    opacity: 0;
+    scale: 0.9;
+    translate: -22px 0;
+  }
+}
+
+@keyframes media-seek-feedback-forward {
+  0% {
+    opacity: 0;
+    scale: 0.72;
+    translate: -26px 0;
+  }
+
+  30% {
+    opacity: 1;
+    scale: 1.12;
+    translate: 0 0;
+  }
+
+  70% {
+    opacity: 1;
+    scale: 1;
+    translate: 3px 0;
+  }
+
+  100% {
+    opacity: 0;
+    scale: 0.9;
+    translate: 22px 0;
+  }
+}
+
+.media-preview-seek {
+  touch-action: pan-x;
+}
+
+.public-home-background {
+  background:
+    radial-gradient(ellipse at 0% 0%, rgb(48 160 235 / 68%), transparent 54%),
+    radial-gradient(ellipse at 100% 100%, rgb(126 98 235 / 62%), transparent 54%),
+    linear-gradient(135deg, #f8fbff 0%, #fbfaff 54%, #fcfbff 100%);
+  background-size: 100% 100%, 100% 100%, 100% 100%;
+  animation: public-home-color-drift 18s ease-in-out infinite alternate;
+}
+
+@keyframes public-home-color-drift {
+  from {
+    background-size: 100% 100%, 100% 100%, 100% 100%;
+  }
+
+  to {
+    background-size: 112% 112%, 112% 112%, 100% 100%;
+  }
 }
 
 button,
@@ -80,7 +209,51 @@ input {
   animation: chat-attachment-upload-fill 1.6s cubic-bezier(0.45, 0, 0.55, 1) infinite;
 }
 
+.camera-capture-dialog {
+  height: 100dvh;
+  width: 100%;
+}
+
+.camera-mobile-control {
+  display: flex;
+}
+
+.camera-desktop-close {
+  display: none;
+}
+
+.camera-desktop-switch-control {
+  display: flex;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .camera-mobile-control {
+    display: none;
+  }
+
+  .camera-desktop-close {
+    display: flex;
+  }
+
+  .camera-desktop-switch-control {
+    display: flex;
+  }
+}
+
+@media (min-width: 640px) {
+  .camera-capture-dialog {
+    aspect-ratio: 16 / 9;
+    height: auto;
+    max-height: 82dvh;
+    width: min(92vw, calc(82dvh * 16 / 9));
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
+  .public-home-background {
+    animation: none;
+  }
+
   .attachment-upload-progress {
     height: 100%;
     animation: none;
@@ -88,5 +261,11 @@ input {
 
   .chat-loading-skeleton {
     animation: none;
+  }
+
+  .media-seek-feedback,
+  .media-seek-feedback-back,
+  .media-seek-feedback-forward {
+    animation-duration: 1ms;
   }
 }

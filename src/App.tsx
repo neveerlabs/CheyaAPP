@@ -12,30 +12,47 @@ import {
   ChevronDown,
   ChevronRight,
   Copy,
+  Flashlight,
+  FlashlightOff,
   Files,
   Image,
   LoaderCircle,
   Mic,
+  Pause,
   Pencil,
+  Play,
   Plus,
   RotateCw,
   X,
   Settings,
   Send,
+  SwitchCamera,
   Video,
   ThumbsDown,
   ThumbsUp,
   TriangleAlert,
   Trash2,
 } from "lucide-react";
-import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  lazy,
+  memo,
+  Suspense,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import cheyaLogo from "../assets/circle.png";
 import { AccountLogin } from "./AccountLogin";
+import { ErrorPage } from "./ErrorPage";
 import { LinkPreviews } from "./components/LinkPreviews";
 import { PublicHome } from "./PublicHome";
 import {
   CHAT_ATTACHMENT_BUCKET,
   MAX_CHAT_ATTACHMENT_BYTES,
+  MAX_CHAT_ATTACHMENT_SOURCE_BYTES,
   MAX_CHAT_ATTACHMENT_COUNT,
   MAX_CHAT_MESSAGE_ATTACHMENT_BYTES,
   CHAT_ATTACHMENT_RETENTION_MS,
@@ -48,6 +65,7 @@ import {
   saveChatAttachmentDraft,
   type ChatAttachmentRegistration,
 } from "./lib/chat-attachments";
+import { preprocessChatAttachment } from "./lib/chat-attachment-processing";
 import {
   generateThinkingSummary,
   generateGeminiConversation,
@@ -57,14 +75,531 @@ import {
 import type { AppSupabaseClient, ChatMessageJob, ChatMessageVersion } from "./lib/supabase";
 import type { ChatAttachment } from "./lib/chat-attachments";
 
+let assistantMarkdownModulePromise: Promise<typeof import("./components/AssistantMarkdown")> | null =
+  null;
+function loadAssistantMarkdown() {
+  assistantMarkdownModulePromise ??= import("./components/AssistantMarkdown");
+  return assistantMarkdownModulePromise;
+}
+
 const SettingsPage = lazy(() =>
   import("./SettingsPage").then((module) => ({ default: module.SettingsPage })),
 );
 const AssistantMarkdown = lazy(() =>
-  import("./components/AssistantMarkdown").then((module) => ({
-    default: module.AssistantMarkdown,
-  })),
+  loadAssistantMarkdown().then((module) => ({ default: module.AssistantMarkdown })),
 );
+
+function PageLoadingSkeleton({ pathname }: { pathname: string }) {
+  const isSettings = pathname.startsWith("/settings");
+  const settingsTitle = pathname.endsWith("/personal")
+    ? "Personal"
+    : pathname.endsWith("/configure")
+      ? "Configure"
+      : pathname.endsWith("/memory")
+        ? "Memory"
+        : "Settings";
+
+  if (isSettings) {
+    return (
+      <main className="fixed inset-0 flex justify-center bg-[#f5f6f8]">
+        <section
+          aria-label={`Loading ${settingsTitle.toLowerCase()} page`}
+          className="relative h-full w-full max-w-4xl overflow-hidden bg-[#f5f6f8] sm:my-5 sm:h-[calc(100%-40px)]"
+        >
+          <header className="absolute inset-x-0 top-0 z-10 flex h-[68px] items-center gap-2 px-1 sm:px-4">
+            <div className="chat-loading-skeleton size-11 rounded-full" />
+            <div className="chat-loading-skeleton h-11 flex-1 rounded-full" />
+            <div className="chat-loading-skeleton size-11 rounded-full" />
+          </header>
+          <div className="absolute inset-0 overflow-hidden px-5 pb-8 pt-[92px] sm:px-8">
+            <div className="animate-pulse space-y-5">
+              {settingsTitle === "Settings" ? (
+                [0, 1, 2].map((item) => (
+                  <div key={item} className="flex items-center gap-4 py-5">
+                    <div className="h-10 w-10 shrink-0 rounded-xl bg-[#e9ebef]" />
+                    <div className="flex-1 space-y-2">
+                      <div className="h-4 w-28 rounded-full bg-[#e9ebef]" />
+                      <div className="h-3 w-3/4 rounded-full bg-[#e9ebef]" />
+                    </div>
+                    <div className="size-5 rounded-full bg-[#e9ebef]" />
+                  </div>
+                ))
+              ) : (
+                <>
+                  <div className="space-y-2 pt-3">
+                    <div className="h-5 w-32 rounded-full bg-[#e9ebef]" />
+                    <div className="h-3 w-64 max-w-full rounded-full bg-[#e9ebef]" />
+                  </div>
+                  {[48, 120, 48, 48, 100].map((height, index) => (
+                    <div
+                      key={index}
+                      className="rounded-xl bg-[#e9ebef]"
+                      style={{ height }}
+                    />
+                  ))}
+                </>
+              )}
+            </div>
+          </div>
+        </section>
+      </main>
+    );
+  }
+
+  return (
+    <main className="fixed inset-0 flex justify-center bg-white p-0 sm:p-5">
+      <section
+        aria-label="Loading chat"
+        className="relative flex h-full w-full max-w-[580px] flex-col overflow-hidden bg-white sm:rounded-[34px] sm:border sm:border-[#e7e8eb]"
+      >
+        <header className="flex h-[64px] shrink-0 items-center justify-between gap-2 px-2 py-1 sm:gap-3 sm:px-5">
+          <div className="flex h-12 min-w-0 flex-1 items-center gap-2 rounded-full border border-[#e8e9ec] bg-white py-1 pl-1 pr-2">
+            <div className="size-10 rounded-full bg-[#eef0f3]" />
+            <div className="space-y-2">
+              <div className="h-3.5 w-28 rounded-full bg-[#eef0f3]" />
+              <div className="h-2.5 w-20 rounded-full bg-[#eef0f3]" />
+            </div>
+            <div className="ml-auto size-8 rounded-full bg-[#f1f2f4]" />
+          </div>
+          <div className="h-12 w-32 rounded-full border border-[#e8e9ec] bg-white p-1">
+            <div className="flex h-full justify-end gap-1">
+              <div className="size-9 rounded-full bg-[#f1f2f4]" />
+              <div className="size-9 rounded-full bg-[#f1f2f4]" />
+              <div className="size-9 rounded-full bg-[#f1f2f4]" />
+            </div>
+          </div>
+        </header>
+        <div className="flex min-h-0 flex-1 flex-col justify-end gap-5 px-4 pb-3 pt-2 sm:px-6">
+          <div className="chat-loading-skeleton ml-auto h-10 w-36 rounded-[18px] rounded-br-md" />
+          <div className="space-y-3">
+            <div className="chat-loading-skeleton h-3 w-28 rounded-full" />
+            <div className="chat-loading-skeleton h-3 w-[92%] rounded-full" />
+            <div className="chat-loading-skeleton h-3 w-[84%] rounded-full" />
+            <div className="chat-loading-skeleton h-3 w-[68%] rounded-full" />
+          </div>
+          <div className="chat-loading-skeleton ml-auto h-10 w-48 rounded-[18px] rounded-br-md" />
+        </div>
+        <footer className="shrink-0 px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-2.5 sm:px-5 sm:pb-5">
+          <div className="chat-loading-skeleton h-[88px] rounded-[25px] border border-[#e5e6e9] bg-white p-1" />
+        </footer>
+      </section>
+    </main>
+  );
+}
+
+function formatMediaTime(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
+  const wholeSeconds = Math.floor(seconds);
+  return `${Math.floor(wholeSeconds / 60)}:${String(wholeSeconds % 60).padStart(2, "0")}`;
+}
+
+function MediaPreview({
+  src,
+  fileName,
+  fileSize,
+  isVideo,
+  downloadHref,
+  onClose,
+}: {
+  src: string;
+  fileName: string;
+  fileSize: number;
+  isVideo: boolean;
+  downloadHref?: string;
+  onClose: () => void;
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const mediaStageRef = useRef<HTMLDivElement>(null);
+  const mediaRef = useRef<HTMLImageElement | HTMLVideoElement>(null);
+  const activePointersRef = useRef(new Map<number, { x: number; y: number }>());
+  const pinchStartRef = useRef<{
+    distance: number;
+    centerX: number;
+    centerY: number;
+    scale: number;
+    translateX: number;
+    translateY: number;
+    focalX: number;
+    focalY: number;
+  } | null>(null);
+  const mediaTransformRef = useRef({ scale: 1, translateX: 0, translateY: 0 });
+  const panStartRef = useRef<{
+    pointerX: number;
+    pointerY: number;
+    translateX: number;
+    translateY: number;
+  } | null>(null);
+  const pinchOccurredRef = useRef(false);
+  const pinchClickResetRef = useRef<number | null>(null);
+  const clickTimerRef = useRef<number | null>(null);
+  const lastTapRef = useRef<{ time: number; x: number } | null>(null);
+  const seekFeedbackTimerRef = useRef<number | null>(null);
+  const [duration, setDuration] = useState(0);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [playError, setPlayError] = useState("");
+  const [seekFeedback, setSeekFeedback] = useState<{ direction: "back" | "forward"; id: number } | null>(
+    null,
+  );
+
+  function handlePointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    if (
+      event.pointerType !== "touch" ||
+      !window.matchMedia("(pointer: coarse)").matches ||
+      (event.target as HTMLElement).closest("button, input")
+    ) {
+      return;
+    }
+
+    activePointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    event.currentTarget.setPointerCapture(event.pointerId);
+    if (activePointersRef.current.size === 1 && mediaTransformRef.current.scale > 1) {
+      panStartRef.current = {
+        pointerX: event.clientX,
+        pointerY: event.clientY,
+        translateX: mediaTransformRef.current.translateX,
+        translateY: mediaTransformRef.current.translateY,
+      };
+    }
+    if (activePointersRef.current.size === 2) {
+      activePointersRef.current.forEach((_, pointerId) => {
+        if (!event.currentTarget.hasPointerCapture(pointerId)) {
+          event.currentTarget.setPointerCapture(pointerId);
+        }
+      });
+      const [first, second] = [...activePointersRef.current.values()];
+      const distance = Math.hypot(first.x - second.x, first.y - second.y);
+      if (distance > 0 && mediaRef.current) {
+        if (pinchClickResetRef.current !== null) {
+          window.clearTimeout(pinchClickResetRef.current);
+          pinchClickResetRef.current = null;
+        }
+        const stageBounds = mediaStageRef.current?.getBoundingClientRect();
+        if (!stageBounds) return;
+        const centerX = (first.x + second.x) / 2;
+        const centerY = (first.y + second.y) / 2;
+        pinchStartRef.current = {
+          distance,
+          centerX,
+          centerY,
+          scale: mediaTransformRef.current.scale,
+          translateX: mediaTransformRef.current.translateX,
+          translateY: mediaTransformRef.current.translateY,
+          focalX:
+            (centerX -
+              stageBounds.left -
+              stageBounds.width / 2 -
+              mediaTransformRef.current.translateX) /
+            mediaTransformRef.current.scale,
+          focalY:
+            (centerY -
+              stageBounds.top -
+              stageBounds.height / 2 -
+              mediaTransformRef.current.translateY) /
+            mediaTransformRef.current.scale,
+        };
+        mediaRef.current.style.transition = "none";
+        mediaRef.current.style.transformOrigin = "center";
+        pinchOccurredRef.current = true;
+      }
+    }
+  }
+
+  function applyMediaTransform(scale: number, translateX: number, translateY: number) {
+    const stage = mediaStageRef.current;
+    const media = mediaRef.current;
+    if (!stage || !media) return;
+    const mediaWidth =
+      media instanceof HTMLVideoElement ? media.videoWidth : media.naturalWidth;
+    const mediaHeight =
+      media instanceof HTMLVideoElement ? media.videoHeight : media.naturalHeight;
+    const aspectRatio =
+      mediaWidth > 0 && mediaHeight > 0 ? mediaWidth / mediaHeight : stage.clientWidth / stage.clientHeight;
+    const fittedWidth = Math.min(stage.clientWidth, stage.clientHeight * aspectRatio);
+    const fittedHeight = Math.min(stage.clientHeight, stage.clientWidth / aspectRatio);
+    const maxX = Math.max(0, (fittedWidth * scale - stage.clientWidth) / 2);
+    const maxY = Math.max(0, (fittedHeight * scale - stage.clientHeight) / 2);
+    const boundedX = Math.min(maxX, Math.max(-maxX, translateX));
+    const boundedY = Math.min(maxY, Math.max(-maxY, translateY));
+    mediaTransformRef.current = { scale, translateX: boundedX, translateY: boundedY };
+    media.style.transform =
+      `translate3d(${boundedX}px, ${boundedY}px, 0) scale(${scale})`;
+  }
+
+  function handlePointerMove(event: React.PointerEvent<HTMLDivElement>) {
+    if (!activePointersRef.current.has(event.pointerId)) return;
+    activePointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    if (activePointersRef.current.size === 1 && panStartRef.current) {
+      const translateX =
+        panStartRef.current.translateX + event.clientX - panStartRef.current.pointerX;
+      const translateY =
+        panStartRef.current.translateY + event.clientY - panStartRef.current.pointerY;
+      applyMediaTransform(mediaTransformRef.current.scale, translateX, translateY);
+      return;
+    }
+    if (activePointersRef.current.size < 2 || !pinchStartRef.current) return;
+
+    const [first, second] = [...activePointersRef.current.values()];
+    const distance = Math.hypot(first.x - second.x, first.y - second.y);
+    const centerX = (first.x + second.x) / 2;
+    const centerY = (first.y + second.y) / 2;
+    const nextZoom = Math.min(
+      4,
+      Math.max(
+        1,
+        pinchStartRef.current.scale * (distance / pinchStartRef.current.distance),
+      ),
+    );
+    const stageBounds = mediaStageRef.current?.getBoundingClientRect();
+    if (!stageBounds) return;
+    const translateX =
+      centerX - stageBounds.left - stageBounds.width / 2 - pinchStartRef.current.focalX * nextZoom;
+    const translateY =
+      centerY - stageBounds.top - stageBounds.height / 2 - pinchStartRef.current.focalY * nextZoom;
+    applyMediaTransform(nextZoom, translateX, translateY);
+  }
+
+  function handlePointerEnd(event: React.PointerEvent<HTMLDivElement>) {
+    activePointersRef.current.delete(event.pointerId);
+    panStartRef.current = null;
+    if (activePointersRef.current.size === 0) {
+      pinchStartRef.current = null;
+      applyMediaTransform(1, 0, 0);
+      if (pinchOccurredRef.current) {
+        if (mediaRef.current) {
+          mediaRef.current.style.transition = "none";
+        }
+        pinchClickResetRef.current = window.setTimeout(() => {
+          pinchOccurredRef.current = false;
+          pinchClickResetRef.current = null;
+        }, 400);
+      }
+    } else if (activePointersRef.current.size === 1) {
+      pinchStartRef.current = null;
+      const [pointer] = [...activePointersRef.current.values()];
+      if (mediaTransformRef.current.scale > 1) {
+        panStartRef.current = {
+          pointerX: pointer.x,
+          pointerY: pointer.y,
+          translateX: mediaTransformRef.current.translateX,
+          translateY: mediaTransformRef.current.translateY,
+        };
+      }
+    }
+  }
+
+  useEffect(
+    () => () => {
+      if (pinchClickResetRef.current !== null) window.clearTimeout(pinchClickResetRef.current);
+      if (clickTimerRef.current !== null) window.clearTimeout(clickTimerRef.current);
+      if (seekFeedbackTimerRef.current !== null) window.clearTimeout(seekFeedbackTimerRef.current);
+    },
+    [],
+  );
+
+  async function togglePlayback() {
+    const video = videoRef.current;
+    if (!video) return;
+    setPlayError("");
+    if (video.paused) {
+      try {
+        await video.play();
+      } catch (error) {
+        setPlayError(
+          error instanceof Error
+            ? `This video could not be played: ${error.message}`
+            : "This video could not be played.",
+        );
+      }
+    } else {
+      video.pause();
+    }
+  }
+
+  function seekFromDoubleClick(clientX: number) {
+    const video = videoRef.current;
+    const stage = mediaStageRef.current;
+    if (!video || !stage) return;
+    const bounds = stage.getBoundingClientRect();
+    const clickedLeftSide = clientX < bounds.left + bounds.width / 2;
+    const direction = clickedLeftSide ? "back" : "forward";
+    video.currentTime = Math.min(
+      Math.max(0, video.currentTime + (clickedLeftSide ? -5 : 5)),
+      Number.isFinite(video.duration) ? video.duration : video.currentTime + 5,
+    );
+    setSeekFeedback((current) => ({
+      direction,
+      id: (current?.id ?? 0) + 1,
+    }));
+    if (seekFeedbackTimerRef.current !== null) window.clearTimeout(seekFeedbackTimerRef.current);
+    seekFeedbackTimerRef.current = window.setTimeout(() => setSeekFeedback(null), 650);
+  }
+
+  function handleMediaClick(event: React.MouseEvent<HTMLImageElement | HTMLVideoElement>) {
+    if (pinchOccurredRef.current) {
+      if (pinchClickResetRef.current !== null) window.clearTimeout(pinchClickResetRef.current);
+      pinchOccurredRef.current = false;
+      pinchClickResetRef.current = null;
+      return;
+    }
+    if (!isVideo) return;
+
+    const now = performance.now();
+    const lastTap = lastTapRef.current;
+    if (
+      event.detail >= 2 ||
+      (lastTap && now - lastTap.time < 320 && Math.abs(event.clientX - lastTap.x) < 120)
+    ) {
+      if (clickTimerRef.current !== null) window.clearTimeout(clickTimerRef.current);
+      clickTimerRef.current = null;
+      lastTapRef.current = null;
+      seekFromDoubleClick(event.clientX);
+      return;
+    }
+
+    lastTapRef.current = { time: now, x: event.clientX };
+    if (clickTimerRef.current !== null) window.clearTimeout(clickTimerRef.current);
+    clickTimerRef.current = window.setTimeout(() => {
+      clickTimerRef.current = null;
+      void togglePlayback();
+    }, 220);
+  }
+
+  return (
+    <main className="fixed inset-0 z-[60] flex flex-col bg-[#17181c] text-white">
+      <header className="flex min-h-14 items-center justify-between gap-3 border-b border-white/10 px-4">
+        <div className="min-w-0">
+          <p className="truncate text-sm font-medium">{fileName}</p>
+          <p className="text-xs text-white/60">{formatChatAttachmentSize(fileSize)}</p>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          {downloadHref && (
+            <a
+              href={downloadHref}
+              download={fileName}
+              target="_blank"
+              rel="noreferrer"
+              className="rounded-full border border-white/20 px-3 py-1.5 text-xs font-medium hover:bg-white/10"
+            >
+              Download
+            </a>
+          )}
+          <button
+            type="button"
+            aria-label="Close attachment"
+            onClick={onClose}
+            className="flex size-9 shrink-0 items-center justify-center rounded-full hover:bg-white/10"
+          >
+            <X aria-hidden="true" className="size-5" />
+          </button>
+        </div>
+      </header>
+      <div
+        ref={mediaStageRef}
+        className="media-preview-stage relative flex min-h-0 flex-1 items-center justify-center overflow-hidden"
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerEnd}
+        onPointerCancel={handlePointerEnd}
+      >
+        {isVideo ? (
+          <video
+            ref={(element) => {
+              videoRef.current = element;
+              mediaRef.current = element;
+            }}
+            src={src}
+            playsInline
+            preload="metadata"
+            aria-label={fileName}
+            onClick={handleMediaClick}
+            onLoadedMetadata={(event) =>
+              setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0)
+            }
+            onDurationChange={(event) =>
+              setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0)
+            }
+            onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
+            onPlay={() => setIsPlaying(true)}
+            onPause={() => setIsPlaying(false)}
+            onEnded={() => setIsPlaying(false)}
+            onError={() => setPlayError("This video could not be loaded or played in this browser.")}
+            className="size-full select-none object-contain"
+          />
+        ) : (
+          <img
+            ref={(element) => {
+              mediaRef.current = element;
+            }}
+            src={src}
+            alt={fileName}
+            draggable={false}
+            onClick={handleMediaClick}
+            className="size-full select-none object-contain"
+          />
+        )}
+        {isVideo && seekFeedback && (
+          <span
+            key={seekFeedback.id}
+            aria-hidden="true"
+            className={`media-seek-feedback media-seek-feedback-${seekFeedback.direction} pointer-events-none absolute top-1/2 z-10 flex -translate-y-1/2 items-center justify-center text-white ${
+              seekFeedback.direction === "back" ? "left-[12%]" : "right-[12%]"
+            }`}
+          >
+            {seekFeedback.direction === "back" ? (
+              <ArrowLeft aria-hidden="true" className="size-12" strokeWidth={2.5} />
+            ) : (
+              <ArrowRight aria-hidden="true" className="size-12" strokeWidth={2.5} />
+            )}
+          </span>
+        )}
+        {isVideo && (
+          <div className="absolute inset-x-0 bottom-0 mx-auto flex w-full max-w-3xl flex-col gap-2 bg-gradient-to-t from-black/85 via-black/55 to-transparent px-4 pb-[max(16px,env(safe-area-inset-bottom))] pt-8 sm:px-6">
+            <input
+              type="range"
+              aria-label="Video position"
+              min={0}
+              max={duration || 0}
+              step={0.1}
+              value={Math.min(currentTime, duration || 0)}
+              onInput={(event) => {
+                const video = videoRef.current;
+                if (!video) return;
+                const nextTime = Number(event.currentTarget.value);
+                video.currentTime = nextTime;
+                setCurrentTime(nextTime);
+              }}
+              className="media-preview-seek h-2 w-full cursor-pointer accent-white"
+            />
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex min-w-0 items-center gap-3">
+                <button
+                  type="button"
+                  aria-label={isPlaying ? "Pause video" : "Play video"}
+                  onClick={() => void togglePlayback()}
+                  className="flex size-9 shrink-0 items-center justify-center rounded-full bg-white/15 transition hover:bg-white/25"
+                >
+                  {isPlaying ? (
+                    <Pause aria-hidden="true" className="size-4" fill="currentColor" />
+                  ) : (
+                    <Play aria-hidden="true" className="size-4" fill="currentColor" />
+                  )}
+                </button>
+                <span className="text-xs tabular-nums text-white/85">
+                  {formatMediaTime(currentTime)} / {formatMediaTime(duration)}
+                </span>
+              </div>
+              <span className="hidden truncate text-xs text-white/60 sm:block">
+                Double-click left/right to seek 5s
+              </span>
+            </div>
+            {playError && <p role="alert" className="text-xs text-red-200">{playError}</p>}
+          </div>
+        )}
+      </div>
+    </main>
+  );
+}
 
 const UserMessageAttachmentTile = memo(function UserMessageAttachmentTile({
   attachment,
@@ -122,8 +657,6 @@ const UserMessageAttachmentTile = memo(function UserMessageAttachmentTile({
         <video
           src={previewUrl}
           muted
-          loop
-          autoPlay
           playsInline
           preload="metadata"
           aria-label={attachment.file_name}
@@ -153,6 +686,11 @@ const UserMessageAttachmentTile = memo(function UserMessageAttachmentTile({
           {attachment.file_name}
         </span>
       )}
+      {isVideo && previewUrl && (
+        <span className="pointer-events-none absolute left-1/2 top-1/2 flex size-7 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full bg-black/55 text-white">
+          <Play aria-hidden="true" className="size-3.5 fill-current" />
+        </span>
+      )}
       {expired && (
         <span className="absolute inset-x-0 bottom-0 bg-black/65 px-1 py-1 text-center text-[8px] font-medium text-white">
           Expired
@@ -164,20 +702,30 @@ const UserMessageAttachmentTile = memo(function UserMessageAttachmentTile({
 
 const ChatMessageInput = memo(function ChatMessageInput({
   inputRef,
+  defaultValue,
   disabled,
   placeholder,
   onDraftInput,
   onSubmitMessage,
 }: {
   inputRef: React.RefObject<HTMLTextAreaElement | null>;
+  defaultValue: string;
   disabled: boolean;
   placeholder: string;
   onDraftInput: (value: string, input: HTMLTextAreaElement) => void;
   onSubmitMessage: () => void;
 }) {
+  useLayoutEffect(() => {
+    const input = inputRef.current;
+    if (!input || !defaultValue) return;
+    input.style.height = "auto";
+    input.style.height = `${Math.min(Math.max(input.scrollHeight, 44), 88)}px`;
+  }, [defaultValue, inputRef]);
+
   return (
     <textarea
       ref={inputRef}
+      defaultValue={defaultValue}
       aria-label="Message"
       name="message"
       placeholder={placeholder}
@@ -206,6 +754,123 @@ const ChatMessageInput = memo(function ChatMessageInput({
   );
 });
 
+const ChatMediaMenu = memo(function ChatMediaMenu({
+  disabled,
+  onOpenCamera,
+  onPickPhoto,
+  onPickFiles,
+}: {
+  disabled: boolean;
+  onOpenCamera: () => void;
+  onPickPhoto: () => void;
+  onPickFiles: () => void;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        aria-label="Add media"
+        disabled={disabled}
+        aria-expanded={isOpen}
+        aria-haspopup="menu"
+        onClick={() => setIsOpen((open) => !open)}
+        className="flex size-9 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] disabled:cursor-not-allowed sm:size-10"
+      >
+        <Plus aria-hidden="true" className="size-[21px]" strokeWidth={1.8} />
+      </button>
+      {isOpen && (
+        <>
+          <button
+            type="button"
+            aria-label="Close media menu"
+            className="fixed inset-0 z-20 cursor-default"
+            onClick={() => setIsOpen(false)}
+          />
+          <div
+            role="menu"
+            aria-label="Choose a media source"
+            className="absolute bottom-[calc(100%+10px)] left-0 z-30 w-48 overflow-hidden rounded-2xl border border-[#e5e6e9] bg-white p-1.5 shadow-xl"
+          >
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setIsOpen(false);
+                onOpenCamera();
+              }}
+              className="flex h-11 w-full items-center gap-3 rounded-xl px-3 text-sm text-[#292b30] transition hover:bg-[#f4f5f7]"
+            >
+              <Camera aria-hidden="true" className="size-[18px]" />
+              Camera
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setIsOpen(false);
+                onPickPhoto();
+              }}
+              className="flex h-11 w-full items-center gap-3 rounded-xl px-3 text-sm text-[#292b30] transition hover:bg-[#f4f5f7]"
+            >
+              <Image aria-hidden="true" className="size-[18px]" />
+              Photo
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setIsOpen(false);
+                onPickFiles();
+              }}
+              className="flex h-11 w-full items-center gap-3 rounded-xl px-3 text-sm text-[#292b30] transition hover:bg-[#f4f5f7]"
+            >
+              <Files aria-hidden="true" className="size-[18px]" />
+              Files
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+});
+
+const ThinkingModeToggle = memo(function ThinkingModeToggle({
+  disabled,
+  onToggle,
+}: {
+  disabled: boolean;
+  onToggle: (enabled: boolean) => void;
+}) {
+  const [enabled, setEnabled] = useState(false);
+  const title = enabled ? "Turn off thinking summary" : "Turn on thinking summary";
+
+  return (
+    <button
+      type="button"
+      aria-label="Think"
+      aria-pressed={enabled}
+      title={title}
+      disabled={disabled}
+      onPointerDown={(event) => event.preventDefault()}
+      onClick={() => {
+        const next = !enabled;
+        setEnabled(next);
+        onToggle(next);
+      }}
+      className={`flex h-9 items-center gap-2 rounded-full border px-3 text-sm font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] disabled:cursor-not-allowed sm:h-10 sm:px-3.5 ${
+        enabled
+          ? "border-[#b9dff2] bg-[#edf8fd] text-[#1678a8]"
+          : "border-[#e5e6e9] bg-white text-[#34363b] hover:bg-[#f7f8fa]"
+      }`}
+    >
+      <Brain aria-hidden="true" className="size-[18px]" strokeWidth={1.8} />
+      <span>Thinking</span>
+    </button>
+  );
+});
+
 const headerActions = [
   { label: "Report a problem", icon: Bug },
   { label: "Settings", icon: Settings },
@@ -226,6 +891,8 @@ interface PendingChatAttachment {
   mimeType: string;
   draftSavedAt?: number;
   isUploading: boolean;
+  isBlocked: boolean;
+  isPreprocessed?: boolean;
   uploadError: string | null;
   uploaded: ChatAttachment | null;
 }
@@ -234,8 +901,6 @@ interface AttachmentView {
   index: number;
   mode: "media" | "editor";
 }
-
-type CameraMode = "photo" | "video";
 
 function messageDraftStorageKey(userId: string): string {
   return `cheyaverse-chat-message-draft:v1:${userId}`;
@@ -279,7 +944,6 @@ interface DeleteChatTarget {
 interface ReportTarget {
   id: string;
   versionNumber: number;
-  text: string;
 }
 
 type AssistantRating = "like" | "dislike";
@@ -339,6 +1003,7 @@ export function App() {
   const [authUser, setAuthUser] = useState<{ id: string; email: string | null } | null>(null);
   const [isAuthLoading, setIsAuthLoading] = useState(true);
   const [authError, setAuthError] = useState("");
+  const [historyLoadError, setHistoryLoadError] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatJobs, setChatJobs] = useState<ChatMessageJob[]>([]);
   const [messageVersions, setMessageVersions] = useState<Record<string, ChatMessageVersion[]>>({});
@@ -346,38 +1011,40 @@ export function App() {
   const [isSending, setIsSending] = useState(false);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [isRestoringDraftAttachments, setIsRestoringDraftAttachments] = useState(false);
-  const [isRestoringVersion, setIsRestoringVersion] = useState(false);
   const [typingAssistant, setTypingAssistant] = useState<{ id: string; content: string } | null>(
     null,
   );
   const [showScrollToLatest, setShowScrollToLatest] = useState(false);
   const [realtimeRevision, setRealtimeRevision] = useState(0);
   const [hasGeminiApiKey, setHasGeminiApiKey] = useState(false);
-  const [isThinkMode, setIsThinkMode] = useState(false);
   const [thinkingSteps, setThinkingSteps] = useState<string[]>([]);
   const [expandedThinkingIds, setExpandedThinkingIds] = useState<Set<string>>(() => new Set());
   const [ratings, setRatings] = useState<Record<string, AssistantRating>>({});
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [reportTarget, setReportTarget] = useState<ReportTarget | null>(null);
-  const [reportDetails, setReportDetails] = useState("");
+  const reportDetailsRef = useRef("");
   const [reportError, setReportError] = useState("");
   const [isSavingReport, setIsSavingReport] = useState(false);
-  const [userEditTarget, setUserEditTarget] = useState<string | null>(null);
-  const [userEditText, setUserEditText] = useState("");
+  const userEditTargetRef = useRef<string | null>(null);
+  const userEditTextRef = useRef("");
+  const userEditDialogRef = useRef<HTMLDialogElement>(null);
+  const userEditTextareaRef = useRef<HTMLTextAreaElement>(null);
   const [activeUserActions, setActiveUserActions] = useState<string | null>(null);
   const [deleteConfirmation, setDeleteConfirmation] = useState<DeleteConfirmation | null>(null);
   const [deleteChatTarget, setDeleteChatTarget] = useState<DeleteChatTarget | null>(null);
   const [isDeletingChatBranch, setIsDeletingChatBranch] = useState(false);
   const [sendError, setSendError] = useState("");
-  const [isMediaMenuOpen, setIsMediaMenuOpen] = useState(false);
+  const [attachmentToast, setAttachmentToast] = useState("");
   const [isDraggingAttachments, setIsDraggingAttachments] = useState(false);
   const [attachedMedia, setAttachedMedia] = useState<PendingChatAttachment[]>([]);
+  const [isPreparingAttachments, setIsPreparingAttachments] = useState(false);
   const [isCameraOpen, setIsCameraOpen] = useState(false);
-  const [cameraMode, setCameraMode] = useState<CameraMode>("photo");
-  const [cameraError, setCameraError] = useState("");
-  const [isRecordingVideo, setIsRecordingVideo] = useState(false);
-  const [cameraRecordedBytes, setCameraRecordedBytes] = useState(0);
-  const isAttachmentUploadPending = attachedMedia.some((attachment) => attachment.isUploading);
+  const [cameraFacing, setCameraFacing] = useState<"environment" | "user">("environment");
+  const [isCameraSwitchSupported, setIsCameraSwitchSupported] = useState(false);
+  const [isCameraTorchSupported, setIsCameraTorchSupported] = useState(false);
+  const [isCameraTorchOn, setIsCameraTorchOn] = useState(false);
+  const isAttachmentUploadPending =
+    isPreparingAttachments || attachedMedia.some((attachment) => attachment.isUploading);
   const authenticatedUserId = authUser?.id ?? null;
   const [remoteAttachmentView, setRemoteAttachmentView] = useState<{
     attachment: ChatAttachment;
@@ -389,17 +1056,23 @@ export function App() {
   const editorOriginalContentRef = useRef<string | null>(null);
   const [editorError, setEditorError] = useState("");
   const [isEditorLoading, setIsEditorLoading] = useState(false);
-  const [viewport, setViewport] = useState({ height: 0, top: 0 });
   const conversationRef = useRef<HTMLDivElement>(null);
   const pendingConversationScrollRestoreRef = useRef<number | null>(null);
+  const pendingHistoryScrollRestoreRef = useRef<{ height: number; top: number } | null>(null);
+  const pendingInitialConversationScrollRef = useRef(false);
+  const oldestHistoryCursorRef = useRef<{ id: string; created_at: string } | null>(null);
+  const hasOlderHistoryRef = useRef(false);
+  const loadingOlderHistoryRef = useRef(false);
+  const historyGenerationRef = useRef(0);
+  const versionRestoreGenerationRef = useRef(0);
+  const versionRestoreQueueRef = useRef(Promise.resolve());
+  const realtimeRefreshTimerRef = useRef<number | null>(null);
+  const jobRefreshTimerRef = useRef<number | null>(null);
   const cameraVideoRef = useRef<HTMLVideoElement>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
-  const cameraRecorderRef = useRef<MediaRecorder | null>(null);
-  const cameraChunksRef = useRef<Blob[]>([]);
-  const cameraRecordedBytesRef = useRef(0);
-  const cameraProgressUpdatedAtRef = useRef(0);
-  const cameraStopForSizeLimitRef = useRef(false);
-  const discardCameraRecordingRef = useRef(false);
+  const preparingAttachmentsRef = useRef(false);
+  const cameraHistoryEntryRef = useRef(false);
+  const attachmentToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const messageDraftRef = useRef("");
   const messageDraftSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const messageDraftUserIdRef = useRef<string | null>(null);
@@ -411,10 +1084,12 @@ export function App() {
   const filesInputRef = useRef<HTMLInputElement>(null);
   const messageInputRef = useRef<HTMLTextAreaElement>(null);
   const nextApiIndexRef = useRef(0);
+  const thinkingModeRef = useRef(false);
   const attachmentViewRequestRef = useRef(0);
   const cancelledAttachmentsRef = useRef(new Set<string>());
   const deleteConfirmationResolverRef = useRef<((approved: boolean) => void) | null>(null);
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const longPressStartRef = useRef<{ x: number; y: number } | null>(null);
   const wasSettingsRef = useRef(window.location.pathname === "/settings");
   const chatJobsByMessageId = useMemo(() => {
     const result = new Map<string, ChatMessageJob>();
@@ -433,9 +1108,136 @@ export function App() {
     conversation.scrollTo({ top: conversation.scrollHeight, behavior });
   }
 
+  async function loadOlderChatHistory() {
+    const client = authClient;
+    const generation = historyGenerationRef.current;
+    const before = oldestHistoryCursorRef.current;
+    if (
+      !client ||
+      !authenticatedUserId ||
+      !before ||
+      !hasOlderHistoryRef.current ||
+      loadingOlderHistoryRef.current
+    ) {
+      return;
+    }
+    loadingOlderHistoryRef.current = true;
+    loadingOlderHistoryRef.current = true;
+    try {
+      const { loadChatMessagePage, loadMessageAttachments, loadMessageVersions } =
+        await import("./lib/chat-data");
+      const page = await loadChatMessagePage(client, {
+        before,
+        userId: authenticatedUserId,
+      });
+      if (historyGenerationRef.current !== generation) return;
+      if (page.messages.length === 0) {
+        hasOlderHistoryRef.current = false;
+        return;
+      }
+
+      const [versions, attachments] = await Promise.all([
+        loadMessageVersions(
+          client,
+          page.messages.map((message) => message.id),
+        ),
+        loadMessageAttachments(
+          client,
+          page.messages.map((message) => message.id),
+        ),
+      ]);
+      const assistantMessages = page.messages.filter((message) => message.role === "assistant");
+      let loadedRatings: Record<string, AssistantRating> = {};
+      if (assistantMessages.length > 0) {
+        const { data, error } = await client
+          .from("message_feedback")
+          .select("message_id, version_number, kind")
+          .in(
+            "message_id",
+            assistantMessages.map((message) => message.id),
+          )
+          .in("kind", ["like", "dislike"]);
+        if (error) {
+          throw new Error(`Could not load saved response feedback: ${error.message}`);
+        }
+        loadedRatings = Object.fromEntries(
+          data.flatMap((item) =>
+            item.kind === "like" || item.kind === "dislike"
+              ? [[`${item.message_id}:${item.version_number}`, item.kind]]
+              : [],
+          ),
+        );
+      }
+
+      if (historyGenerationRef.current !== generation) return;
+      const conversation = conversationRef.current;
+      if (conversation) {
+        pendingHistoryScrollRestoreRef.current = {
+          height: conversation.scrollHeight,
+          top: conversation.scrollTop,
+        };
+      }
+      const oldestMessage = page.messages[0];
+      oldestHistoryCursorRef.current = oldestMessage
+        ? { id: oldestMessage.id, created_at: oldestMessage.created_at }
+        : before;
+      hasOlderHistoryRef.current = page.hasMore;
+      setMessageVersions((current) => ({ ...current, ...versions }));
+      setSelectedMessageVersions((current) => ({
+        ...current,
+        ...Object.fromEntries(
+          page.messages.map((message) => [message.id, message.version_number]),
+        ),
+      }));
+      setRatings((current) => ({ ...current, ...loadedRatings }));
+      setMessages((current) => {
+        const currentIds = new Set(current.map((message) => message.id));
+        const olderMessages = page.messages
+          .filter((message) => !currentIds.has(message.id))
+          .map(({ id, role, content, created_at, version_number, thinking_summary }) => ({
+            id,
+            role,
+            text: content,
+            createdAt: created_at,
+            versionNumber: version_number,
+            thinkingSummary: thinking_summary,
+            attachments: attachments[id] ?? [],
+          }));
+        return [...olderMessages, ...current];
+      });
+    } catch (error) {
+      setSendError(
+        error instanceof Error ? error.message : "Could not load earlier chat history.",
+      );
+    } finally {
+      if (historyGenerationRef.current === generation) {
+        loadingOlderHistoryRef.current = false;
+      }
+    }
+  }
+
+  function showAttachmentToast(message: string) {
+    setAttachmentToast(message);
+    if (attachmentToastTimerRef.current) clearTimeout(attachmentToastTimerRef.current);
+    attachmentToastTimerRef.current = setTimeout(() => {
+      attachmentToastTimerRef.current = null;
+      setAttachmentToast("");
+    }, 5000);
+  }
+
+  useEffect(
+    () => () => {
+      if (attachmentToastTimerRef.current) clearTimeout(attachmentToastTimerRef.current);
+    },
+    [],
+  );
+
   function handleConversationScroll() {
     const conversation = conversationRef.current;
     if (!conversation) return;
+    if (conversation.scrollTop <= 48 && hasOlderHistoryRef.current) {
+      void loadOlderChatHistory();
+    }
     setShowScrollToLatest(
       conversation.scrollHeight - conversation.scrollTop - conversation.clientHeight > 120,
     );
@@ -472,10 +1274,20 @@ export function App() {
     () =>
       new Map(
         attachedMedia
-          .filter(({ mimeType }) => mimeType.startsWith("image/") || mimeType.startsWith("video/"))
+          .filter(
+            ({ mimeType, isBlocked }) =>
+              !isBlocked &&
+              (mimeType.startsWith("image/") || mimeType.startsWith("video/")),
+          )
           .map(({ file }) => [file, URL.createObjectURL(file)]),
       ),
     [attachedMedia],
+  );
+  useEffect(
+    () => () => {
+      mediaPreviews.forEach((url) => URL.revokeObjectURL(url));
+    },
+    [mediaPreviews],
   );
 
   function requestDeleteConfirmation(label: string, preview: string): Promise<boolean> {
@@ -512,8 +1324,21 @@ export function App() {
     );
   }
 
+  function openUserMessageEditor(messageId: string, text: string) {
+    userEditTargetRef.current = messageId;
+    userEditTextRef.current = text;
+    if (userEditTextareaRef.current) userEditTextareaRef.current.value = text;
+    const dialog = userEditDialogRef.current;
+    if (dialog && !dialog.open) dialog.showModal();
+  }
+
+  function closeUserMessageEditor() {
+    userEditDialogRef.current?.close();
+    userEditTargetRef.current = null;
+  }
+
   async function setMessageVersion(chatMessage: ChatMessage, direction: -1 | 1) {
-    if (isSending || isRestoringVersion) return;
+    if (isSending) return;
     setSendError("");
     setTypingAssistant(null);
     const messageIndex = messages.findIndex((item) => item.id === chatMessage.id);
@@ -529,18 +1354,31 @@ export function App() {
     if (!nextVersion) return;
 
     if (authClient) {
-      setIsRestoringVersion(true);
+      const restoreGeneration = ++versionRestoreGenerationRef.current;
+      setSelectedMessageVersions((current) => ({
+        ...current,
+        [chatMessage.id]: nextVersion.version_number,
+      }));
       try {
         const {
           restoreChatBranch,
           loadMessageAttachments,
           loadMessageVersions,
         } = await import("./lib/chat-data");
-        const branch = await restoreChatBranch(
-          authClient,
-          chatMessage.id,
-          nextVersion.version_number,
+        const branchRequest = versionRestoreQueueRef.current.then(() => {
+          if (versionRestoreGenerationRef.current !== restoreGeneration) return null;
+          return restoreChatBranch(
+            authClient,
+            chatMessage.id,
+            nextVersion.version_number,
+          );
+        });
+        versionRestoreQueueRef.current = branchRequest.then(
+          () => undefined,
+          () => undefined,
         );
+        const branch = await branchRequest;
+        if (!branch) return;
         if (branch.length === 0) {
           throw new Error("No saved conversation branch was returned for this message version.");
         }
@@ -554,6 +1392,7 @@ export function App() {
             branch.map((item) => item.id),
           ),
         ]);
+        if (versionRestoreGenerationRef.current !== restoreGeneration) return;
         setMessages(
           branch.map(({ id, role, content, created_at, version_number, thinking_summary }) => ({
             id,
@@ -572,12 +1411,16 @@ export function App() {
         setSendError("");
         return;
       } catch (error) {
-        setSendError(
-          error instanceof Error ? error.message : "Could not restore this conversation branch.",
-        );
+        if (versionRestoreGenerationRef.current === restoreGeneration) {
+          setSelectedMessageVersions((current) => ({
+            ...current,
+            [chatMessage.id]: currentNumber,
+          }));
+          setSendError(
+            error instanceof Error ? error.message : "Could not restore this conversation branch.",
+          );
+        }
         return;
-      } finally {
-        setIsRestoringVersion(false);
       }
     }
 
@@ -661,7 +1504,7 @@ export function App() {
       }
       flushDraft();
     };
-  }, [authenticatedUserId, pathname]);
+  }, [authenticatedUserId]);
 
   useEffect(
     () => () => {
@@ -669,25 +1512,6 @@ export function App() {
     },
     [mediaPreviews],
   );
-
-  useEffect(() => {
-    const visualViewport = window.visualViewport;
-    const updateViewport = () => {
-      const height = Math.round(visualViewport?.height ?? window.innerHeight);
-      const top = Math.round(visualViewport?.offsetTop ?? 0);
-      setViewport((current) =>
-        current.height === height && current.top === top ? current : { height, top },
-      );
-    };
-    updateViewport();
-    visualViewport?.addEventListener("resize", updateViewport);
-    window.addEventListener("resize", updateViewport);
-
-    return () => {
-      visualViewport?.removeEventListener("resize", updateViewport);
-      window.removeEventListener("resize", updateViewport);
-    };
-  }, []);
 
   useEffect(() => {
     if (!isSending) return;
@@ -729,14 +1553,27 @@ export function App() {
   }, [authClient, authUser, isAuthLoading, isLoadingHistory, messages.length, pathname]);
 
   useEffect(() => {
-    const conversationContent = conversationRef.current?.firstElementChild;
-    if (!(conversationContent instanceof HTMLElement)) return;
-    const observer = new ResizeObserver(() => {
+    const conversation = conversationRef.current;
+    if (!conversation) return;
+    let observedContent: Element | null = null;
+    const resizeObserver = new ResizeObserver(() => {
       if (followLatestRef.current) scrollConversationToLatest("auto");
     });
-    observer.observe(conversationContent);
-    return () => observer.disconnect();
-  }, [pathname]);
+    const observeCurrentContent = () => {
+      const currentContent = conversation.firstElementChild;
+      if (currentContent === observedContent) return;
+      if (observedContent) resizeObserver.unobserve(observedContent);
+      observedContent = currentContent;
+      if (observedContent) resizeObserver.observe(observedContent);
+    };
+    const mutationObserver = new MutationObserver(observeCurrentContent);
+    observeCurrentContent();
+    mutationObserver.observe(conversation, { childList: true });
+    return () => {
+      mutationObserver.disconnect();
+      resizeObserver.disconnect();
+    };
+  }, [isLoadingHistory, messages.length, pathname]);
 
   useEffect(() => {
     const anchorId = pendingAssistantAnchorRef.current;
@@ -803,7 +1640,8 @@ export function App() {
 
       const {
         data: { subscription },
-      } = client.auth.onAuthStateChange((_event, session) => {
+      } = client.auth.onAuthStateChange((event, session) => {
+        if (event === "TOKEN_REFRESHED") return;
         window.setTimeout(() => void activateSession(session), 0);
       });
       unsubscribe = () => subscription.unsubscribe();
@@ -824,10 +1662,17 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    const historyGeneration = ++historyGenerationRef.current;
+    loadingOlderHistoryRef.current = false;
+    pendingHistoryScrollRestoreRef.current = null;
     if (!authClient || !authenticatedUserId) {
       setIsLoadingHistory(false);
+      setHistoryLoadError("");
       setMessages([]);
       setAttachedMedia([]);
+      oldestHistoryCursorRef.current = null;
+      hasOlderHistoryRef.current = false;
+      loadingOlderHistoryRef.current = false;
       setMessageVersions({});
       setSelectedMessageVersions({});
       setRatings({});
@@ -840,16 +1685,56 @@ export function App() {
     let isMounted = true;
     shouldScrollToLatestRef.current = true;
     followLatestRef.current = true;
+    oldestHistoryCursorRef.current = null;
+    hasOlderHistoryRef.current = false;
     setIsLoadingHistory(true);
+    setHistoryLoadError("");
+    let didLoadHistory = false;
     void (async () => {
       try {
+        const markdownPromise = loadAssistantMarkdown();
+        const chatData = await import("./lib/chat-data");
         const {
+          loadChatMessagePage,
           loadMessageAttachments,
           loadMessageVersions,
-          loadRecentChatMessages,
-        } = await import("./lib/chat-data");
-        const [savedMessages, keyResult, jobsResult] = await Promise.all([
-          loadRecentChatMessages(authClient),
+        } = chatData;
+        const [messagePage] = await Promise.all([
+          loadChatMessagePage(authClient, { userId: authenticatedUserId }),
+          markdownPromise,
+        ]);
+        if (!isMounted) return;
+        const savedMessages = messagePage.messages;
+        didLoadHistory = true;
+        const oldestMessage = savedMessages[0];
+        oldestHistoryCursorRef.current = oldestMessage
+          ? { id: oldestMessage.id, created_at: oldestMessage.created_at }
+          : null;
+        hasOlderHistoryRef.current = messagePage.hasMore;
+
+        setMessages((current) => {
+          const currentAttachments = new Map(
+            current.map((message) => [message.id, message.attachments ?? []]),
+          );
+          return savedMessages.map(
+            ({ id, role, content, created_at, version_number, thinking_summary }) => ({
+              id,
+              role,
+              text: content,
+              createdAt: created_at,
+              versionNumber: version_number,
+              thinkingSummary: thinking_summary,
+              attachments: currentAttachments.get(id) ?? [],
+            }),
+          );
+        });
+        pendingInitialConversationScrollRef.current = savedMessages.length > 0;
+        shouldScrollToLatestRef.current = true;
+        if (savedMessages.length === 0) setIsLoadingHistory(false);
+
+        const assistantMessages = savedMessages.filter((item) => item.role === "assistant");
+        const [keyResult, jobsResult, loadedVersions, loadedAttachments, loadedRatings] =
+          await Promise.all([
           authClient
             .from("ai_api_keys")
             .select("id")
@@ -861,10 +1746,6 @@ export function App() {
             .or("status.in.(queued,processing,failed),error.not.is.null")
             .order("created_at", { ascending: false })
             .limit(50),
-        ]);
-        if (keyResult.error) throw keyResult.error;
-        if (jobsResult.error) throw jobsResult.error;
-        const [loadedVersions, loadedAttachments] = await Promise.all([
           loadMessageVersions(
             authClient,
             savedMessages.map((item) => item.id),
@@ -873,26 +1754,29 @@ export function App() {
             authClient,
             savedMessages.map((item) => item.id),
           ),
-        ]);
-        const assistantMessages = savedMessages.filter((item) => item.role === "assistant");
-        const loadedRatings: Record<string, AssistantRating> = {};
-        if (assistantMessages.length > 0) {
-          const { data: feedback, error: feedbackError } = await authClient
-            .from("message_feedback")
-            .select("message_id, version_number, kind")
-            .in("message_id", assistantMessages.map((item) => item.id))
-            .in("kind", ["like", "dislike"]);
-          if (feedbackError) {
-            throw new Error(
-              `Could not load saved response feedback. Run the latest server schema. ${feedbackError.message}`,
-            );
-          }
-          feedback.forEach((item) => {
-            if (item.kind === "like" || item.kind === "dislike") {
-              loadedRatings[`${item.message_id}:${item.version_number}`] = item.kind;
+          (async () => {
+            if (assistantMessages.length === 0) return {};
+            const { data: feedback, error: feedbackError } = await authClient
+              .from("message_feedback")
+              .select("message_id, version_number, kind")
+              .in("message_id", assistantMessages.map((item) => item.id))
+              .in("kind", ["like", "dislike"]);
+            if (feedbackError) {
+              throw new Error(
+                `Could not load saved response feedback. Run the latest server schema. ${feedbackError.message}`,
+              );
             }
-          });
-        }
+            const ratings: Record<string, AssistantRating> = {};
+            feedback.forEach((item) => {
+              if (item.kind === "like" || item.kind === "dislike") {
+                ratings[`${item.message_id}:${item.version_number}`] = item.kind;
+              }
+            });
+            return ratings;
+          })(),
+          ]);
+        if (keyResult.error) throw keyResult.error;
+        if (jobsResult.error) throw jobsResult.error;
         if (isMounted) {
           setHasGeminiApiKey(keyResult.data.length > 0);
           setChatJobs(jobsResult.data);
@@ -918,23 +1802,20 @@ export function App() {
           setSelectedMessageVersions(
             Object.fromEntries(savedMessages.map((item) => [item.id, item.version_number])),
           );
-          setMessages(
-            savedMessages.map(({ id, role, content, created_at, version_number, thinking_summary }) => ({
-              id,
-              role,
-              text: content,
-              createdAt: created_at,
-              versionNumber: version_number,
-              thinkingSummary: thinking_summary,
-              attachments: loadedAttachments[id] ?? [],
+          setMessages((current) =>
+            current.map((message) => ({
+              ...message,
+              attachments: loadedAttachments[message.id] ?? message.attachments ?? [],
             })),
           );
-          shouldScrollToLatestRef.current = true;
         }
       } catch (error) {
         if (isMounted) {
+          const message =
+            error instanceof Error ? error.message : "Could not load saved chat history.";
+          if (!didLoadHistory && pathname === "/") setHistoryLoadError(message);
           setSendError(
-            error instanceof Error ? error.message : "Could not load saved chat history.",
+            message,
           );
         }
       } finally {
@@ -944,6 +1825,9 @@ export function App() {
 
     return () => {
       isMounted = false;
+      if (historyGenerationRef.current === historyGeneration) {
+        historyGenerationRef.current += 1;
+      }
     };
   }, [authClient, authUser, pathname, realtimeRevision]);
 
@@ -1027,6 +1911,7 @@ export function App() {
             mimeType: draft.mimeType,
             draftSavedAt: draft.savedAt,
             isUploading: !uploaded,
+            isBlocked: false,
             uploadError: null,
             uploaded,
             sortAt: uploaded ? Date.parse(uploaded.created_at) : draft.savedAt,
@@ -1061,6 +1946,7 @@ export function App() {
             mimeType: row.mime_type,
             draftSavedAt: Date.parse(row.created_at),
             isUploading: false,
+            isBlocked: false,
             uploadError: null,
             uploaded: row,
             sortAt: Date.parse(row.created_at),
@@ -1101,13 +1987,8 @@ export function App() {
       "chat_messages",
       "chat_message_versions",
       "chat_conversation_branches",
-      "chat_message_jobs",
       "chat_message_attachments",
       "message_feedback",
-      "message_insights",
-      "user_memories",
-      "user_settings",
-      "ai_api_keys",
     ] as const;
     for (const table of tables) {
       channel = channel.on(
@@ -1118,20 +1999,74 @@ export function App() {
           table,
         },
         () => {
-          if (isMounted) setRealtimeRevision((revision) => revision + 1);
+          if (!isMounted) return;
+          if (realtimeRefreshTimerRef.current !== null) {
+            window.clearTimeout(realtimeRefreshTimerRef.current);
+          }
+          realtimeRefreshTimerRef.current = window.setTimeout(() => {
+            realtimeRefreshTimerRef.current = null;
+            if (isMounted) setRealtimeRevision((revision) => revision + 1);
+          }, 80);
         },
       );
     }
+    channel = channel.on(
+      "postgres_changes",
+      {
+        event: "*",
+        schema: "public",
+        table: "chat_message_jobs",
+      },
+      () => {
+        if (!isMounted) return;
+        if (jobRefreshTimerRef.current !== null) {
+          window.clearTimeout(jobRefreshTimerRef.current);
+        }
+        jobRefreshTimerRef.current = window.setTimeout(() => {
+          jobRefreshTimerRef.current = null;
+          void (async () => {
+            try {
+              const { data, error } = await authClient
+                .from("chat_message_jobs")
+                .select("*")
+                .or("status.in.(queued,processing,failed),error.not.is.null")
+                .order("created_at", { ascending: false })
+                .limit(50);
+              if (!isMounted) return;
+              if (error) {
+                setSendError(`Could not refresh chat job status: ${error.message}`);
+                return;
+              }
+              setChatJobs(data);
+              setIsSending(data.some((job) => job.status === "queued" || job.status === "processing"));
+            } catch (error) {
+              if (!isMounted) return;
+              setSendError(
+                error instanceof Error
+                  ? `Could not refresh chat job status: ${error.message}`
+                  : "Could not refresh chat job status.",
+              );
+            }
+          })();
+        }, 80);
+      },
+    );
     channel = channel.subscribe((status) => {
-      if (isMounted && status === "SUBSCRIBED") {
-        setRealtimeRevision((revision) => revision + 1);
-      } else if (isMounted && (status === "CHANNEL_ERROR" || status === "TIMED_OUT")) {
+      if (isMounted && (status === "CHANNEL_ERROR" || status === "TIMED_OUT")) {
         setSendError("Live sync is unavailable. Check your connection and reload to refresh data.");
       }
     });
 
     return () => {
       isMounted = false;
+      if (realtimeRefreshTimerRef.current !== null) {
+        window.clearTimeout(realtimeRefreshTimerRef.current);
+        realtimeRefreshTimerRef.current = null;
+      }
+      if (jobRefreshTimerRef.current !== null) {
+        window.clearTimeout(jobRefreshTimerRef.current);
+        jobRefreshTimerRef.current = null;
+      }
       void authClient.removeChannel(channel);
     };
   }, [authClient, authUser]);
@@ -1158,6 +2093,51 @@ export function App() {
   }, [attachmentView]);
 
   useEffect(() => {
+    if (!remoteAttachmentView) return;
+
+    window.history.pushState(
+      { ...window.history.state, remoteAttachmentView: true },
+      "",
+      window.location.href,
+    );
+    const closeOnBack = () => setRemoteAttachmentView(null);
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") window.history.back();
+    };
+    window.addEventListener("popstate", closeOnBack);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("popstate", closeOnBack);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [remoteAttachmentView]);
+
+  useLayoutEffect(() => {
+    if (pendingInitialConversationScrollRef.current) {
+      pendingInitialConversationScrollRef.current = false;
+      const conversation = conversationRef.current;
+      if (conversation) {
+        conversation.scrollTop = conversation.scrollHeight;
+        shouldScrollToLatestRef.current = false;
+        followLatestRef.current = true;
+      }
+    }
+
+    const previousPosition = pendingHistoryScrollRestoreRef.current;
+    const conversation = conversationRef.current;
+    if (previousPosition && conversation) {
+      pendingHistoryScrollRestoreRef.current = null;
+      conversation.scrollTop =
+        previousPosition.top + conversation.scrollHeight - previousPosition.height;
+    }
+    if (pathname === "/" && shouldScrollToLatestRef.current && conversation) {
+      conversation.scrollTop = conversation.scrollHeight;
+      shouldScrollToLatestRef.current = false;
+      followLatestRef.current = true;
+    }
+  }, [messages, pathname]);
+
+  useEffect(() => {
     if (
       attachmentView ||
       remoteAttachmentView ||
@@ -1181,43 +2161,55 @@ export function App() {
     let cancelled = false;
     const startCamera = async () => {
       if (!navigator.mediaDevices?.getUserMedia) {
-        setCameraError("Direct camera access is not available in this browser or connection.");
+        showAttachmentToast("Direct camera access is not available in this browser or connection.");
         return;
       }
       try {
-        let stream: MediaStream;
-        let hasAudio = cameraMode !== "video";
-        try {
-          stream = await navigator.mediaDevices.getUserMedia({
-            video: { facingMode: { ideal: "environment" } },
-            audio: cameraMode === "video",
-          });
-          hasAudio = stream.getAudioTracks().length > 0;
-        } catch (error) {
-          if (cameraMode !== "video") throw error;
-          stream = await navigator.mediaDevices.getUserMedia({
-            video: { facingMode: { ideal: "environment" } },
-            audio: false,
-          });
-          hasAudio = false;
-        }
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: cameraFacing },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+            frameRate: { ideal: 30, max: 30 },
+          },
+          audio: false,
+        });
         if (cancelled) {
           stream.getTracks().forEach((track) => track.stop());
           return;
         }
         cameraStreamRef.current = stream;
+        const videoTrack = stream.getVideoTracks()[0];
+        void navigator.mediaDevices
+          .enumerateDevices()
+          .then((devices) => {
+            if (!cancelled) {
+              setIsCameraSwitchSupported(
+                devices.filter((device) => device.kind === "videoinput").length > 1,
+              );
+            }
+          })
+          .catch((error: unknown) => {
+            if (!cancelled) {
+              showAttachmentToast(
+                error instanceof Error
+                  ? `Could not check whether another camera is available: ${error.message}`
+                  : "Could not check whether another camera is available.",
+              );
+            }
+          });
+        const trackCapabilities = videoTrack?.getCapabilities() as
+          | (MediaTrackCapabilities & { torch?: boolean })
+          | undefined;
+        setIsCameraTorchSupported(Boolean(trackCapabilities?.torch));
+        setIsCameraTorchOn(false);
         if (cameraVideoRef.current) {
           cameraVideoRef.current.srcObject = stream;
           await cameraVideoRef.current.play();
         }
-        setCameraError(
-          cameraMode === "video" && !hasAudio
-            ? "Microphone access is unavailable. Video will be recorded without audio."
-            : "",
-        );
       } catch (error) {
         if (!cancelled) {
-          setCameraError(
+          showAttachmentToast(
             error instanceof Error
               ? `Could not start the camera: ${error.message}`
               : "Could not start the camera. Check camera permissions and try again.",
@@ -1232,8 +2224,29 @@ export function App() {
       cameraStreamRef.current?.getTracks().forEach((track) => track.stop());
       cameraStreamRef.current = null;
       if (cameraVideoRef.current) cameraVideoRef.current.srcObject = null;
+      setIsCameraTorchSupported(false);
+      setIsCameraTorchOn(false);
+      setIsCameraSwitchSupported(false);
     };
-  }, [isCameraOpen, cameraMode]);
+  }, [cameraFacing, isCameraOpen]);
+
+  useEffect(() => {
+    if (!isCameraOpen) return;
+    window.history.pushState(
+      { ...window.history.state, cameraCapture: true },
+      "",
+      window.location.href,
+    );
+    cameraHistoryEntryRef.current = true;
+    const closeOnBack = () => {
+      cameraHistoryEntryRef.current = false;
+      setIsCameraOpen(false);
+    };
+    window.addEventListener("popstate", closeOnBack);
+    return () => {
+      window.removeEventListener("popstate", closeOnBack);
+    };
+  }, [isCameraOpen]);
 
   useEffect(() => {
     if (window.location.pathname.startsWith("/settings/")) {
@@ -1422,29 +2435,75 @@ export function App() {
   async function uploadPendingAttachment(
     attachment: PendingChatAttachment,
   ): Promise<ChatAttachment | null> {
+    let preprocessingFailed = false;
     try {
       if (!authUser) throw new Error("Sign in before saving an attachment draft.");
+      let uploadable = attachment;
+      if (!attachment.isPreprocessed) {
+        let processed: Awaited<ReturnType<typeof preprocessChatAttachment>>;
+        try {
+          processed = await preprocessChatAttachment(attachment.file, attachment.mimeType);
+        } catch (error) {
+          preprocessingFailed = true;
+          throw error;
+        }
+        if (cancelledAttachmentsRef.current.has(attachment.id)) {
+          throw new Error("The attachment was removed from the composer.");
+        }
+        if (processed.oversized) {
+          const message = `This file is still larger than ${formatChatAttachmentSize(MAX_CHAT_ATTACHMENT_BYTES)} after processing and was not uploaded.`;
+          setAttachedMedia((current) =>
+            current.map((item) =>
+              item.id === attachment.id
+                ? { ...item, isUploading: false, isBlocked: true, uploadError: message }
+                : item,
+            ),
+          );
+          setSendError(message);
+          return null;
+        }
+        const mimeType = resolveChatAttachmentMimeType(processed.file);
+        if (!mimeType) throw new Error("The processed file type is not supported for upload.");
+        uploadable = {
+          ...attachment,
+          file: processed.file,
+          mimeType,
+          isPreprocessed: true,
+        };
+        setAttachedMedia((current) =>
+          current.map((item) =>
+            item.id === attachment.id
+              ? {
+                  ...item,
+                  file: processed.file,
+                  mimeType,
+                  isPreprocessed: true,
+                }
+              : item,
+          ),
+        );
+      }
       await saveChatAttachmentDraft(
         authUser.id,
-        attachment.id,
-        attachment.file,
-        attachment.mimeType,
-        attachment.draftSavedAt,
+        uploadable.id,
+        uploadable.file,
+        uploadable.mimeType,
+        uploadable.draftSavedAt,
       );
-      if (cancelledAttachmentsRef.current.has(attachment.id)) {
+      if (cancelledAttachmentsRef.current.has(uploadable.id)) {
         throw new Error("The attachment was removed from the composer.");
       }
-      const uploaded = await registerChatAttachment(attachment);
-      if (cancelledAttachmentsRef.current.has(attachment.id)) {
-        await deleteStoredAttachments([attachment.id]);
-        await removeChatAttachmentDraft(authUser.id, attachment.id);
-        cancelledAttachmentsRef.current.delete(attachment.id);
+      const uploaded = await registerChatAttachment(uploadable);
+      if (cancelledAttachmentsRef.current.has(uploadable.id)) {
+        await deleteStoredAttachments([uploadable.id]);
+        await removeChatAttachmentDraft(authUser.id, uploadable.id);
+        cancelledAttachmentsRef.current.delete(uploadable.id);
         return null;
       }
       setAttachedMedia((current) =>
         current.map((item) =>
-          item.id === attachment.id
-            ? { ...item, isUploading: false, uploadError: null, uploaded }
+          item.id === uploadable.id
+            ? { ...item, isUploading: false, isBlocked: false, uploadError: null, uploaded }
             : item,
         ),
       );
@@ -1467,10 +2526,15 @@ export function App() {
       }
       const message =
         error instanceof Error ? error.message : `Could not upload ${attachment.file.name}.`;
+      if (preprocessingFailed) {
+        setAttachedMedia((current) => current.filter((item) => item.id !== attachment.id));
+        setSendError(message);
+        return null;
+      }
       setAttachedMedia((current) =>
         current.map((item) =>
           item.id === attachment.id
-            ? { ...item, isUploading: false, uploadError: message }
+            ? { ...item, isUploading: false, isBlocked: false, uploadError: message }
             : item,
         ),
       );
@@ -1503,11 +2567,19 @@ export function App() {
     }
   }
 
+  function closeRemoteAttachmentView() {
+    setRemoteAttachmentView(null);
+    if (window.history.state?.remoteAttachmentView) {
+      window.history.back();
+    }
+  }
+
   async function openStoredAttachment(attachment: ChatAttachment) {
     if (isChatAttachmentExpired(attachment)) {
       setSendError(`"${attachment.file_name}" expired after 24 hours and is no longer available.`);
       return;
     }
+
     try {
       const accessToken = await getAccessToken();
       const response = await fetch("/api/chat-attachment-link", {
@@ -1555,36 +2627,38 @@ export function App() {
     }
   }
 
-  function addPickedFiles(fileList: FileList | File[] | null) {
+  function addPickedFiles(fileList: FileList | File[] | null, alreadyProcessed = false) {
     const files = Array.from(fileList ?? []);
     if (files.length === 0) return;
+    if (preparingAttachmentsRef.current) {
+      setSendError("Wait for the current files to finish processing before adding more.");
+      return;
+    }
 
     const availableSlots = Math.max(0, MAX_CHAT_ATTACHMENT_COUNT - attachedMedia.length);
-    let projectedBytes = attachedMedia.reduce((total, item) => total + item.file.size, 0);
     const acceptedFiles: PendingChatAttachment[] = [];
     let rejectedCount = 0;
-    let rejectionReason = "";
+    const rejectionReasons: string[] = [];
     for (const file of files) {
       if (acceptedFiles.length >= availableSlots) {
         rejectedCount += 1;
-        rejectionReason = `A message can include up to ${MAX_CHAT_ATTACHMENT_COUNT} files.`;
+        rejectionReasons.push(`A message can include up to ${MAX_CHAT_ATTACHMENT_COUNT} files.`);
         continue;
       }
 
-      if (file.size < 1 || file.size > MAX_CHAT_ATTACHMENT_BYTES) {
+      if (file.size < 1 || file.size > MAX_CHAT_ATTACHMENT_SOURCE_BYTES) {
         rejectedCount += 1;
-        rejectionReason = `Each file must be no larger than ${formatChatAttachmentSize(MAX_CHAT_ATTACHMENT_BYTES)}.`;
+        rejectionReasons.push(
+          `Files must be no larger than ${formatChatAttachmentSize(MAX_CHAT_ATTACHMENT_SOURCE_BYTES)} before processing.`,
+        );
         continue;
       }
       const mimeType = resolveChatAttachmentMimeType(file);
       if (!mimeType) {
         rejectedCount += 1;
-        rejectionReason = `"${file.name}" is not a supported image, video, audio, PDF, or text file.`;
-        continue;
-      }
-      if (projectedBytes + file.size > MAX_CHAT_MESSAGE_ATTACHMENT_BYTES) {
-        rejectedCount += 1;
-        rejectionReason = `Attachments in one message cannot exceed ${formatChatAttachmentSize(MAX_CHAT_MESSAGE_ATTACHMENT_BYTES)} total.`;
+        rejectionReasons.push(
+          `"${file.name}" is not a supported image, video, audio, PDF, or text file.`,
+        );
         continue;
       }
       acceptedFiles.push({
@@ -1592,167 +2666,225 @@ export function App() {
         file,
         mimeType,
         isUploading: true,
+        isBlocked: false,
+        isPreprocessed: alreadyProcessed,
         uploadError: null,
         uploaded: null,
       });
-      projectedBytes += file.size;
     }
     if (acceptedFiles.length > 0) {
       setAttachedMedia((current) => [...current, ...acceptedFiles]);
-      acceptedFiles.forEach((attachment) => void uploadPendingAttachment(attachment));
+      preparingAttachmentsRef.current = true;
+      setIsPreparingAttachments(true);
+      void (async () => {
+        let projectedBytes = attachedMedia
+          .filter((attachment) => !attachment.isBlocked)
+          .reduce((total, attachment) => total + attachment.file.size, 0);
+        for (const attachment of acceptedFiles) {
+          if (cancelledAttachmentsRef.current.has(attachment.id)) {
+            cancelledAttachmentsRef.current.delete(attachment.id);
+            continue;
+          }
+          try {
+            const processed = alreadyProcessed
+              ? {
+                  file: attachment.file,
+                  oversized: attachment.file.size > MAX_CHAT_ATTACHMENT_BYTES,
+                }
+              : await preprocessChatAttachment(attachment.file, attachment.mimeType);
+            if (cancelledAttachmentsRef.current.has(attachment.id)) {
+              cancelledAttachmentsRef.current.delete(attachment.id);
+              continue;
+            }
+            if (processed.oversized) {
+              const message = `This file is still larger than ${formatChatAttachmentSize(MAX_CHAT_ATTACHMENT_BYTES)} after processing and was not uploaded.`;
+              setAttachedMedia((current) =>
+                current.map((item) =>
+                  item.id === attachment.id
+                    ? {
+                        ...item,
+                        isUploading: false,
+                        isBlocked: true,
+                        uploadError: message,
+                      }
+                    : item,
+                ),
+              );
+              rejectionReasons.push(`"${attachment.file.name}" is still too large after processing.`);
+              continue;
+            }
+
+            if (projectedBytes + processed.file.size > MAX_CHAT_MESSAGE_ATTACHMENT_BYTES) {
+              const message = `Attachments in one message cannot exceed ${formatChatAttachmentSize(MAX_CHAT_MESSAGE_ATTACHMENT_BYTES)} total.`;
+              setAttachedMedia((current) =>
+                current.map((item) =>
+                  item.id === attachment.id
+                    ? {
+                        ...item,
+                        isUploading: false,
+                        isBlocked: true,
+                        uploadError: message,
+                      }
+                    : item,
+                ),
+              );
+              rejectionReasons.push(message);
+              continue;
+            }
+
+            const processedMimeType = resolveChatAttachmentMimeType(processed.file);
+            if (!processedMimeType) {
+              throw new Error("The processed file type is not supported for upload.");
+            }
+            const readyAttachment: PendingChatAttachment = {
+              ...attachment,
+              file: processed.file,
+              mimeType: processedMimeType,
+              isPreprocessed: true,
+            };
+            setAttachedMedia((current) =>
+              current.map((item) =>
+                item.id === attachment.id
+                  ? {
+                      ...item,
+                      file: processed.file,
+                      mimeType: processedMimeType,
+                      isPreprocessed: true,
+                    }
+                  : item,
+              ),
+            );
+            projectedBytes += processed.file.size;
+            void uploadPendingAttachment(readyAttachment);
+          } catch (error) {
+            if (cancelledAttachmentsRef.current.has(attachment.id)) {
+              cancelledAttachmentsRef.current.delete(attachment.id);
+              continue;
+            }
+            const message =
+              error instanceof Error ? error.message : `Could not process "${attachment.file.name}".`;
+            setAttachedMedia((current) =>
+              current.filter((item) => item.id !== attachment.id),
+            );
+            rejectedCount += 1;
+            rejectionReasons.push(message);
+          }
+        }
+        preparingAttachmentsRef.current = false;
+        setIsPreparingAttachments(false);
+        if (rejectedCount > 0 || rejectionReasons.length > 0) {
+          const details = [...new Set(rejectionReasons)].join(" ");
+          const countMessage =
+            rejectedCount > 0
+              ? ` ${rejectedCount} file${rejectedCount === 1 ? " was" : "s were"} not added.`
+              : "";
+          showAttachmentToast(`${details}${countMessage}`.trim());
+        } else {
+          setSendError("");
+        }
+      })();
     }
-    if (rejectedCount > 0) {
-      setSendError(`${rejectionReason} ${rejectedCount} file${rejectedCount === 1 ? " was" : "s were"} not added.`);
-    } else {
+    if (rejectedCount > 0 && acceptedFiles.length === 0) {
+      showAttachmentToast(
+        `${[...new Set(rejectionReasons)].join(" ")} ${rejectedCount} file${rejectedCount === 1 ? " was" : "s were"} not added.`,
+      );
+    } else if (acceptedFiles.length === 0) {
       setSendError("");
     }
   }
 
   function openCamera() {
-    setCameraMode("photo");
-    setCameraError("");
-    setCameraRecordedBytes(0);
-    cameraStopForSizeLimitRef.current = false;
     setIsCameraOpen(true);
   }
 
+  function leaveCameraHistoryEntry() {
+    if (!cameraHistoryEntryRef.current) return;
+    cameraHistoryEntryRef.current = false;
+    window.history.back();
+  }
+
   function closeCamera() {
-    if (cameraRecorderRef.current?.state === "recording") {
-      discardCameraRecordingRef.current = true;
-      cameraRecorderRef.current.stop();
-    } else {
-      cameraChunksRef.current = [];
-      cameraRecorderRef.current = null;
-    }
-    setIsRecordingVideo(false);
+    leaveCameraHistoryEntry();
     setIsCameraOpen(false);
   }
 
-  async function captureCameraPhoto() {
-    const video = cameraVideoRef.current;
-    if (!video || video.videoWidth === 0 || video.videoHeight === 0) {
-      setCameraError("The camera is not ready yet. Please wait a moment and try again.");
-      return;
+  async function toggleCameraTorch() {
+    const track = cameraStreamRef.current?.getVideoTracks()[0];
+    if (!track || !isCameraTorchSupported) return;
+
+    const nextTorchState = !isCameraTorchOn;
+    try {
+      await track.applyConstraints({
+        advanced: [{ torch: nextTorchState } as MediaTrackConstraintSet & { torch: boolean }],
+      });
+      setIsCameraTorchOn(nextTorchState);
+    } catch (error) {
+      showAttachmentToast(
+        error instanceof Error
+          ? `Could not change the camera light: ${error.message}`
+          : "Could not change the camera light on this device.",
+      );
     }
-    const canvas = document.createElement("canvas");
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    const context = canvas.getContext("2d");
-    if (!context) {
-      setCameraError("Could not capture an image from the camera.");
-      return;
-    }
-    context.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const imageBlob = await new Promise<Blob | null>((resolve) =>
-      canvas.toBlob(resolve, "image/jpeg", 0.92),
-    );
-    if (!imageBlob) {
-      setCameraError("Could not encode the captured photo.");
-      return;
-    }
-    addPickedFiles([
-      new File([imageBlob], `camera-${Date.now()}.jpg`, {
-        type: "image/jpeg",
-        lastModified: Date.now(),
-      }),
-    ]);
-    closeCamera();
   }
 
-  function toggleVideoRecording() {
-    const stream = cameraStreamRef.current;
-    if (!stream) {
-      setCameraError("The camera is not ready yet. Please wait a moment and try again.");
+  async function captureCameraPhoto() {
+    if (preparingAttachmentsRef.current) {
+      showAttachmentToast("Wait for the current files to finish processing before capturing a photo.");
       return;
     }
-    if (cameraRecorderRef.current?.state === "recording") {
-      cameraRecorderRef.current.stop();
+    const video = cameraVideoRef.current;
+    if (!video || video.videoWidth === 0 || video.videoHeight === 0) {
+      showAttachmentToast("The camera is not ready yet. Please wait a moment and try again.");
       return;
     }
-    if (typeof MediaRecorder === "undefined") {
-      setCameraError("Video recording is not supported by this browser.");
-      return;
-    }
-    const preferredMimeType = [
-      "video/webm;codecs=vp9,opus",
-      "video/webm;codecs=vp8,opus",
-      "video/webm",
-      "video/mp4",
-    ].find((mimeType) => MediaRecorder.isTypeSupported(mimeType));
-    try {
-      const recorderOptions: MediaRecorderOptions = {
-        videoBitsPerSecond: 1_200_000,
-      };
-      if (preferredMimeType) recorderOptions.mimeType = preferredMimeType;
-      if (stream.getAudioTracks().length > 0) {
-        recorderOptions.audioBitsPerSecond = 96_000;
+
+    const track = cameraStreamRef.current?.getVideoTracks()[0];
+    const imageCaptureConstructor = (
+      window as Window & {
+        ImageCapture?: new (track: MediaStreamTrack) => { takePhoto: () => Promise<Blob> };
       }
-      const recorder = new MediaRecorder(stream, recorderOptions);
-      cameraChunksRef.current = [];
-      cameraRecordedBytesRef.current = 0;
-      cameraProgressUpdatedAtRef.current = Date.now();
-      cameraStopForSizeLimitRef.current = false;
-      discardCameraRecordingRef.current = false;
-      setCameraRecordedBytes(0);
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          cameraChunksRef.current.push(event.data);
-          cameraRecordedBytesRef.current += event.data.size;
-          const reachedSizeLimit =
-            cameraRecordedBytesRef.current >=
-            MAX_CHAT_ATTACHMENT_BYTES - 256 * 1024;
-          if (Date.now() - cameraProgressUpdatedAtRef.current >= 1000 || reachedSizeLimit) {
-            cameraProgressUpdatedAtRef.current = Date.now();
-            setCameraRecordedBytes(cameraRecordedBytesRef.current);
-          }
-          if (reachedSizeLimit) {
-            cameraStopForSizeLimitRef.current = true;
-            if (recorder.state === "recording") recorder.stop();
-          }
+    ).ImageCapture;
+    let imageBlob: Blob | null = null;
+
+    try {
+      if (track && imageCaptureConstructor) {
+        try {
+          imageBlob = await new imageCaptureConstructor(track).takePhoto();
+        } catch {
+          imageBlob = null;
         }
-      };
-      recorder.onerror = () => {
-        setCameraError("The video recording failed. Please try again.");
-        setIsRecordingVideo(false);
-      };
-      recorder.onstop = () => {
-        const recordedMimeType = recorder.mimeType || "video/webm";
-        const mimeType = recordedMimeType.split(";")[0].trim().toLowerCase();
-        const videoBlob = new Blob(cameraChunksRef.current, { type: mimeType });
-        cameraChunksRef.current = [];
-        cameraRecorderRef.current = null;
-        setIsRecordingVideo(false);
-        if (!discardCameraRecordingRef.current && videoBlob.size > 0) {
-          if (videoBlob.size > MAX_CHAT_ATTACHMENT_BYTES) {
-            setCameraError(
-              `This recording reached ${formatChatAttachmentSize(videoBlob.size)}, above the ${formatChatAttachmentSize(MAX_CHAT_ATTACHMENT_BYTES)} limit. It was not attached.`,
-            );
-            setSendError(
-              `The video exceeded the ${formatChatAttachmentSize(MAX_CHAT_ATTACHMENT_BYTES)} per-file limit and was not attached.`,
-            );
-            setIsCameraOpen(false);
-            return;
-          }
-          const extension = mimeType === "video/mp4" ? "mp4" : "webm";
-          addPickedFiles([
-            new File([videoBlob], `camera-${Date.now()}.${extension}`, {
-              type: mimeType,
+      }
+      if (!imageBlob) {
+        const canvas = document.createElement("canvas");
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        const context = canvas.getContext("2d");
+        if (!context) throw new Error("Could not prepare the image for capture.");
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+        imageBlob = await new Promise<Blob | null>((resolve) =>
+          canvas.toBlob(resolve, "image/jpeg", 0.9),
+        );
+        canvas.width = 0;
+        canvas.height = 0;
+      }
+      if (!imageBlob) throw new Error("Could not encode the captured photo.");
+
+      addPickedFiles(
+        [
+          new File(
+            [imageBlob],
+            `camera-${Date.now()}.${imageBlob.type === "image/png" ? "png" : "jpg"}`,
+            {
+              type: imageBlob.type || "image/jpeg",
               lastModified: Date.now(),
-            }),
-          ]);
-        }
-        discardCameraRecordingRef.current = false;
-        setIsCameraOpen(false);
-      };
-      cameraRecorderRef.current = recorder;
-      recorder.start(250);
-      setIsRecordingVideo(true);
-      setCameraError("");
+            },
+          ),
+        ],
+      );
+      closeCamera();
     } catch (error) {
-      setCameraError(
-        error instanceof Error
-          ? `Could not record video: ${error.message}`
-          : "Could not record video. Please try again.",
+      showAttachmentToast(
+        error instanceof Error ? error.message : "Could not capture a photo. Please try again.",
       );
     }
   }
@@ -1842,12 +2974,11 @@ export function App() {
   }
 
   function closeAttachmentView() {
+    attachmentViewRequestRef.current += 1;
+    setAttachmentView(null);
+    setIsEditorLoading(false);
     if (window.history.state?.attachmentView) {
       window.history.back();
-    } else {
-      attachmentViewRequestRef.current += 1;
-      setAttachmentView(null);
-      setIsEditorLoading(false);
     }
   }
 
@@ -1880,6 +3011,7 @@ export function App() {
         file: editedFile,
         mimeType,
         isUploading: true,
+        isBlocked: false,
         uploadError: null,
         uploaded: null,
       };
@@ -1936,6 +3068,10 @@ export function App() {
       setSendError("Messages must be 50,000 characters or fewer.");
       return;
     }
+    if (attachedMedia.some((attachment) => attachment.isBlocked)) {
+      setSendError("Remove files that could not be processed or are over the upload limit before sending.");
+      return;
+    }
     if (attachedMedia.some((attachment) => !attachment.uploaded)) {
       setSendError("Wait for every attachment to finish uploading, or remove failed uploads.");
       return;
@@ -1943,9 +3079,10 @@ export function App() {
 
     setSendError("");
     setIsSending(true);
-    const showThinking = isThinkMode;
+    const showThinking = thinkingModeRef.current;
     let jobAccepted = false;
     const optimisticId = crypto.randomUUID();
+    const submittedAttachments = attachedMedia;
     const optimisticMessage: ChatMessage = {
       id: optimisticId,
       role: "user",
@@ -1953,11 +3090,12 @@ export function App() {
       createdAt: new Date().toISOString(),
       versionNumber: 1,
       thinkingSummary: null,
-      attachments: attachedMedia.flatMap((attachment) =>
+      attachments: submittedAttachments.flatMap((attachment) =>
         attachment.uploaded ? [attachment.uploaded] : [],
       ),
     };
     setMessages((current) => [...current, optimisticMessage]);
+    setAttachedMedia([]);
     if (messageInputRef.current) {
       messageInputRef.current.value = "";
       resizeMessageInput(messageInputRef.current);
@@ -1980,7 +3118,7 @@ export function App() {
         body: JSON.stringify({
           content: prompt,
           thinkingMode: showThinking,
-          attachmentIds: attachedMedia.map((attachment) => attachment.id),
+          attachmentIds: submittedAttachments.map((attachment) => attachment.id),
         }),
       });
       const result = (await response.json().catch(() => null)) as
@@ -2022,34 +3160,31 @@ export function App() {
             {
               ...item,
               id: result.messageId!,
-              attachments: attachedMedia.flatMap((attachment) =>
+              attachments: submittedAttachments.flatMap((attachment) =>
                 attachment.uploaded ? [attachment.uploaded] : [],
               ),
             },
           ];
         });
       });
-      setAttachedMedia([]);
       if (authUser) {
-        try {
-          await Promise.all(
-            attachedMedia.map((attachment) =>
-              removeChatAttachmentDraft(authUser.id, attachment.id),
-            ),
-          );
-        } catch (error) {
+        void Promise.all(
+          submittedAttachments.map((attachment) =>
+            removeChatAttachmentDraft(authUser.id, attachment.id),
+          ),
+        ).catch((error: unknown) => {
           setSendError(
             `Your message was sent, but the local attachment draft could not be cleared: ${
               error instanceof Error ? error.message : "unknown local storage error"
             }`,
           );
-        }
+        });
       }
       setThinkingSteps(showThinking ? ["Membaca pesan dan konteks percakapan…"] : []);
-      setRealtimeRevision((revision) => revision + 1);
     } catch (error) {
       if (!jobAccepted) {
         setMessages((current) => current.filter((item) => item.id !== optimisticId));
+        setAttachedMedia((current) => [...submittedAttachments, ...current]);
         if (messageInputRef.current && !messageInputRef.current.value) {
           messageInputRef.current.value = promptInput;
           resizeMessageInput(messageInputRef.current);
@@ -2093,7 +3228,7 @@ export function App() {
 
   async function submitAssistantReport() {
     if (!reportTarget) return;
-    const details = reportDetails.trim();
+    const details = reportDetailsRef.current.trim();
     if (!details) {
       setReportError("Write a short description before sending a report.");
       return;
@@ -2116,7 +3251,7 @@ export function App() {
         details,
       );
       setReportTarget(null);
-      setReportDetails("");
+      reportDetailsRef.current = "";
       setReportError("");
     } catch (error) {
       setReportError(error instanceof Error ? error.message : "Could not save this report.");
@@ -2194,7 +3329,6 @@ export function App() {
       );
       setActiveUserActions(null);
       setDeleteChatTarget(null);
-      setRealtimeRevision((revision) => revision + 1);
     } catch (error) {
       setSendError(error instanceof Error ? error.message : "Could not delete this message branch.");
     } finally {
@@ -2225,7 +3359,7 @@ export function App() {
 
     setIsSending(true);
     setSendError("");
-    const showThinking = isThinkMode;
+    const showThinking = thinkingModeRef.current;
     setThinkingSteps(showThinking ? ["Mencari konteks untuk menyusun ulang jawaban…"] : []);
     try {
       const [
@@ -2402,6 +3536,7 @@ export function App() {
         profile ?? DEFAULT_PERSONALIZATION,
         {
           thinkingMode: showThinking,
+          regenerateForVariation: !editedSource,
           currentMessageAt: sourceMessage.createdAt,
           history: history.map(({ role, text, createdAt }) => ({
             role,
@@ -2606,8 +3741,9 @@ export function App() {
   }
 
   async function saveUserMessageEdit() {
+    const userEditTarget = userEditTargetRef.current;
     if (!userEditTarget) return;
-    const nextText = userEditText.trim();
+    const nextText = userEditTextRef.current.trim();
     if (!nextText || nextText.length > 50000) {
       setSendError("Edited messages must contain 1–50,000 characters.");
       return;
@@ -2677,8 +3813,8 @@ export function App() {
             : item,
         ),
       );
-      setUserEditTarget(null);
-      setUserEditText("");
+      closeUserMessageEditor();
+      userEditTextRef.current = "";
       setActiveUserActions(null);
       const nextAssistant = messages[messageIndex + 1];
       if (nextAssistant?.role === "assistant") {
@@ -2704,19 +3840,48 @@ export function App() {
     }
   }
 
-  if (isAuthLoading) {
+  if (
+    pathname !== "/" &&
+    !/^\/settings(?:\/(?:personal|configure|memory))?\/?$/.test(pathname)
+  ) {
     return (
-      <main className="fixed inset-0 flex items-start justify-center bg-[#f5f6f8] p-5">
-        <div className="w-full max-w-[580px] animate-pulse space-y-5 rounded-[34px] bg-white p-6">
-          <div className="h-12 w-52 rounded-full bg-[#f1f2f4]" />
-          <div className="space-y-3 pt-10">
-            <div className="ml-auto h-14 w-3/5 rounded-2xl bg-[#f1f2f4]" />
-            <div className="h-20 w-4/5 rounded-2xl bg-[#f1f2f4]" />
-            <div className="ml-auto h-12 w-1/2 rounded-2xl bg-[#f1f2f4]" />
-          </div>
-          <div className="mt-32 h-14 rounded-full bg-[#f1f2f4]" />
-        </div>
-      </main>
+      <ErrorPage
+        code="404"
+        title="Page not found"
+        description="The page you’re looking for doesn’t exist or may have moved."
+        onHome={() => window.location.assign("/")}
+        onRetry={() => window.location.reload()}
+      />
+    );
+  }
+
+  if (isAuthLoading) {
+    return <PageLoadingSkeleton pathname={pathname} />;
+  }
+
+  if (historyLoadError && authUser && pathname === "/") {
+    return (
+      <ErrorPage
+        code="CHAT HISTORY ERROR"
+        title="Could not load your chat"
+        description="Your conversation history could not be reached. Check your connection and try again."
+        details={historyLoadError}
+        onHome={() => window.location.assign("/")}
+        onRetry={() => window.location.reload()}
+      />
+    );
+  }
+
+  if (authError && !authUser) {
+    return (
+      <ErrorPage
+        code="ACCOUNT ERROR"
+        title="Could not connect your account"
+        description="CheyaAPP could not restore the account session. Check the connection and try again."
+        details={authError}
+        onHome={() => window.location.assign("/")}
+        onRetry={() => window.location.reload()}
+      />
     );
   }
 
@@ -2728,7 +3893,6 @@ export function App() {
       <AccountLogin
         client={authClient}
         error={authError}
-        onBack={pathname === "/" ? () => setIsLoginOpen(false) : undefined}
       />
     );
   }
@@ -2738,6 +3902,18 @@ export function App() {
     const isImage = attachment.mime_type.startsWith("image/");
     const isVideo = attachment.mime_type.startsWith("video/");
     const isPdf = attachment.mime_type === "application/pdf";
+    if (isImage || isVideo) {
+      return (
+        <MediaPreview
+          src={signedUrl}
+          fileName={attachment.file_name}
+          fileSize={attachment.size_bytes}
+          isVideo={isVideo}
+          downloadHref={signedUrl}
+          onClose={closeRemoteAttachmentView}
+        />
+      );
+    }
     const textLines = (remoteAttachmentView.textContent ?? "").split(/\r\n|\r|\n/);
     const longestTextLine = textLines.reduce(
       (longest, line) => Math.max(longest, line.length),
@@ -2763,24 +3939,19 @@ export function App() {
             <button
               type="button"
               aria-label="Close attachment"
-              onClick={() => setRemoteAttachmentView(null)}
+              onClick={closeRemoteAttachmentView}
               className="flex size-9 items-center justify-center rounded-full hover:bg-white/10"
             >
               <X aria-hidden="true" className="size-5" />
             </button>
           </div>
         </header>
-        <div className="flex min-h-0 flex-1 items-center justify-center overflow-auto p-3 sm:p-6">
-          {isImage ? (
-            <img src={signedUrl} alt={attachment.file_name} className="max-h-full max-w-full object-contain" />
-          ) : isVideo ? (
-            <video
-              src={signedUrl}
-              controls
-              playsInline
-              className="max-h-full max-w-full"
-            />
-          ) : isPdf ? (
+        <div
+          className={`flex min-h-0 flex-1 items-center justify-center overflow-auto ${
+            isTextAttachment(attachment.mime_type, attachment.file_name) ? "p-0" : "p-3 sm:p-6"
+          }`}
+        >
+          {isPdf ? (
             <iframe
               src={signedUrl}
               title={attachment.file_name}
@@ -2789,7 +3960,7 @@ export function App() {
           ) : isTextAttachment(attachment.mime_type, attachment.file_name) ? (
             <section
               aria-label="File preview"
-              className="relative size-full min-h-0 overflow-hidden rounded-lg bg-white text-[#24252a]"
+              className="relative size-full min-h-0 overflow-hidden bg-white text-[#24252a]"
             >
               <div className="absolute inset-0 overflow-auto overscroll-contain">
                 <div className="flex min-h-full w-max min-w-full items-stretch font-mono text-[13px] leading-6">
@@ -2833,16 +4004,7 @@ export function App() {
   if (pathname.startsWith("/settings") && authClient) {
     return (
       <Suspense
-        fallback={
-          <main className="fixed inset-0 flex justify-center bg-white p-4">
-            <div className="w-full max-w-[680px] animate-pulse space-y-4 pt-5">
-              <div className="h-12 w-full rounded-full bg-[#f1f2f4]" />
-              <div className="h-28 rounded-[24px] bg-[#f1f2f4]" />
-              <div className="h-36 rounded-[24px] bg-[#f1f2f4]" />
-              <div className="h-24 rounded-[24px] bg-[#f1f2f4]" />
-            </div>
-          </main>
-        }
+        fallback={<PageLoadingSkeleton pathname={pathname} />}
       >
         <SettingsPage
           pathname={pathname}
@@ -2856,6 +4018,10 @@ export function App() {
     );
   }
 
+  if (pathname === "/" && isLoadingHistory && messages.length === 0) {
+    return <PageLoadingSkeleton pathname={pathname} />;
+  }
+
   const viewedAttachment = attachmentView ? attachedMedia[attachmentView.index] : undefined;
   const viewedFile = viewedAttachment?.file;
   const editorLines = editorContent.split(/\r\n|\r|\n/);
@@ -2866,46 +4032,33 @@ export function App() {
     const isMediaView =
       viewedAttachment.mimeType.startsWith("image/") ||
       viewedAttachment.mimeType.startsWith("video/");
+    if (isMediaView) {
+      return previewUrl ? (
+        <MediaPreview
+          src={previewUrl}
+          fileName={viewedFile.name}
+          fileSize={viewedFile.size}
+          isVideo={viewedAttachment.mimeType.startsWith("video/")}
+          onClose={closeAttachmentView}
+        />
+      ) : null;
+    }
     const editorWidth = `calc(${Math.max(40, longestEditorLine)}ch + 1.5rem)`;
     const editorHeight = `${Math.max(100, editorLines.length * 24 + 32)}px`;
 
     return (
       <main
-        aria-label={isMediaView ? `Preview: ${viewedFile.name}` : `Edit: ${viewedFile.name}`}
-        className={`fixed inset-0 z-40 flex flex-col ${
-          isMediaView ? "cursor-zoom-out bg-black" : "bg-white text-[#24252a]"
-        }`}
-        onClick={isMediaView ? closeAttachmentView : undefined}
+        aria-label={`Edit: ${viewedFile.name}`}
+        className="fixed inset-0 z-40 flex flex-col bg-white text-[#24252a]"
       >
-        {isMediaView ? (
-          viewedAttachment.mimeType.startsWith("video/") && previewUrl ? (
-            <video
-              src={previewUrl}
-              aria-label={viewedFile.name}
-              autoPlay
-              muted
-              loop
-              playsInline
-              className="size-full object-contain"
-            />
-          ) : previewUrl ? (
-            <img
-              src={previewUrl}
-              alt={viewedFile.name}
-              className="size-full select-none object-contain"
-              draggable={false}
-            />
-          ) : null
-        ) : (
-          <>
-            <header className="flex h-11 shrink-0 items-center justify-between gap-3 border-b border-[#eceef0] px-3 text-xs">
-              <span className="min-w-0 truncate font-medium">{viewedFile.name}</span>
-              <span className="shrink-0 text-[#777a81]">{formatFileSize(viewedFile.size)}</span>
-            </header>
-            <section
-              aria-label="File editor"
-              className="relative min-h-0 flex-1 overflow-hidden bg-white"
-            >
+        <header className="flex h-11 shrink-0 items-center justify-between gap-3 border-b border-[#eceef0] px-3 text-xs">
+          <span className="min-w-0 truncate font-medium">{viewedFile.name}</span>
+          <span className="shrink-0 text-[#777a81]">{formatFileSize(viewedFile.size)}</span>
+        </header>
+        <section
+          aria-label="File editor"
+          className="relative min-h-0 flex-1 overflow-hidden bg-white"
+        >
               {isEditorLoading ? (
                 <div className="flex h-full items-center justify-center gap-2 text-sm text-[#777a81]">
                   <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
@@ -2952,20 +4105,14 @@ export function App() {
               >
                 Commit
               </button>
-            </section>
-          </>
-        )}
+        </section>
       </main>
     );
   }
 
   return (
     <main
-      className="fixed inset-x-0 flex justify-center bg-[#f5f6f8] p-0 sm:p-5"
-      style={{
-        top: viewport.height ? `${viewport.top}px` : 0,
-        height: viewport.height ? `${viewport.height}px` : "100dvh",
-      }}
+      className="fixed inset-0 flex justify-center bg-white p-0 sm:p-5"
     >
       <section
         aria-label="CheyaVerse chat"
@@ -3014,70 +4161,6 @@ export function App() {
             className="pointer-events-none absolute inset-2 z-40 flex items-center justify-center rounded-[28px] border-2 border-dashed border-[#229fe3] bg-[#e9f7fd]/95 text-center text-sm font-medium text-[#176d96] shadow-[0_0_0_9999px_rgba(34,159,227,0.08)] sm:inset-3"
           >
             Drop files or media to attach
-          </div>
-        )}
-        {isLoadingHistory && messages.length === 0 && (
-          <div
-            role="status"
-            aria-label="Loading conversation"
-            className="absolute inset-0 z-30 flex flex-col bg-white sm:rounded-[33px]"
-          >
-            <div
-              aria-hidden="true"
-              className="flex h-[64px] shrink-0 items-center justify-between gap-2 px-2 py-1 sm:gap-3 sm:px-5"
-            >
-              <div className="flex h-12 min-w-0 flex-1 items-center gap-2 rounded-full border border-[#e8e9ec] bg-white py-1 pl-1 pr-3 sm:gap-2.5">
-                <div className="chat-loading-skeleton size-10 shrink-0 rounded-full" />
-                <div className="flex min-w-0 flex-1 flex-col gap-1.5">
-                  <div className="chat-loading-skeleton h-3.5 w-28 rounded-full" />
-                  <div className="chat-loading-skeleton h-2.5 w-24 rounded-full" />
-                </div>
-                <div className="chat-loading-skeleton size-8 shrink-0 rounded-full" />
-              </div>
-              <div className="flex h-12 shrink-0 items-center gap-1 rounded-full border border-[#e8e9ec] bg-white p-1">
-                {[0, 1].map((item) => (
-                  <div key={item} className="chat-loading-skeleton size-9 rounded-full" />
-                ))}
-              </div>
-            </div>
-
-            <div className="flex min-h-0 flex-1 flex-col justify-end gap-5 overflow-hidden px-4 pb-5 pt-[72px] sm:px-6">
-              <div aria-hidden="true" className="flex flex-col items-end gap-2">
-                <div className="flex gap-1.5">
-                  <div className="chat-loading-skeleton size-[68px] rounded-xl" />
-                  <div className="chat-loading-skeleton size-[68px] rounded-xl" />
-                </div>
-                <div className="chat-loading-skeleton h-10 w-36 rounded-[18px] rounded-br-md" />
-              </div>
-              <div aria-hidden="true" className="flex flex-col gap-3">
-                <div className="chat-loading-skeleton h-3 w-28 rounded-full" />
-                <div className="chat-loading-skeleton h-3 w-[92%] rounded-full" />
-                <div className="chat-loading-skeleton h-3 w-[84%] rounded-full" />
-                <div className="chat-loading-skeleton h-3 w-[68%] rounded-full" />
-              </div>
-              <div aria-hidden="true" className="flex justify-end">
-                <div className="chat-loading-skeleton h-10 w-48 rounded-[18px] rounded-br-md" />
-              </div>
-            </div>
-
-            <div
-              aria-hidden="true"
-              className="shrink-0 px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-2.5 sm:px-5 sm:pb-5"
-            >
-              <div className="rounded-[28px] border border-[#e8e9ec] bg-white p-2 shadow-[0_4px_18px_rgba(25,32,43,0.06)]">
-                <div className="chat-loading-skeleton mb-2 h-[68px] w-[68px] rounded-xl" />
-                <div className="flex min-h-11 items-start px-3 pt-2 sm:min-h-[52px]">
-                  <div className="chat-loading-skeleton mt-1 h-3.5 w-28 rounded-full" />
-                </div>
-                <div className="-mx-1 flex items-center justify-between gap-2 px-1 pb-1">
-                  <div className="chat-loading-skeleton size-9 rounded-full sm:size-10" />
-                  <div className="flex items-center gap-2">
-                    <div className="chat-loading-skeleton h-9 w-28 rounded-full sm:h-10" />
-                    <div className="chat-loading-skeleton size-9 rounded-full sm:size-10" />
-                  </div>
-                </div>
-              </div>
-            </div>
           </div>
         )}
         <header className="absolute inset-x-0 top-0 z-20 flex h-[64px] select-none items-center justify-between gap-2 bg-transparent px-2 py-1 sm:gap-3 sm:px-5">
@@ -3139,7 +4222,7 @@ export function App() {
           aria-label="Conversation"
           aria-live="polite"
           onScroll={handleConversationScroll}
-          className="relative min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pb-3 pt-[72px] sm:px-6"
+          className="relative min-h-0 flex-1 overflow-y-auto overscroll-contain bg-white px-4 pb-3 pt-[72px] sm:px-6"
         >
           <div className="space-y-3">
             {messages.map((chatMessage) => {
@@ -3162,7 +4245,7 @@ export function App() {
                   <button
                     type="button"
                     aria-label={`Show previous ${versionLabel} version`}
-                    disabled={isSending || isRestoringVersion || versionIndex <= 0}
+                    disabled={isSending || versionIndex <= 0}
                     onClick={() => void setMessageVersion(chatMessage, -1)}
                     className="flex size-7 items-center justify-center rounded-md hover:bg-[#f1f2f4] disabled:opacity-30"
                   >
@@ -3174,7 +4257,6 @@ export function App() {
                     aria-label={`Show newer ${versionLabel} version`}
                     disabled={
                       isSending ||
-                      isRestoringVersion ||
                       versionIndex < 0 ||
                       versionIndex >= versions.length - 1
                     }
@@ -3207,16 +4289,37 @@ export function App() {
                       </div>
                     )}
                     <div
-                      onTouchStart={() => {
+                      onPointerDown={(event) => {
+                        if (event.pointerType !== "touch") return;
                         clearLongPressTimer();
+                        longPressStartRef.current = { x: event.clientX, y: event.clientY };
                         longPressTimerRef.current = setTimeout(
-                          () => setActiveUserActions(chatMessage.id),
-                          550,
+                          () => {
+                            setActiveUserActions(chatMessage.id);
+                            longPressTimerRef.current = null;
+                          },
+                          300,
                         );
                       }}
-                      onTouchMove={clearLongPressTimer}
-                      onTouchEnd={clearLongPressTimer}
-                      onTouchCancel={clearLongPressTimer}
+                      onPointerMove={(event) => {
+                        const start = longPressStartRef.current;
+                        if (
+                          event.pointerType === "touch" &&
+                          start &&
+                          Math.hypot(event.clientX - start.x, event.clientY - start.y) > 10
+                        ) {
+                          clearLongPressTimer();
+                          longPressStartRef.current = null;
+                        }
+                      }}
+                      onPointerUp={() => {
+                        clearLongPressTimer();
+                        longPressStartRef.current = null;
+                      }}
+                      onPointerCancel={() => {
+                        clearLongPressTimer();
+                        longPressStartRef.current = null;
+                      }}
                       onContextMenu={(event) => {
                         event.preventDefault();
                         setActiveUserActions(chatMessage.id);
@@ -3225,7 +4328,7 @@ export function App() {
                       className="max-w-[94%] select-none rounded-[18px] rounded-br-md bg-[#28292e] px-3.5 py-1.5 text-[13px] leading-[1.35] text-white [webkit-touch-callout:none] sm:max-w-[88%]"
                       style={{ WebkitTouchCallout: "none" }}
                     >
-                      <Suspense fallback={<p className="m-0 whitespace-pre-wrap">{visibleText}</p>}>
+                      <Suspense fallback={null}>
                         <AssistantMarkdown content={visibleText} userMessage />
                       </Suspense>
                       <LinkPreviews
@@ -3272,9 +4375,7 @@ export function App() {
                         type="button"
                         aria-label="Edit user message"
                         onClick={() => {
-                          setUserEditTarget(chatMessage.id);
-                          setUserEditText(visibleText);
-                          setSendError("");
+                          openUserMessageEditor(chatMessage.id, visibleText);
                         }}
                         className="flex size-7 items-center justify-center rounded-md text-[#777a82] hover:bg-[#f1f2f4]"
                       >
@@ -3329,7 +4430,7 @@ export function App() {
                     </div>
                   )}
                   <div className="max-w-full break-words text-[14px] leading-6 sm:text-[15px]">
-                    <Suspense fallback={<p className="whitespace-pre-wrap">{visibleText}</p>}>
+                    <Suspense fallback={null}>
                       <AssistantMarkdown
                         content={visibleText}
                         animate={animateAssistant}
@@ -3394,9 +4495,8 @@ export function App() {
                         setReportTarget({
                           id: chatMessage.id,
                           versionNumber,
-                          text: visibleText,
                         });
-                        setReportDetails("");
+                        reportDetailsRef.current = "";
                         setReportError("");
                         setSendError("");
                       }}
@@ -3425,12 +4525,12 @@ export function App() {
                 role="status"
                 aria-live="polite"
                 className={`w-full min-w-0 text-xs text-[#747780] ${
-                  activeChatJob?.thinking_mode ?? isThinkMode
+                  activeChatJob?.thinking_mode ?? thinkingModeRef.current
                     ? "space-y-1.5 rounded-2xl border border-[#ece9f5] bg-[#faf9fd] px-3.5 py-3"
                     : "flex justify-start px-1 py-1"
                 }`}
               >
-                {activeChatJob?.thinking_mode ?? isThinkMode ? (
+                {activeChatJob?.thinking_mode ?? thinkingModeRef.current ? (
                   <p className="font-medium text-[#4b4e55]">
                     {activeChatJob?.progress ||
                       thinkingSteps[thinkingSteps.length - 1] ||
@@ -3496,7 +4596,7 @@ export function App() {
                   const isPreviewable =
                     attachment.mimeType.startsWith("image/") ||
                     attachment.mimeType.startsWith("video/");
-                  const preview = mediaPreviews.get(file);
+                  const preview = attachment.isBlocked ? undefined : mediaPreviews.get(file);
 
                   return (
                     <article
@@ -3508,16 +4608,22 @@ export function App() {
                       <button
                         type="button"
                         aria-label={`Open ${file.name}`}
+                        disabled={attachment.isBlocked}
                         onClick={() => void openAttachment(index)}
-                        className="absolute inset-0 flex size-full flex-col items-center justify-center overflow-hidden text-left"
+                        className="absolute inset-0 flex size-full flex-col items-center justify-center overflow-hidden text-left disabled:cursor-not-allowed"
                       >
-                        {isPreviewable && preview ? (
+                        {attachment.isBlocked ? (
+                          <div className="flex size-full flex-col items-center justify-center gap-1 bg-amber-50 px-1.5 text-amber-800">
+                            <TriangleAlert aria-hidden="true" className="size-6" />
+                            <span className="text-center text-[9px] font-semibold leading-3">
+                              Not uploaded
+                            </span>
+                          </div>
+                        ) : isPreviewable && preview ? (
                           attachment.mimeType.startsWith("video/") ? (
                             <video
                               src={preview}
                               muted
-                              loop
-                              autoPlay
                               playsInline
                               preload="metadata"
                               aria-label={`Preview of ${file.name}`}
@@ -3543,6 +4649,13 @@ export function App() {
                           </div>
                         )}
                       </button>
+                      {attachment.mimeType.startsWith("video/") &&
+                        preview &&
+                        !attachment.isBlocked && (
+                          <span className="pointer-events-none absolute left-1/2 top-1/2 z-[2] flex size-8 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full bg-black/55 text-white">
+                            <Play aria-hidden="true" className="size-4 fill-current" />
+                          </span>
+                        )}
                       {isPreviewable && preview && (
                         <span className="pointer-events-none absolute inset-x-0 bottom-0 truncate bg-gradient-to-t from-black/75 to-transparent px-1 pb-1 pt-3 text-center text-[8px] font-medium text-white">
                           {file.name}
@@ -3555,7 +4668,7 @@ export function App() {
                           className="attachment-upload-progress pointer-events-none absolute inset-x-0 bottom-0 z-[5]"
                         />
                       )}
-                      {attachment.uploadError && (
+                      {attachment.uploadError && !attachment.isBlocked && (
                         <span
                           role="alert"
                           className="absolute inset-x-0 bottom-0 truncate bg-red-700/90 px-1 py-1 text-center text-[9px] font-medium text-white"
@@ -3581,10 +4694,11 @@ export function App() {
                 })}
               </div>
             )}
-            <div className="flex min-h-11 items-start px-3 pt-1 sm:min-h-[52px]">
+            <div className="flex min-h-11 items-start px-3 pb-2 pt-1 sm:min-h-[52px]">
               <ChatMessageInput
                 inputRef={messageInputRef}
-                disabled={!hasGeminiApiKey || isLoadingHistory}
+                defaultValue={messageDraftRef.current}
+                disabled={!hasGeminiApiKey}
                 onDraftInput={handleMessageDraftInput}
                 onSubmitMessage={() => void sendMessage()}
                 placeholder={
@@ -3594,88 +4708,23 @@ export function App() {
             </div>
 
             <div className="-mx-1 flex items-center justify-between gap-2 px-1 pb-1">
-              <div className="relative">
-                <button
-                  type="button"
-                  aria-label="Add media"
-                  disabled={!hasGeminiApiKey || isLoadingHistory || isRestoringDraftAttachments}
-                  aria-expanded={isMediaMenuOpen}
-                  aria-haspopup="menu"
-                  onClick={() => setIsMediaMenuOpen((open) => !open)}
-                  className="flex size-9 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] disabled:cursor-not-allowed sm:size-10"
-                >
-                  <Plus aria-hidden="true" className="size-[21px]" strokeWidth={1.8} />
-                </button>
-                {isMediaMenuOpen && (
-                  <>
-                    <button
-                      type="button"
-                      aria-label="Close media menu"
-                      className="fixed inset-0 z-20 cursor-default"
-                      onClick={() => setIsMediaMenuOpen(false)}
-                    />
-                    <div
-                      role="menu"
-                      aria-label="Choose a media source"
-                      className="absolute bottom-[calc(100%+10px)] left-0 z-30 w-48 overflow-hidden rounded-2xl border border-[#e5e6e9] bg-white p-1.5 shadow-xl"
-                    >
-                      <button
-                        type="button"
-                        role="menuitem"
-                        onClick={() => {
-                          setIsMediaMenuOpen(false);
-                          openCamera();
-                        }}
-                        className="flex h-11 w-full items-center gap-3 rounded-xl px-3 text-sm text-[#292b30] transition hover:bg-[#f4f5f7]"
-                      >
-                        <Camera aria-hidden="true" className="size-[18px]" />
-                        Camera
-                      </button>
-                      <button
-                        type="button"
-                        role="menuitem"
-                        onClick={() => {
-                          setIsMediaMenuOpen(false);
-                          fileInputRef.current?.click();
-                        }}
-                        className="flex h-11 w-full items-center gap-3 rounded-xl px-3 text-sm text-[#292b30] transition hover:bg-[#f4f5f7]"
-                      >
-                        <Image aria-hidden="true" className="size-[18px]" />
-                        Photo
-                      </button>
-                      <button
-                        type="button"
-                        role="menuitem"
-                        onClick={() => {
-                          setIsMediaMenuOpen(false);
-                          filesInputRef.current?.click();
-                        }}
-                        className="flex h-11 w-full items-center gap-3 rounded-xl px-3 text-sm text-[#292b30] transition hover:bg-[#f4f5f7]"
-                      >
-                        <Files aria-hidden="true" className="size-[18px]" />
-                        Files
-                      </button>
-                    </div>
-                  </>
-                )}
-              </div>
+              <ChatMediaMenu
+                disabled={
+                  !hasGeminiApiKey ||
+                  isRestoringDraftAttachments ||
+                  isPreparingAttachments
+                }
+                onOpenCamera={openCamera}
+                onPickPhoto={() => fileInputRef.current?.click()}
+                onPickFiles={() => filesInputRef.current?.click()}
+              />
               <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  aria-label="Think"
-                  aria-pressed={isThinkMode}
-                  title={isThinkMode ? "Turn off thinking summary" : "Turn on thinking summary"}
-                  disabled={!hasGeminiApiKey || isLoadingHistory}
-                  onClick={() => setIsThinkMode((enabled) => !enabled)}
-                  className={`flex h-9 items-center gap-2 rounded-full border px-3 text-sm font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] disabled:cursor-not-allowed sm:h-10 sm:px-3.5 ${
-                    isThinkMode
-                      ? "border-[#b9dff2] bg-[#edf8fd] text-[#1678a8]"
-                      : "border-[#e5e6e9] bg-white text-[#34363b] hover:bg-[#f7f8fa]"
-                  }`}
-                >
-                  <Brain aria-hidden="true" className="size-[18px]" strokeWidth={1.8} />
-                  <span>Thinking</span>
-                </button>
+                <ThinkingModeToggle
+                  disabled={!hasGeminiApiKey}
+                  onToggle={(enabled) => {
+                    thinkingModeRef.current = enabled;
+                  }}
+                />
                 {attachedMedia.length > 0 ? (
                   <button
                     type="button"
@@ -3683,10 +4732,13 @@ export function App() {
                     onClick={sendMessage}
                     disabled={
                       isSending ||
-                      isLoadingHistory ||
                       isRestoringDraftAttachments ||
+                      isPreparingAttachments ||
                       !hasGeminiApiKey ||
-                      attachedMedia.some((attachment) => attachment.isUploading || !attachment.uploaded)
+                      attachedMedia.some(
+                        (attachment) =>
+                          attachment.isBlocked || attachment.isUploading || !attachment.uploaded,
+                      )
                     }
                     className="flex size-9 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] sm:size-10"
                   >
@@ -3718,7 +4770,6 @@ export function App() {
                       onClick={sendMessage}
                       disabled={
                         isSending ||
-                        isLoadingHistory ||
                         isRestoringDraftAttachments ||
                         isAttachmentUploadPending ||
                         !hasGeminiApiKey
@@ -3740,7 +4791,14 @@ export function App() {
       </section>
 
       {deleteChatTarget && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-5 py-8">
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-5 py-8"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !isDeletingChatBranch) {
+              setDeleteChatTarget(null);
+            }
+          }}
+        >
           <section
             role="alertdialog"
             aria-modal="true"
@@ -3792,56 +4850,72 @@ export function App() {
         </div>
       )}
 
-      {userEditTarget && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-5 py-8">
-          <form
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="edit-user-message-title"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void saveUserMessageEdit();
+      <dialog
+        ref={userEditDialogRef}
+        onCancel={(event) => {
+          event.preventDefault();
+          closeUserMessageEditor();
+        }}
+        onClose={() => {
+          userEditTargetRef.current = null;
+        }}
+        className="fixed inset-0 m-auto w-[calc(100%-2.5rem)] max-w-lg border-0 bg-transparent p-0 backdrop:bg-black/35"
+      >
+        <form
+          aria-labelledby="edit-user-message-title"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void saveUserMessageEdit();
+          }}
+          className="w-full rounded-3xl bg-white p-5 shadow-xl"
+        >
+          <h2 id="edit-user-message-title" className="text-base font-semibold text-[#22242a]">
+            Edit message
+          </h2>
+          <textarea
+            ref={userEditTextareaRef}
+            aria-label="Edit user message"
+            maxLength={50000}
+            rows={5}
+            onInput={(event) => {
+              userEditTextRef.current = event.currentTarget.value;
             }}
-            className="w-full max-w-lg rounded-3xl bg-white p-5 shadow-xl"
-          >
-            <h2 id="edit-user-message-title" className="text-base font-semibold text-[#22242a]">
-              Edit message
-            </h2>
-            <textarea
-              aria-label="Edit user message"
-              maxLength={50000}
-              rows={5}
-              value={userEditText}
-              onChange={(event) => setUserEditText(event.target.value)}
-              className="mt-3 w-full resize-y rounded-xl border border-[#e5e6e9] p-3 text-sm leading-6 outline-none focus:border-[#229fe3]"
-            />
-            <p className="mt-2 text-xs text-[#777a82]">
-              Pesan setelah ini akan disimpan sebagai riwayat lama dan disembunyikan dari percakapan aktif.
-            </p>
-            <div className="mt-4 flex justify-end gap-2">
-              <button
-                type="button"
-                disabled={isSending}
-                onClick={() => setUserEditTarget(null)}
-                className="h-10 rounded-full border border-[#e5e6e9] px-4 text-sm font-medium text-[#34363b] hover:bg-[#f7f8fa] disabled:opacity-50"
-              >
-                Cancel
-              </button>
-              <button
-                type="submit"
-                disabled={isSending}
-                className="flex h-10 items-center gap-2 rounded-full bg-[#28292e] px-4 text-sm font-medium text-white hover:bg-[#3b3d43] disabled:opacity-50"
-              >
-                {isSending && <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />}
-                Save edit
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
+            className="mt-3 w-full resize-y rounded-xl border border-[#e5e6e9] p-3 text-sm leading-6 outline-none focus:border-[#229fe3]"
+          />
+          <p className="mt-2 text-xs text-[#777a82]">
+            Pesan setelah ini akan disimpan sebagai riwayat lama dan disembunyikan dari percakapan aktif.
+          </p>
+          <div className="mt-4 flex justify-end gap-2">
+            <button
+              type="button"
+              disabled={isSending}
+              onClick={closeUserMessageEditor}
+              className="h-10 rounded-full border border-[#e5e6e9] px-4 text-sm font-medium text-[#34363b] hover:bg-[#f7f8fa] disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={isSending}
+              className="flex h-10 items-center gap-2 rounded-full bg-[#28292e] px-4 text-sm font-medium text-white hover:bg-[#3b3d43] disabled:opacity-50"
+            >
+              {isSending && <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />}
+              Save edit
+            </button>
+          </div>
+        </form>
+      </dialog>
 
       {reportTarget && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-5 py-8">
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-5 py-8"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !isSavingReport) {
+              setReportTarget(null);
+              setReportError("");
+            }
+          }}
+        >
           <section
             role="dialog"
             aria-modal="true"
@@ -3851,13 +4925,6 @@ export function App() {
             <h2 id="report-response-title" className="text-base font-semibold text-[#22242a]">
               Report this response
             </h2>
-            <p className="mt-1 text-xs leading-5 text-[#747780]">
-              Your report is saved with this response to guide future replies in your chat. It is
-              not sent to an administrator or anyone else.
-            </p>
-            <p className="mt-2 max-h-20 overflow-y-auto whitespace-pre-wrap rounded-xl bg-[#f5f6f8] p-3 text-xs leading-5 text-[#64666d]">
-              {reportTarget.text.slice(0, 400)}
-            </p>
             <label htmlFor="response-report-details" className="mt-4 block text-sm text-[#43454b]">
               What went wrong?
             </label>
@@ -3865,8 +4932,10 @@ export function App() {
               id="response-report-details"
               maxLength={2000}
               rows={4}
-              value={reportDetails}
-              onChange={(event) => setReportDetails(event.target.value)}
+              defaultValue={reportDetailsRef.current}
+              onChange={(event) => {
+                reportDetailsRef.current = event.currentTarget.value;
+              }}
               className="mt-2 w-full resize-y rounded-xl border border-[#e5e6e9] p-3 text-sm outline-none focus:border-[#229fe3]"
             />
             {reportError && (
@@ -3901,7 +4970,12 @@ export function App() {
       )}
 
       {deleteConfirmation && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-5 py-8">
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-5 py-8"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) resolveDeleteConfirmation(false);
+          }}
+        >
           <section
             role="alertdialog"
             aria-modal="true"
@@ -3938,125 +5012,100 @@ export function App() {
         </div>
       )}
 
+      {attachmentToast && (
+        <div className="pointer-events-none fixed inset-x-0 bottom-[calc(84px+env(safe-area-inset-bottom))] z-[80] flex justify-center px-4 sm:bottom-6">
+          <div
+            role="alert"
+            aria-live="assertive"
+            className="pointer-events-auto flex max-w-lg items-start gap-2.5 rounded-2xl border border-red-200 bg-[#fff8f7] px-3.5 py-3 text-sm text-red-900 shadow-[0_8px_28px_rgba(30,20,20,0.22)]"
+          >
+            <TriangleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-red-700" />
+            <p className="min-w-0 flex-1 whitespace-pre-line leading-5">{attachmentToast}</p>
+            <button
+              type="button"
+              aria-label="Dismiss attachment notification"
+              onClick={() => {
+                if (attachmentToastTimerRef.current) {
+                  clearTimeout(attachmentToastTimerRef.current);
+                  attachmentToastTimerRef.current = null;
+                }
+                setAttachmentToast("");
+              }}
+              className="flex size-6 shrink-0 items-center justify-center rounded-full text-red-800 transition hover:bg-red-100"
+            >
+              <X aria-hidden="true" className="size-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {isCameraOpen && (
         <div
-          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/75 p-3 sm:p-6"
-          onClick={() => {
-            if (!isRecordingVideo) closeCamera();
-          }}
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/75 p-0 backdrop-blur-sm sm:p-6"
+          onClick={closeCamera}
         >
           <section
             role="dialog"
             aria-modal="true"
             aria-label="Camera capture"
-            className="relative flex max-h-full w-full max-w-2xl flex-col overflow-hidden rounded-3xl bg-[#17181c] text-white shadow-2xl"
+            className="camera-capture-dialog relative overflow-hidden bg-[#090a0c] sm:rounded-3xl sm:shadow-2xl"
             onClick={(event) => event.stopPropagation()}
           >
-            <header className="flex h-14 shrink-0 items-center justify-between border-b border-white/10 px-4">
-              <h2 className="text-sm font-medium">Camera</h2>
-              <button
-                type="button"
-                aria-label="Close camera"
-                onClick={closeCamera}
-                disabled={isRecordingVideo}
-                className="flex size-9 items-center justify-center rounded-full hover:bg-white/10 disabled:opacity-50"
-              >
-                <X aria-hidden="true" className="size-5" />
-              </button>
-            </header>
-            <div className="relative flex min-h-0 flex-1 items-center justify-center bg-black">
+            <div className="absolute inset-0 flex items-center justify-center bg-black">
               <video
                 ref={cameraVideoRef}
                 autoPlay
                 muted
                 playsInline
                 aria-label="Live camera preview"
-                className="max-h-[min(68dvh,680px)] w-full object-contain"
+                className="size-full object-cover"
               />
-              {cameraError && (
-                <p role="alert" className="absolute inset-x-4 bottom-4 rounded-xl bg-black/75 p-3 text-center text-sm text-white">
-                  {cameraError}
-                </p>
-              )}
             </div>
-            <footer className="flex shrink-0 flex-wrap items-center justify-between gap-3 p-4">
-              <div className="flex rounded-full border border-white/15 p-1">
-                <button
-                  type="button"
-                  aria-pressed={cameraMode === "photo"}
-                  disabled={isRecordingVideo}
-                  onClick={() => setCameraMode("photo")}
-                  className={`rounded-full px-4 py-2 text-sm ${cameraMode === "photo" ? "bg-white text-[#202126]" : "text-white/75 hover:bg-white/10"}`}
-                >
-                  Photo
-                </button>
-                <button
-                  type="button"
-                  aria-pressed={cameraMode === "video"}
-                  disabled={isRecordingVideo}
-                  onClick={() => setCameraMode("video")}
-                  className={`rounded-full px-4 py-2 text-sm ${cameraMode === "video" ? "bg-white text-[#202126]" : "text-white/75 hover:bg-white/10"}`}
-                >
-                  Video
-                </button>
-              </div>
-              {cameraMode === "photo" ? (
-                <button
-                  type="button"
-                  aria-label="Take photo"
-                  onClick={() => void captureCameraPhoto()}
-                  className="flex h-11 items-center gap-2 rounded-full bg-white px-5 text-sm font-semibold text-[#202126] hover:bg-white/90"
-                >
-                  <Camera aria-hidden="true" className="size-4" />
-                  Capture
-                </button>
-              ) : (
-                <div className="flex min-w-0 flex-1 items-center justify-end gap-3">
-                  <div className="min-w-0 flex-1">
-                    <div className="mb-1 flex justify-between gap-2 text-[11px] text-white/75">
-                      <span>
-                        {isRecordingVideo
-                          ? cameraStopForSizeLimitRef.current
-                            ? "Finalizing recording…"
-                            : "Recording size"
-                          : "Max recording size"}
-                      </span>
-                      <span className="shrink-0">
-                        {formatChatAttachmentSize(cameraRecordedBytes)} /{" "}
-                        {formatChatAttachmentSize(MAX_CHAT_ATTACHMENT_BYTES)}
-                      </span>
-                    </div>
-                    <div
-                      role="progressbar"
-                      aria-label="Video recording size limit"
-                      aria-valuemin={0}
-                      aria-valuemax={MAX_CHAT_ATTACHMENT_BYTES}
-                      aria-valuenow={Math.min(cameraRecordedBytes, MAX_CHAT_ATTACHMENT_BYTES)}
-                      className="h-1.5 overflow-hidden rounded-full bg-white/15"
-                    >
-                      <div
-                        className={`h-full rounded-full transition-[width] ${cameraStopForSizeLimitRef.current ? "bg-amber-400" : "bg-[#39b6ed]"}`}
-                        style={{
-                          width: `${Math.min(
-                            100,
-                            (cameraRecordedBytes / MAX_CHAT_ATTACHMENT_BYTES) * 100,
-                          )}%`,
-                        }}
-                      />
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    aria-label={isRecordingVideo ? "Stop recording" : "Start recording"}
-                    onClick={toggleVideoRecording}
-                    className={`flex h-11 shrink-0 items-center gap-2 rounded-full px-5 text-sm font-semibold ${isRecordingVideo ? "bg-red-600 text-white hover:bg-red-700" : "bg-white text-[#202126] hover:bg-white/90"}`}
-                  >
-                    <Video aria-hidden="true" className="size-4" />
-                    {isRecordingVideo ? "Stop" : "Record"}
-                  </button>
-                </div>
-              )}
-            </footer>
+            <button
+              type="button"
+              aria-label="Close camera"
+              onClick={closeCamera}
+              className="camera-desktop-close absolute right-4 top-4 z-10 size-11 items-center justify-center rounded-full border border-white/35 bg-black/50 text-white shadow-lg backdrop-blur-md transition hover:bg-black/70 sm:right-5 sm:top-5"
+            >
+              <X aria-hidden="true" className="size-5" />
+            </button>
+            {isCameraSwitchSupported && (
+              <button
+                type="button"
+                aria-label="Switch camera"
+                title="Switch camera"
+                onClick={() =>
+                  setCameraFacing((facing) => (facing === "environment" ? "user" : "environment"))
+                }
+                className="camera-mobile-control camera-desktop-switch-control absolute bottom-[max(38px,env(safe-area-inset-bottom))] left-5 z-10 flex size-12 items-center justify-center rounded-full border border-white/30 bg-black/45 text-white shadow-lg backdrop-blur-md transition hover:bg-black/65 active:scale-95"
+              >
+                <SwitchCamera aria-hidden="true" className="size-5" />
+              </button>
+            )}
+            {isCameraTorchSupported && (
+              <button
+                type="button"
+                aria-label={isCameraTorchOn ? "Turn camera light off" : "Turn camera light on"}
+                title={isCameraTorchOn ? "Turn light off" : "Turn light on"}
+                aria-pressed={isCameraTorchOn}
+                onClick={() => void toggleCameraTorch()}
+                className="camera-mobile-control absolute bottom-[max(38px,env(safe-area-inset-bottom))] right-5 z-10 flex size-12 items-center justify-center rounded-full border border-white/30 bg-black/45 text-white shadow-lg backdrop-blur-md transition hover:bg-black/65 active:scale-95"
+              >
+                {isCameraTorchOn ? (
+                  <FlashlightOff aria-hidden="true" className="size-5" />
+                ) : (
+                  <Flashlight aria-hidden="true" className="size-5" />
+                )}
+              </button>
+            )}
+            <button
+              type="button"
+              aria-label="Take photo"
+              onClick={() => void captureCameraPhoto()}
+              className="absolute bottom-[max(28px,env(safe-area-inset-bottom))] left-1/2 z-10 flex size-[68px] -translate-x-1/2 items-center justify-center rounded-full border-[3px] border-white bg-white/15 shadow-[0_4px_18px_rgba(0,0,0,0.18)] transition active:scale-95"
+            >
+              <span aria-hidden="true" className="size-[50px] rounded-full bg-white" />
+            </button>
           </section>
         </div>
       )}

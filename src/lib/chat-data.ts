@@ -188,17 +188,32 @@ export async function createChatJob(
   return { jobId: job.job_id, messageId: job.message_id };
 }
 
-export async function loadRecentChatMessages(
+export interface ChatMessagePage {
+  messages: StoredChatMessage[];
+  hasMore: boolean;
+}
+
+export async function loadChatMessagePage(
   client: AppSupabaseClient,
-  limit = 50,
-  userId?: string,
-): Promise<StoredChatMessage[]> {
+  options: {
+    limit?: number;
+    before?: Pick<StoredChatMessage, "id" | "created_at">;
+    userId?: string;
+  } = {},
+): Promise<ChatMessagePage> {
+  const { limit = 50, before, userId } = options;
   let query = client
     .from("chat_messages")
     .select("id, user_id, role, content, embedding, created_at, version_number, thinking_summary, is_active, revision_reason")
     .eq("is_active", true)
     .order("created_at", { ascending: false })
-    .limit(limit);
+    .order("id", { ascending: false })
+    .limit(limit + 1);
+  if (before) {
+    query = query.or(
+      `created_at.lt.${before.created_at},and(created_at.eq.${before.created_at},id.lt.${before.id})`,
+    );
+  }
   if (userId) query = query.eq("user_id", userId);
   const { data, error } = await query;
   if (error) {
@@ -206,7 +221,10 @@ export async function loadRecentChatMessages(
       `Could not load saved chat history: ${error.message} Confirm the latest supabase/schema.sql has been run.`,
     );
   }
-  return data.reverse();
+  return {
+    messages: data.slice(0, limit).reverse(),
+    hasMore: data.length > limit,
+  };
 }
 
 export async function loadMessageAttachments(
@@ -378,6 +396,49 @@ export async function loadRecentInsights(
     );
   }
   return data.reverse();
+}
+
+export async function loadInsightsForMessages(
+  client: AppSupabaseClient,
+  messageIds: string[],
+  userId?: string,
+  limit = 12,
+): Promise<
+  Array<
+    Pick<
+      MessageInsight,
+      | "message_id"
+      | "mood"
+      | "communication_style"
+      | "situation"
+      | "topics"
+      | "support_needs"
+      | "summary"
+      | "created_at"
+    >
+  >
+> {
+  const uniqueMessageIds = [...new Set(messageIds)];
+  if (uniqueMessageIds.length === 0) return [];
+
+  let query = client
+    .from("message_insights")
+    .select("message_id, mood, communication_style, situation, topics, support_needs, summary, created_at")
+    .in("message_id", uniqueMessageIds)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+  if (userId) query = query.eq("user_id", userId);
+
+  const { data, error } = await query;
+  if (error) {
+    throw new Error(
+      `Could not load relevant conversation insights: ${error.message} Confirm the latest supabase/schema.sql has been run.`,
+    );
+  }
+  return data.sort(
+    (first, second) =>
+      uniqueMessageIds.indexOf(first.message_id) - uniqueMessageIds.indexOf(second.message_id),
+  );
 }
 
 export async function saveMessageInsight(
@@ -565,10 +626,13 @@ export async function loadRecentAssistantFeedback(
   userId?: string,
 ): Promise<
   Array<{
+    messageId: string;
     rating: "like" | "dislike" | "report";
     response: string;
     versionNumber: number;
     details: string | null;
+    request: string | null;
+    requestMessageId: string | null;
   }>
 > {
   if (messageIds.length === 0) return [];
@@ -604,23 +668,68 @@ export async function loadRecentAssistantFeedback(
     .select("message_id, version_number, content")
     .in("message_id", [...new Set(feedback.map((item) => item.message_id))]);
   if (userId) versionsQuery = versionsQuery.eq("user_id", userId);
-  const { data: versions, error: versionsError } = await versionsQuery;
+  let targetMessagesQuery = client
+    .from("chat_messages")
+    .select("id, created_at")
+    .in("id", [...new Set(feedback.map((item) => item.message_id))]);
+  if (userId) targetMessagesQuery = targetMessagesQuery.eq("user_id", userId);
+  const [versionsResult, targetMessagesResult] = await Promise.all([
+    versionsQuery,
+    targetMessagesQuery,
+  ]);
+  const { data: versions, error: versionsError } = versionsResult;
   if (versionsError) {
     throw new Error(`Could not load rated response versions: ${versionsError.message}`);
   }
   const contentById = new Map(
     versions.map((item) => [`${item.message_id}:${item.version_number}`, item.content]),
   );
-  return feedback.flatMap((item) => {
+  const { data: targetMessages, error: targetMessagesError } = targetMessagesResult;
+  if (targetMessagesError) {
+    throw new Error(`Could not load rated response context: ${targetMessagesError.message}`);
+  }
+  const latestResponseTime = targetMessages.reduce(
+    (latest, item) => (item.created_at > latest ? item.created_at : latest),
+    "",
+  );
+  let userMessagesQuery = client
+    .from("chat_messages")
+    .select("id, content, created_at")
+    .eq("role", "user")
+    .order("created_at", { ascending: false })
+    .limit(200);
+  if (latestResponseTime) userMessagesQuery = userMessagesQuery.lte("created_at", latestResponseTime);
+  if (userId) userMessagesQuery = userMessagesQuery.eq("user_id", userId);
+  const { data: userMessages, error: userMessagesError } = await userMessagesQuery;
+  if (userMessagesError) {
+    throw new Error(`Could not load requests for rated responses: ${userMessagesError.message}`);
+  }
+  const requestByResponseId = new Map(
+    targetMessages.map((response) => [
+      response.id,
+      userMessages.find((message) => message.created_at <= response.created_at) ?? null,
+    ]),
+  );
+  const messagePriority = new Map(messageIds.map((messageId, index) => [messageId, index]));
+  const prioritizedFeedback = [...feedback].sort((first, second) => {
+    const priorityDifference =
+      (messagePriority.get(first.message_id) ?? Number.MAX_SAFE_INTEGER) -
+      (messagePriority.get(second.message_id) ?? Number.MAX_SAFE_INTEGER);
+    return priorityDifference || second.created_at.localeCompare(first.created_at);
+  });
+  return prioritizedFeedback.flatMap((item) => {
     const content = contentById.get(`${item.message_id}:${item.version_number}`);
     if (!content || (item.kind !== "like" && item.kind !== "dislike" && item.kind !== "report")) {
       return [];
     }
     return [{
+      messageId: item.message_id,
       rating: item.kind,
       response: content,
       versionNumber: item.version_number,
       details: item.kind === "report" ? item.details : null,
+      request: requestByResponseId.get(item.message_id)?.content ?? null,
+      requestMessageId: requestByResponseId.get(item.message_id)?.id ?? null,
     }];
   });
 }
