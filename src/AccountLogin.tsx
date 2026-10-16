@@ -63,9 +63,10 @@ function loadGoogleIdentitySdk(): Promise<void> {
 interface AccountLoginProps {
   client: AppSupabaseClient | null;
   error: string;
+  onBack?: () => void;
 }
 
-export function AccountLogin({ client, error: initialError }: AccountLoginProps) {
+export function AccountLogin({ client, error: initialError, onBack }: AccountLoginProps) {
   const [captchaToken, setCaptchaToken] = useState<string | null>(null);
   const [captchaRound, setCaptchaRound] = useState(0);
   const [accessCode, setAccessCode] = useState<string[]>(Array(6).fill(""));
@@ -233,7 +234,7 @@ export function AccountLogin({ client, error: initialError }: AccountLoginProps)
           id="account-login-title"
           className="mt-4 text-center text-xl font-semibold text-[#202126]"
         >
-          Sign in to CheyaVerse
+          Sign in to CheyaAPP
         </h1>
         <p className="mt-2 text-center text-sm leading-6 text-[#777a81]">
           Sign in to sync your chats, memories, settings, and Gemini API keys on every device.
@@ -251,7 +252,7 @@ export function AccountLogin({ client, error: initialError }: AccountLoginProps)
 
         {!client ? (
           <p role="alert" className="mt-5 rounded-2xl bg-amber-50 px-3.5 py-3 text-sm text-amber-900">
-            The CheyaVerse account service is not configured for this deployment.
+            The CheyaAPP account service is not configured for this deployment.
           </p>
         ) : !siteKey ? (
           <p role="alert" className="mt-5 rounded-2xl bg-amber-50 px-3.5 py-3 text-sm text-amber-900">
@@ -345,7 +346,12 @@ export function AccountLogin({ client, error: initialError }: AccountLoginProps)
           </div>
         )}
       </section>
-      <nav aria-label="Legal information" className="flex shrink-0 items-center gap-4 pb-2 text-xs text-[#777a81]">
+      <nav aria-label="Account and legal links" className="flex shrink-0 items-center gap-4 pb-2 text-xs text-[#777a81]">
+        {onBack && (
+          <button type="button" onClick={onBack} className="hover:text-[#25262a] hover:underline">
+            Back
+          </button>
+        )}
         <a href="/privacy" className="hover:text-[#25262a] hover:underline">
           Kebijakan Privasi
         </a>

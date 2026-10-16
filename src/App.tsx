@@ -32,6 +32,7 @@ import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef, useState
 import cheyaLogo from "../assets/circle.png";
 import { AccountLogin } from "./AccountLogin";
 import { LinkPreviews } from "./components/LinkPreviews";
+import { PublicHome } from "./PublicHome";
 import {
   CHAT_ATTACHMENT_BUCKET,
   MAX_CHAT_ATTACHMENT_BYTES,
@@ -333,6 +334,7 @@ function isTextAttachment(mimeType: string, fileName: string): boolean {
 
 export function App() {
   const [pathname, setPathname] = useState(window.location.pathname);
+  const [isLoginOpen, setIsLoginOpen] = useState(false);
   const [authClient, setAuthClient] = useState<AppSupabaseClient | null>(null);
   const [authUser, setAuthUser] = useState<{ id: string; email: string | null } | null>(null);
   const [isAuthLoading, setIsAuthLoading] = useState(true);
@@ -2719,7 +2721,16 @@ export function App() {
   }
 
   if (!authUser) {
-    return <AccountLogin client={authClient} error={authError} />;
+    if (pathname === "/" && !isLoginOpen) {
+      return <PublicHome onSignIn={() => setIsLoginOpen(true)} />;
+    }
+    return (
+      <AccountLogin
+        client={authClient}
+        error={authError}
+        onBack={pathname === "/" ? () => setIsLoginOpen(false) : undefined}
+      />
+    );
   }
 
   if (remoteAttachmentView) {

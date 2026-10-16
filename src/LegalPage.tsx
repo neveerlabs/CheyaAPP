@@ -11,7 +11,7 @@ export function LegalPage({ kind }: { kind: LegalPageKind }) {
   const title = isPrivacy ? "Kebijakan Privasi" : "Ketentuan Layanan";
 
   useEffect(() => {
-    document.title = `${title} | CheyaVerse`;
+    document.title = `${title} | CheyaAPP`;
   }, [title]);
 
   return (
@@ -25,7 +25,7 @@ export function LegalPage({ kind }: { kind: LegalPageKind }) {
               className="size-11 rounded-full border border-[#e7e8eb] object-cover"
               draggable={false}
             />
-            <span className="text-sm font-semibold tracking-tight text-[#25262a]">CheyaVerse</span>
+            <span className="text-sm font-semibold tracking-tight text-[#25262a]">CheyaAPP</span>
           </a>
           <h1 className="mt-6 text-2xl font-semibold tracking-tight text-[#202126] sm:text-3xl">
             {title}
@@ -33,8 +33,8 @@ export function LegalPage({ kind }: { kind: LegalPageKind }) {
           <p className="mt-2 text-sm text-[#777a82]">Berlaku mulai 16 Oktober 2026</p>
           <p className="mt-4 max-w-2xl text-sm leading-6 text-[#5f626a]">
             {isPrivacy
-              ? "Halaman ini menjelaskan informasi yang diproses saat Anda menggunakan CheyaVerse, bagaimana informasi tersebut digunakan, dan pilihan yang tersedia bagi Anda."
-              : "Ketentuan ini mengatur penggunaan CheyaVerse. Dengan menggunakan layanan, Anda menyetujui ketentuan berikut."}
+              ? "Halaman ini menjelaskan informasi yang diproses saat Anda menggunakan CheyaAPP, bagaimana informasi tersebut digunakan, dan pilihan yang tersedia bagi Anda."
+              : "Ketentuan ini mengatur penggunaan CheyaAPP. Dengan menggunakan layanan, Anda menyetujui ketentuan berikut."}
           </p>
         </header>
 
@@ -42,7 +42,7 @@ export function LegalPage({ kind }: { kind: LegalPageKind }) {
 
         <footer className="flex flex-col gap-3 border-t border-[#eceef0] px-6 py-5 text-sm sm:flex-row sm:items-center sm:justify-between sm:px-10">
           <a href="/" className="font-medium text-[#356d91] hover:underline">
-            Kembali ke CheyaVerse
+            Kembali ke CheyaAPP
           </a>
           <nav aria-label="Legal information" className="flex flex-wrap items-center gap-x-4 gap-y-2">
             <a href="/privacy" className="text-[#5f626a] hover:text-[#25262a] hover:underline">
@@ -82,8 +82,12 @@ function PrivacyPolicy() {
       <PolicySection title="Informasi yang diproses">
         <p>
           Saat Anda masuk, Google dan Supabase memproses informasi akun yang diperlukan untuk
-          autentikasi, seperti identitas akun dan alamat email. CheyaVerse mengaitkan data layanan
+          autentikasi, seperti identitas akun dan alamat email. CheyaAPP mengaitkan data layanan
           dengan ID akun Supabase Anda.
+        </p>
+        <p>
+          Google Sign-In digunakan untuk autentikasi. CheyaAPP tidak meminta akses ke Gmail, Google
+          Drive, kontak, atau konten Google lainnya.
         </p>
         <p>
           Layanan menyimpan konten yang Anda buat atau kirim, termasuk pesan, balasan AI, versi
@@ -104,7 +108,7 @@ function PrivacyPolicy() {
           layanan. Kami tidak menjual data pribadi atau menggunakan percakapan untuk iklan.
         </p>
         <p>
-          CheyaVerse menggunakan Supabase untuk autentikasi, basis data, dan penyimpanan file;
+          CheyaAPP menggunakan Supabase untuk autentikasi, basis data, dan penyimpanan file;
           Vercel untuk hosting dan pemrosesan aplikasi; Google untuk masuk dan layanan Gemini AI;
           serta Cloudflare Turnstile untuk pemeriksaan keamanan saat masuk. Saat fitur pencarian
           web digunakan, query atau halaman yang diminta dapat diproses oleh penyedia pencarian
@@ -159,7 +163,7 @@ function TermsOfService() {
     <div>
       <PolicySection title="Menggunakan layanan">
         <p>
-          CheyaVerse menyediakan ruang percakapan AI, penyimpanan riwayat chat, pengelolaan
+          CheyaAPP menyediakan ruang percakapan AI, penyimpanan riwayat chat, pengelolaan
           personalisasi, serta fitur lampiran dan pencarian web. Anda bertanggung jawab menjaga
           akses ke akun dan kunci API yang Anda tambahkan.
         </p>
@@ -187,7 +191,7 @@ function TermsOfService() {
       <PolicySection title="Konten dan lampiran">
         <p>
           Anda tetap memiliki hak atas konten yang Anda kirim. Anda memberi izin terbatas kepada
-          CheyaVerse untuk menyimpan dan memproses konten tersebut hanya sejauh diperlukan untuk
+          CheyaAPP untuk menyimpan dan memproses konten tersebut hanya sejauh diperlukan untuk
           menjalankan fitur yang Anda gunakan.
         </p>
         <p>
