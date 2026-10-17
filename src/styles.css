@@ -162,6 +162,15 @@ input {
   font: inherit;
 }
 
+input,
+textarea,
+select,
+[contenteditable="true"],
+[role="textbox"] {
+  animation: none !important;
+  transition: none !important;
+}
+
 .chat-composer:has(textarea:not(:placeholder-shown)) .chat-composer-idle-control {
   display: none;
 }

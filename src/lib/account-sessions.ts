@@ -20,14 +20,8 @@ export function getAccountSessionLocation(): { origin: string; path: string } {
 }
 
 export function getAccountSessionDeviceLabel(userAgent: string): string {
-  if (/android/i.test(userAgent)) {
-    return /mobile/i.test(userAgent) ? "Android phone or tablet" : "Android device";
-  }
-  if (/iphone|ipad|ipod/i.test(userAgent)) return "iPhone or iPad";
-  if (/windows/i.test(userAgent)) return "Windows computer";
-  if (/macintosh|mac os/i.test(userAgent)) return "Mac computer";
-  if (/linux/i.test(userAgent)) return "Linux computer";
-  return "Unknown device";
+  if (/android|iphone|ipad|ipod|mobile/i.test(userAgent)) return "Mobile";
+  return "Computer";
 }
 
 export function getAccountSessionBrowserLabel(userAgent: string): string {

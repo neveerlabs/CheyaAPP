@@ -197,7 +197,7 @@ export function SettingsPage({
   const [deletingSessionIds, setDeletingSessionIds] = useState<string[]>([]);
   const [isDeletingOtherSessions, setIsDeletingOtherSessions] = useState(false);
   const [isDeleteAccountDialogOpen, setIsDeleteAccountDialogOpen] = useState(false);
-  const [deleteAccountConfirmation, setDeleteAccountConfirmation] = useState("");
+  const [isDeleteAccountConfirmationValid, setIsDeleteAccountConfirmationValid] = useState(false);
   const [isDeletingAccount, setIsDeletingAccount] = useState(false);
   const [memories, setMemories] = useState<UserMemory[]>([]);
   const [memoryContent, setMemoryContent] = useState("");
@@ -208,6 +208,8 @@ export function SettingsPage({
   const [isClearingChats, setIsClearingChats] = useState(false);
   const [isClearChatsConfirmationOpen, setIsClearChatsConfirmationOpen] = useState(false);
   const settingsContentRef = useRef<HTMLDivElement>(null);
+  const deleteAccountConfirmationRef = useRef<HTMLInputElement>(null);
+  const deleteAccountConfirmationValidRef = useRef(false);
   const personalizationDraftDirtyRef = useRef(false);
   const ttsDraftDirtyRef = useRef(false);
   const memoryDraftDirtyRef = useRef(false);
@@ -850,6 +852,7 @@ export function SettingsPage({
   }
 
   async function deleteAccount() {
+    if (deleteAccountConfirmationRef.current?.value !== "DELETE") return;
     clearMessages();
     setIsDeletingAccount(true);
     try {
@@ -881,7 +884,8 @@ export function SettingsPage({
       }
       clearAccountSessionId();
       setIsDeleteAccountDialogOpen(false);
-      setDeleteAccountConfirmation("");
+      deleteAccountConfirmationValidRef.current = false;
+      setIsDeleteAccountConfirmationValid(false);
       await client.auth.signOut({ scope: "local" });
       onNavigate("/");
     } catch (error) {
@@ -1573,7 +1577,8 @@ export function SettingsPage({
                 <button
                   type="button"
                   onClick={() => {
-                    setDeleteAccountConfirmation("");
+                    deleteAccountConfirmationValidRef.current = false;
+                    setIsDeleteAccountConfirmationValid(false);
                     setIsDeleteAccountDialogOpen(true);
                   }}
                   disabled={!isDatabaseReady || isDeletingAccount}
@@ -2260,9 +2265,14 @@ export function SettingsPage({
               confirm.
             </p>
             <input
+              ref={deleteAccountConfirmationRef}
               autoFocus
-              value={deleteAccountConfirmation}
-              onChange={(event) => setDeleteAccountConfirmation(event.target.value)}
+              onChange={(event) => {
+                const isValid = event.target.value === "DELETE";
+                if (deleteAccountConfirmationValidRef.current === isValid) return;
+                deleteAccountConfirmationValidRef.current = isValid;
+                setIsDeleteAccountConfirmationValid(isValid);
+              }}
               aria-label="Type DELETE to confirm account deletion"
               autoComplete="off"
               className="mt-4 h-11 w-full rounded-xl border border-[#e1e3e7] bg-white px-3 text-sm outline-none focus:border-red-500"
@@ -2283,7 +2293,7 @@ export function SettingsPage({
               </button>
               <button
                 type="button"
-                disabled={isDeletingAccount || deleteAccountConfirmation !== "DELETE"}
+                disabled={isDeletingAccount || !isDeleteAccountConfirmationValid}
                 onClick={() => void deleteAccount()}
                 className="flex h-10 items-center gap-2 rounded-full bg-red-700 px-4 text-sm font-medium text-white hover:bg-red-800 disabled:opacity-50"
               >
