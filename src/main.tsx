@@ -9,7 +9,10 @@ function Root() {
   const pathname = window.location.pathname;
   if (pathname === "/privacy") return <LegalPage kind="privacy" />;
   if (pathname === "/terms") return <LegalPage kind="terms" />;
-  if (pathname !== "/" && !/^\/settings(?:\/(?:personal|configure|memory))?\/?$/.test(pathname)) {
+  if (
+    pathname !== "/" &&
+    !/^\/settings(?:\/(?:personal|configure|memory|account|privacy|terms))?\/?$/.test(pathname)
+  ) {
     return (
       <ErrorPage
         code="404"

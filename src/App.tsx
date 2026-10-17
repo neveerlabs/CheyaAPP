@@ -28,6 +28,7 @@ import {
   Send,
   SwitchCamera,
   Video,
+  Volume2,
   ThumbsDown,
   ThumbsUp,
   TriangleAlert,
@@ -67,11 +68,25 @@ import {
 } from "./lib/chat-attachments";
 import { preprocessChatAttachment } from "./lib/chat-attachment-processing";
 import {
+  readBarcodeForAi,
+  type AiBarcodeReading,
+} from "./lib/chat-barcode";
+import {
   generateThinkingSummary,
   generateGeminiConversation,
+  normalizeUserFacingMarkdown,
   prepareGeminiAttachments,
   type GeminiAttachmentReference,
 } from "./lib/gemini";
+import {
+  clearAccountSessionId,
+  getAccountSessionId,
+  getAccountSessionLocation,
+} from "./lib/account-sessions";
+import { subscribeWithReconnect } from "./lib/realtime";
+import {
+  prepareAssistantSpeech,
+} from "./lib/tts-playback";
 import type { AppSupabaseClient, ChatMessageJob, ChatMessageVersion } from "./lib/supabase";
 import type { ChatAttachment } from "./lib/chat-attachments";
 
@@ -97,6 +112,12 @@ function PageLoadingSkeleton({ pathname }: { pathname: string }) {
       ? "Configure"
       : pathname.endsWith("/memory")
         ? "Memory"
+        : pathname.endsWith("/account")
+          ? "Account"
+          : pathname.endsWith("/privacy")
+            ? "Privacy Policy"
+            : pathname.endsWith("/terms")
+              ? "Terms of Service"
         : "Settings";
 
   if (isSettings) {
@@ -776,7 +797,7 @@ const ChatMediaMenu = memo(function ChatMediaMenu({
         aria-expanded={isOpen}
         aria-haspopup="menu"
         onClick={() => setIsOpen((open) => !open)}
-        className="flex size-9 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] disabled:cursor-not-allowed sm:size-10"
+        className="flex size-9 shrink-0 items-center justify-center rounded-full border-0 bg-transparent text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] disabled:cursor-not-allowed sm:size-10"
       >
         <Plus aria-hidden="true" className="size-[21px]" strokeWidth={1.8} />
       </button>
@@ -946,6 +967,19 @@ interface ReportTarget {
   versionNumber: number;
 }
 
+interface TtsPlayback {
+  messageId: string;
+  versionNumber: number;
+  text: string;
+  engine: "loading" | "audio" | "browser";
+  status: "loading" | "ready" | "playing" | "paused" | "ended" | "error";
+  durationSeconds: number;
+  elapsedSeconds: number;
+  browserVoiceName?: string;
+  errorSummary?: string;
+  errorDetails?: string;
+}
+
 type AssistantRating = "like" | "dislike";
 
 const textFileExtensions = new Set([
@@ -987,6 +1021,78 @@ const textFileExtensions = new Set([
 ]);
 const binaryFileExtensions = new Set(["7z", "doc", "docx", "gz", "pdf", "rar", "tar", "xls", "xlsx", "zip"]);
 
+function speechTextFromMarkdown(markdown: string): string {
+  return markdown
+    .replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/```[^\n]*\n?([\s\S]*?)```/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/^\s{0,3}(?:#{1,6}\s+|>\s?)/gm, "")
+    .replace(/^\s*(?:[-*+]|\d+[.)])\s+/gm, "")
+    .replace(/<\/?[a-z][^>]*>/gi, "")
+    .replace(/(\*\*|__|~~|\*|_)/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function estimateSpeechDurationSeconds(text: string): number {
+  const wordCount = text.split(/\s+/).filter(Boolean).length;
+  return Math.max(1, Math.ceil((wordCount / 155) * 60));
+}
+
+function formatSpeechTime(seconds: number): string {
+  const wholeSeconds = Math.max(0, Math.floor(seconds));
+  return `${Math.floor(wholeSeconds / 60)}:${String(wholeSeconds % 60).padStart(2, "0")}`;
+}
+
+function speechWaveHeight(text: string, index: number): number {
+  const character = text.charCodeAt((index * 7) % Math.max(text.length, 1)) || index * 13;
+  return 18 + ((character * (index + 11)) % 72);
+}
+
+function summarizeSpeechError(details: string): string {
+  const firstLine = details.split(/\r?\n/).find((line) => line.trim())?.trim() ?? "Speech playback failed.";
+  return firstLine.length > 64 ? `${firstLine.slice(0, 61).trimEnd()}...` : firstLine;
+}
+
+async function loadBrowserSpeechVoices(): Promise<SpeechSynthesisVoice[]> {
+  const synthesis = window.speechSynthesis;
+  const available = synthesis.getVoices();
+  if (available.length > 0) return available;
+
+  return new Promise((resolve) => {
+    const finish = () => {
+      window.clearTimeout(timeoutId);
+      synthesis.removeEventListener("voiceschanged", finish);
+      resolve(synthesis.getVoices());
+    };
+    const timeoutId = window.setTimeout(finish, 1200);
+    synthesis.addEventListener("voiceschanged", finish, { once: true });
+  });
+}
+
+function selectBrowserSpeechVoice(
+  voices: SpeechSynthesisVoice[],
+  preferredName?: string,
+): SpeechSynthesisVoice | null {
+  if (preferredName) {
+    const preferred = voices.find((voice) => voice.name === preferredName);
+    if (preferred) return preferred;
+  }
+  const indonesianVoices = voices.filter((voice) => /^id(?:-|$)/i.test(voice.lang));
+  const explicitlyFemale = voices.find((voice) =>
+    /google/i.test(voice.name) &&
+    /female|woman|perempuan|wanita|gadis/i.test(voice.name),
+  );
+  if (explicitlyFemale) return explicitlyFemale;
+  const googleIndonesian = indonesianVoices.find((voice) => /google/i.test(voice.name));
+  if (googleIndonesian) return googleIndonesian;
+  const likelyFemale = indonesianVoices.find((voice) =>
+    /female|woman|perempuan|wanita|gadis/i.test(voice.name),
+  );
+  return likelyFemale ?? indonesianVoices[0] ?? voices.find((voice) => /google/i.test(voice.name)) ?? null;
+}
+
 function isTextAttachment(mimeType: string, fileName: string): boolean {
   const extension = fileName.split(".").pop()?.toLowerCase() ?? "";
   return (
@@ -1015,12 +1121,13 @@ export function App() {
     null,
   );
   const [showScrollToLatest, setShowScrollToLatest] = useState(false);
-  const [realtimeRevision, setRealtimeRevision] = useState(0);
   const [hasGeminiApiKey, setHasGeminiApiKey] = useState(false);
   const [thinkingSteps, setThinkingSteps] = useState<string[]>([]);
   const [expandedThinkingIds, setExpandedThinkingIds] = useState<Set<string>>(() => new Set());
   const [ratings, setRatings] = useState<Record<string, AssistantRating>>({});
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const [ttsPlayback, setTtsPlayback] = useState<TtsPlayback | null>(null);
+  const [isTtsErrorExpanded, setIsTtsErrorExpanded] = useState(false);
   const [reportTarget, setReportTarget] = useState<ReportTarget | null>(null);
   const reportDetailsRef = useRef("");
   const [reportError, setReportError] = useState("");
@@ -1037,6 +1144,26 @@ export function App() {
   const [attachmentToast, setAttachmentToast] = useState("");
   const [isDraggingAttachments, setIsDraggingAttachments] = useState(false);
   const [attachedMedia, setAttachedMedia] = useState<PendingChatAttachment[]>([]);
+  const barcodeReadsRef = useRef(
+    new Map<string, Promise<Omit<AiBarcodeReading, "attachmentId"> | null>>(),
+  );
+  function prepareAiBarcodeRead(
+    attachment: Pick<PendingChatAttachment, "id" | "file" | "mimeType">,
+  ): Promise<Omit<AiBarcodeReading, "attachmentId"> | null> | null {
+    if (!attachment.mimeType.startsWith("image/")) return null;
+    const existing = barcodeReadsRef.current.get(attachment.id);
+    if (existing) return existing;
+
+    const reading = readBarcodeForAi(attachment.file).catch((error: unknown) => {
+      console.warn(
+        `Barcode analysis could not be completed for "${attachment.file.name}"; the original image will still be sent to Cheya.`,
+        error,
+      );
+      return null;
+    });
+    barcodeReadsRef.current.set(attachment.id, reading);
+    return reading;
+  }
   const [isPreparingAttachments, setIsPreparingAttachments] = useState(false);
   const [isCameraOpen, setIsCameraOpen] = useState(false);
   const [cameraFacing, setCameraFacing] = useState<"environment" | "user">("environment");
@@ -1057,9 +1184,13 @@ export function App() {
   const [editorError, setEditorError] = useState("");
   const [isEditorLoading, setIsEditorLoading] = useState(false);
   const conversationRef = useRef<HTMLDivElement>(null);
+  const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
+  const ttsUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const ttsAudioUrlRef = useRef("");
+  const ttsRequestControllerRef = useRef<AbortController | null>(null);
+  const ttsTokenRef = useRef(0);
   const pendingConversationScrollRestoreRef = useRef<number | null>(null);
   const pendingHistoryScrollRestoreRef = useRef<{ height: number; top: number } | null>(null);
-  const pendingInitialConversationScrollRef = useRef(false);
   const oldestHistoryCursorRef = useRef<{ id: string; created_at: string } | null>(null);
   const hasOlderHistoryRef = useRef(false);
   const loadingOlderHistoryRef = useRef(false);
@@ -1080,6 +1211,9 @@ export function App() {
   const pendingAssistantAnchorRef = useRef<string | null>(null);
   const shouldScrollToLatestRef = useRef(true);
   const followLatestRef = useRef(true);
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+  const pendingOptimisticMessageIdsRef = useRef(new Set<string>());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const filesInputRef = useRef<HTMLInputElement>(null);
   const messageInputRef = useRef<HTMLTextAreaElement>(null);
@@ -1100,6 +1234,455 @@ export function App() {
   }, [chatJobs]);
   const activeChatJob = chatJobs.find(
     (job) => job.status === "queued" || job.status === "processing",
+  );
+
+  useEffect(() => {
+    if (!authClient || !authenticatedUserId) return;
+    let isActive = true;
+    let sessionId: string;
+    try {
+      sessionId = getAccountSessionId();
+    } catch (error) {
+      console.error("Could not initialize this account session tracker.", error);
+      return;
+    }
+    let hasRegisteredSession = false;
+
+    const reportSession = async () => {
+      if (!isActive) return;
+      try {
+        const { origin, path } = getAccountSessionLocation();
+        const lastSeenAt = new Date().toISOString();
+        if (!hasRegisteredSession) {
+          const { error } = await authClient.from("account_sessions").upsert(
+            {
+              id: sessionId,
+              user_id: authenticatedUserId,
+              origin,
+              path,
+              user_agent: navigator.userAgent,
+              last_seen_at: lastSeenAt,
+            },
+            { onConflict: "id" },
+          );
+          if (error) throw new Error(error.message);
+          hasRegisteredSession = true;
+          return;
+        }
+
+        // Later heartbeats must not recreate a session removed from Account settings.
+        const { data, error } = await authClient
+          .from("account_sessions")
+          .update({ origin, path, user_agent: navigator.userAgent, last_seen_at: lastSeenAt })
+          .eq("id", sessionId)
+          .eq("user_id", authenticatedUserId)
+          .select("id");
+        if (error) throw new Error(error.message);
+        if (data.length === 0) {
+          isActive = false;
+          clearAccountSessionId();
+          const { error: signOutError } = await authClient.auth.signOut({ scope: "local" });
+          if (signOutError) throw new Error(signOutError.message);
+        }
+      } catch (error) {
+        console.error("Could not update the active account session.", error);
+      }
+    };
+
+    void reportSession();
+    const heartbeat = window.setInterval(() => void reportSession(), 30_000);
+    document.addEventListener("visibilitychange", reportSession);
+    return () => {
+      isActive = false;
+      window.clearInterval(heartbeat);
+      document.removeEventListener("visibilitychange", reportSession);
+    };
+  }, [authClient, authenticatedUserId]);
+
+  function closeTts() {
+    ttsTokenRef.current += 1;
+    ttsRequestControllerRef.current?.abort();
+    ttsRequestControllerRef.current = null;
+    ttsAudioRef.current?.pause();
+    ttsAudioRef.current = null;
+    ttsUtteranceRef.current = null;
+    window.speechSynthesis?.cancel();
+    if (ttsAudioUrlRef.current) URL.revokeObjectURL(ttsAudioUrlRef.current);
+    ttsAudioUrlRef.current = "";
+    setIsTtsErrorExpanded(false);
+    setTtsPlayback(null);
+  }
+
+  async function startBrowserSpeech(
+    messageId: string,
+    versionNumber: number,
+    text: string,
+    token: number,
+    durationSeconds: number,
+    previousErrors: string[],
+    preferredVoiceName?: string,
+  ): Promise<string | undefined> {
+    if (!("speechSynthesis" in window) || !("SpeechSynthesisUtterance" in window)) {
+      throw new Error("This browser does not support built-in speech synthesis.");
+    }
+    const voices = await loadBrowserSpeechVoices();
+    if (ttsTokenRef.current !== token) return;
+    const voice = selectBrowserSpeechVoice(voices, preferredVoiceName);
+    if (!voice) {
+      throw new Error("No Google or Indonesian speech voice is installed in this browser.");
+    }
+
+    const synthesis = window.speechSynthesis;
+    synthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.voice = voice;
+    utterance.lang = voice.lang || "id-ID";
+    utterance.rate = 1;
+    utterance.pitch = 1.05;
+    ttsUtteranceRef.current = utterance;
+    utterance.onboundary = (event) => {
+      if (ttsTokenRef.current !== token || !text.length) return;
+      const progress = Math.min(1, Math.max(0, event.charIndex / text.length));
+      setTtsPlayback((current) =>
+        current?.messageId === messageId
+          ? { ...current, elapsedSeconds: durationSeconds * progress }
+          : current,
+      );
+    };
+    utterance.onend = () => {
+      if (ttsTokenRef.current !== token) return;
+      ttsUtteranceRef.current = null;
+      setTtsPlayback((current) =>
+        current?.messageId === messageId
+          ? { ...current, status: "ended", elapsedSeconds: durationSeconds }
+          : current,
+      );
+    };
+    utterance.onerror = (event) => {
+      if (
+        ttsTokenRef.current !== token ||
+        event.error === "canceled" ||
+        event.error === "interrupted"
+      ) {
+        return;
+      }
+      const details = [
+        ...previousErrors,
+        `Browser speech synthesis (${voice.name}) failed: ${event.error}.`,
+      ].join("\n\n");
+      setTtsPlayback((current) =>
+        current?.messageId === messageId
+          ? {
+              ...current,
+              engine: "browser",
+              status: "error",
+              errorSummary: summarizeSpeechError(details),
+              errorDetails: details,
+            }
+          : current,
+      );
+    };
+    synthesis.speak(utterance);
+    setTtsPlayback({
+      messageId,
+      versionNumber,
+      text,
+      engine: "browser",
+      status: "playing",
+      durationSeconds,
+      elapsedSeconds: 0,
+      browserVoiceName: voice.name,
+      errorSummary: previousErrors.length
+        ? "Gemini TTS failed; using the browser voice."
+        : undefined,
+      errorDetails: previousErrors.length ? previousErrors.join("\n\n") : undefined,
+    });
+    return voice.name;
+  }
+
+  async function playAssistantSpeech(
+    messageId: string,
+    versionNumber: number,
+    markdown: string,
+  ) {
+    const text = speechTextFromMarkdown(markdown);
+    if (!text) return;
+
+    if (
+      ttsPlayback?.messageId === messageId &&
+      ttsPlayback.versionNumber === versionNumber
+    ) {
+      if (ttsPlayback.status === "loading") return;
+      if (ttsPlayback.engine === "browser") {
+        const synthesis = window.speechSynthesis;
+        if (ttsPlayback.status === "playing" && synthesis.speaking) {
+          synthesis.pause();
+          setTtsPlayback((current) =>
+            current?.messageId === messageId
+              ? { ...current, status: "paused" }
+              : current,
+          );
+          return;
+        }
+        if (ttsPlayback.status === "paused" && synthesis.paused) {
+          synthesis.resume();
+          setTtsPlayback((current) =>
+            current?.messageId === messageId
+              ? { ...current, status: "playing" }
+              : current,
+          );
+          return;
+        }
+        if (ttsPlayback.status === "ended" || ttsPlayback.status === "error") {
+          const previousErrors = ttsPlayback.errorDetails
+            ? ttsPlayback.errorDetails.split("\n\n")
+            : [];
+          try {
+            await startBrowserSpeech(
+              messageId,
+              versionNumber,
+              text,
+              ttsTokenRef.current,
+              ttsPlayback.durationSeconds,
+              previousErrors,
+              ttsPlayback.browserVoiceName,
+            );
+          } catch (error) {
+            const details = [
+              ttsPlayback.errorDetails,
+              error instanceof Error ? error.message : "Browser speech synthesis failed.",
+            ]
+              .filter(Boolean)
+              .join("\n\n");
+            setTtsPlayback((current) =>
+              current?.messageId === messageId
+                ? {
+                    ...current,
+                    status: "error",
+                    errorSummary: summarizeSpeechError(details),
+                    errorDetails: details,
+                  }
+                : current,
+            );
+          }
+          return;
+        }
+      }
+      const audio = ttsAudioRef.current;
+      if (audio && !audio.paused) {
+        audio.pause();
+        setTtsPlayback((current) =>
+          current?.messageId === messageId
+            ? { ...current, elapsedSeconds: audio.currentTime, status: "paused" }
+            : current,
+        );
+        return;
+      }
+      if (audio) {
+        if (audio.ended) audio.currentTime = 0;
+        const playbackToken = ttsTokenRef.current;
+        const playPromise = audio.play();
+        setTtsPlayback((current) =>
+          current?.messageId === messageId
+            ? { ...current, status: "playing", elapsedSeconds: audio.currentTime }
+            : current,
+        );
+        void playPromise.catch((error: unknown) => {
+          if (ttsTokenRef.current !== playbackToken) return;
+          const details = error instanceof Error ? error.message : "Browser playback was blocked.";
+          setTtsPlayback((current) =>
+            current?.messageId === messageId && current.status !== "paused"
+              ? {
+                  ...current,
+                  status: "paused",
+                  errorSummary: summarizeSpeechError(details),
+                  errorDetails: details,
+                }
+              : current,
+          );
+        });
+        return;
+      }
+    }
+
+    closeTts();
+    const token = ttsTokenRef.current;
+    const requestController = new AbortController();
+    ttsRequestControllerRef.current = requestController;
+    const durationSeconds = estimateSpeechDurationSeconds(text);
+    let errors: string[] = [];
+    setTtsPlayback({
+      messageId,
+      versionNumber,
+      text,
+      engine: "loading",
+      status: "loading",
+      durationSeconds,
+      elapsedSeconds: 0,
+    });
+
+    try {
+      const prepared = await prepareAssistantSpeech(
+        authClient,
+        messageId,
+        versionNumber,
+        text,
+        requestController.signal,
+      );
+      errors = prepared.errors;
+      if (ttsTokenRef.current !== token) return;
+
+      if (!prepared.audio) {
+        await startBrowserSpeech(
+          messageId,
+          versionNumber,
+          text,
+          token,
+          durationSeconds,
+          errors,
+          prepared.browserVoiceName,
+        );
+        return;
+      }
+
+      const audioBlob = prepared.audio;
+      const audioUrl = URL.createObjectURL(audioBlob);
+      ttsAudioUrlRef.current = audioUrl;
+      const audio = new Audio(audioUrl);
+      audio.preload = "auto";
+      ttsAudioRef.current = audio;
+
+      const actualDuration = await new Promise<number>((resolve, reject) => {
+        audio.addEventListener(
+          "loadedmetadata",
+          () => resolve(Number.isFinite(audio.duration) ? audio.duration : durationSeconds),
+          { once: true },
+        );
+        audio.addEventListener(
+          "error",
+          () => reject(new Error("The generated audio could not be loaded by this browser.")),
+          { once: true },
+        );
+        audio.load();
+      });
+      if (ttsTokenRef.current !== token) return;
+
+      audio.addEventListener("timeupdate", () => {
+        if (ttsTokenRef.current !== token) return;
+        setTtsPlayback((current) =>
+          current?.messageId === messageId
+            ? { ...current, elapsedSeconds: audio.currentTime }
+            : current,
+        );
+      });
+      audio.addEventListener("ended", () => {
+        if (ttsTokenRef.current !== token) return;
+        setTtsPlayback((current) =>
+          current?.messageId === messageId
+            ? {
+                ...current,
+                elapsedSeconds: actualDuration,
+                status: "ended",
+              }
+            : current,
+        );
+      });
+      audio.addEventListener("error", () => {
+        if (ttsTokenRef.current !== token) return;
+        const details = [...errors, "The generated audio could not be played by this browser."]
+          .join("\n\n");
+        setTtsPlayback((current) =>
+          current?.messageId === messageId
+            ? {
+                ...current,
+                status: "error",
+                errorSummary: summarizeSpeechError(details),
+                errorDetails: details,
+              }
+            : current,
+        );
+      });
+      setTtsPlayback({
+        messageId,
+        versionNumber,
+        text,
+        engine: "audio",
+        status: "ready",
+        durationSeconds: actualDuration,
+        elapsedSeconds: 0,
+        errorSummary: errors.length ? summarizeSpeechError(errors.join("\n\n")) : undefined,
+        errorDetails: errors.length ? errors.join("\n\n") : undefined,
+      });
+    } catch (error) {
+      if (ttsTokenRef.current !== token || requestController.signal.aborted) return;
+      const details = error instanceof Error ? error.message : "Could not generate speech.";
+      const allErrors = errors.length ? `${errors.join("\n\n")}\n\n${details}` : details;
+      setTtsPlayback((current) =>
+        current?.messageId === messageId
+          ? {
+              ...current,
+              engine: "loading",
+              status: "error",
+              errorSummary: summarizeSpeechError(allErrors),
+              errorDetails: allErrors,
+            }
+          : current,
+      );
+    } finally {
+      if (ttsRequestControllerRef.current === requestController) {
+        ttsRequestControllerRef.current = null;
+      }
+    }
+  }
+
+  useLayoutEffect(() => {
+    if (ttsPlayback?.status !== "ready" || ttsPlayback.engine !== "audio") return;
+    const audio = ttsAudioRef.current;
+    const messageId = ttsPlayback.messageId;
+    const token = ttsTokenRef.current;
+    if (!audio) return;
+
+    void audio.play().then(
+      () => {
+        if (ttsTokenRef.current !== token) return;
+        setTtsPlayback((current) =>
+          current?.messageId === messageId && current.status === "ready"
+            ? { ...current, status: "playing" }
+            : current,
+        );
+      },
+      (error: unknown) => {
+        if (ttsTokenRef.current !== token || !audio.paused) return;
+        const details = error instanceof Error
+          ? error.message
+          : "Browser playback was blocked.";
+        setTtsPlayback((current) =>
+          current?.messageId === messageId && current.status === "ready"
+            ? {
+                ...current,
+                status: "paused",
+                errorSummary: summarizeSpeechError(details),
+                errorDetails: details,
+              }
+            : current,
+        );
+      },
+    );
+  }, [ttsPlayback]);
+
+  useEffect(() => {
+    if (pathname.startsWith("/settings")) closeTts();
+  }, [pathname]);
+
+  useEffect(
+    () => () => {
+      ttsTokenRef.current += 1;
+      ttsRequestControllerRef.current?.abort();
+      ttsAudioRef.current?.pause();
+      window.speechSynthesis?.cancel();
+      if (ttsAudioUrlRef.current) URL.revokeObjectURL(ttsAudioUrlRef.current);
+    },
+    [],
   );
 
   function scrollConversationToLatest(behavior: ScrollBehavior = "smooth") {
@@ -1310,10 +1893,12 @@ export function App() {
 
   function displayedMessageText(chatMessage: ChatMessage): string {
     const versionNumber = displayedVersionNumber(chatMessage);
-    return (
+    const content =
       messageVersions[chatMessage.id]?.find((item) => item.version_number === versionNumber)
-        ?.content ?? chatMessage.text
-    );
+        ?.content ?? chatMessage.text;
+    return chatMessage.role === "assistant"
+      ? normalizeUserFacingMarkdown(content)
+      : content;
   }
 
   function displayedThinkingSummary(chatMessage: ChatMessage): string | null {
@@ -1514,6 +2099,14 @@ export function App() {
   );
 
   useEffect(() => {
+    const previousRestoration = window.history.scrollRestoration;
+    window.history.scrollRestoration = "manual";
+    return () => {
+      window.history.scrollRestoration = previousRestoration;
+    };
+  }, []);
+
+  useEffect(() => {
     if (!isSending) return;
     const frame = window.requestAnimationFrame(() => {
       const conversation = conversationRef.current;
@@ -1534,21 +2127,33 @@ export function App() {
       return;
     }
 
-    let secondFrame = 0;
-    const firstFrame = window.requestAnimationFrame(() => {
-      if (conversationRef.current) {
-        conversationRef.current.scrollTop = conversationRef.current.scrollHeight;
+    let frame = 0;
+    let frameCount = 0;
+    let previousHeight = -1;
+    let stableFrames = 0;
+    const scrollWhenReady = () => {
+      const conversation = conversationRef.current;
+      if (!conversation) {
+        frame = window.requestAnimationFrame(scrollWhenReady);
+        return;
       }
-      secondFrame = window.requestAnimationFrame(() => {
-        if (conversationRef.current) {
-          conversationRef.current.scrollTop = conversationRef.current.scrollHeight;
-        }
+
+      conversation.scrollTop = conversation.scrollHeight;
+      followLatestRef.current = true;
+      frameCount += 1;
+      if (conversation.scrollHeight === previousHeight) stableFrames += 1;
+      else stableFrames = 0;
+      previousHeight = conversation.scrollHeight;
+
+      if (frameCount < 8 && stableFrames < 2) {
+        frame = window.requestAnimationFrame(scrollWhenReady);
+      } else {
         shouldScrollToLatestRef.current = false;
-      });
-    });
+      }
+    };
+    frame = window.requestAnimationFrame(scrollWhenReady);
     return () => {
-      window.cancelAnimationFrame(firstFrame);
-      if (secondFrame) window.cancelAnimationFrame(secondFrame);
+      window.cancelAnimationFrame(frame);
     };
   }, [authClient, authUser, isAuthLoading, isLoadingHistory, messages.length, pathname]);
 
@@ -1728,7 +2333,6 @@ export function App() {
             }),
           );
         });
-        pendingInitialConversationScrollRef.current = savedMessages.length > 0;
         shouldScrollToLatestRef.current = true;
         if (savedMessages.length === 0) setIsLoadingHistory(false);
 
@@ -1829,7 +2433,7 @@ export function App() {
         historyGenerationRef.current += 1;
       }
     };
-  }, [authClient, authUser, pathname, realtimeRevision]);
+  }, [authClient, authUser, pathname]);
 
   useEffect(() => {
     if (!authClient || !authenticatedUserId) {
@@ -1957,6 +2561,7 @@ export function App() {
         const drafts = [...restored.values()]
           .sort((first, second) => first.sortAt - second.sortAt)
           .map(({ sortAt: _sortAt, ...attachment }) => attachment);
+        drafts.forEach((attachment) => prepareAiBarcodeRead(attachment));
         setAttachedMedia(drafts);
         drafts
           .filter((attachment) => attachment.isUploading)
@@ -1982,80 +2587,221 @@ export function App() {
   useEffect(() => {
     if (!authClient || !authUser) return;
     let isMounted = true;
-    let channel = authClient.channel(`account-live-${authUser.id}`);
     const tables = [
       "chat_messages",
       "chat_message_versions",
       "chat_conversation_branches",
       "chat_message_attachments",
       "message_feedback",
+      "ai_api_keys",
     ] as const;
-    for (const table of tables) {
-      channel = channel.on(
-        "postgres_changes",
-        {
-          event: "*",
-          schema: "public",
-          table,
-        },
-        () => {
-          if (!isMounted) return;
-          if (realtimeRefreshTimerRef.current !== null) {
-            window.clearTimeout(realtimeRefreshTimerRef.current);
-          }
-          realtimeRefreshTimerRef.current = window.setTimeout(() => {
-            realtimeRefreshTimerRef.current = null;
-            if (isMounted) setRealtimeRevision((revision) => revision + 1);
-          }, 80);
-        },
-      );
-    }
-    channel = channel.on(
-      "postgres_changes",
-      {
-        event: "*",
-        schema: "public",
-        table: "chat_message_jobs",
-      },
-      () => {
+    let hasConnected = false;
+    const syncChatData = async () => {
+      try {
+        const currentMessages = messagesRef.current;
+        const persistedMessageCount = currentMessages.filter(
+          (message) => !pendingOptimisticMessageIdsRef.current.has(message.id),
+        ).length;
+        const {
+          loadChatMessagePage,
+          loadMessageAttachments,
+          loadMessageVersions,
+        } = await import("./lib/chat-data");
+        const page = await loadChatMessagePage(authClient, {
+          limit: Math.max(50, persistedMessageCount + 1),
+          userId: authUser.id,
+        });
+        const messageIds = page.messages.map((message) => message.id);
+        const assistantMessageIds = page.messages
+          .filter((message) => message.role === "assistant")
+          .map((message) => message.id);
+        const [
+          attachments,
+          versions,
+          feedbackResult,
+          keysResult,
+          jobsResult,
+        ] = await Promise.all([
+          loadMessageAttachments(authClient, messageIds),
+          loadMessageVersions(authClient, messageIds),
+          assistantMessageIds.length > 0
+            ? authClient
+                .from("message_feedback")
+                .select("message_id, version_number, kind")
+                .in("message_id", assistantMessageIds)
+                .in("kind", ["like", "dislike"])
+            : Promise.resolve({ data: [], error: null }),
+          authClient.from("ai_api_keys").select("id").limit(1),
+          authClient
+            .from("chat_message_jobs")
+            .select("*")
+            .or("status.in.(queued,processing,failed),error.not.is.null")
+            .order("created_at", { ascending: false })
+            .limit(50),
+        ]);
+        if (feedbackResult.error) throw feedbackResult.error;
+        if (keysResult.error) throw keysResult.error;
+        if (jobsResult.error) throw jobsResult.error;
         if (!isMounted) return;
-        if (jobRefreshTimerRef.current !== null) {
-          window.clearTimeout(jobRefreshTimerRef.current);
-        }
-        jobRefreshTimerRef.current = window.setTimeout(() => {
-          jobRefreshTimerRef.current = null;
-          void (async () => {
-            try {
-              const { data, error } = await authClient
-                .from("chat_message_jobs")
-                .select("*")
-                .or("status.in.(queued,processing,failed),error.not.is.null")
-                .order("created_at", { ascending: false })
-                .limit(50);
-              if (!isMounted) return;
-              if (error) {
-                setSendError(`Could not refresh chat job status: ${error.message}`);
-                return;
-              }
-              setChatJobs(data);
-              setIsSending(data.some((job) => job.status === "queued" || job.status === "processing"));
-            } catch (error) {
-              if (!isMounted) return;
-              setSendError(
-                error instanceof Error
-                  ? `Could not refresh chat job status: ${error.message}`
-                  : "Could not refresh chat job status.",
-              );
+
+        const persistedIds = new Set(messageIds);
+        const serverMessages: ChatMessage[] = page.messages.map(
+          ({ id, role, content, created_at, version_number, thinking_summary }) => ({
+            id,
+            role,
+            text: content,
+            createdAt: created_at,
+            versionNumber: version_number,
+            thinkingSummary: thinking_summary,
+            attachments: attachments[id] ?? [],
+          }),
+        );
+        const loadedRatings = Object.fromEntries(
+          feedbackResult.data.flatMap((item) =>
+            item.kind === "like" || item.kind === "dislike"
+              ? [[`${item.message_id}:${item.version_number}`, item.kind]]
+              : [],
+          ),
+        ) as Record<string, AssistantRating>;
+        const loadedSelections = Object.fromEntries(
+          page.messages.map((message) => [message.id, message.version_number]),
+        );
+
+        setMessages((current) => {
+          const pendingMessages = current.filter(
+            (message) =>
+              pendingOptimisticMessageIdsRef.current.has(message.id) &&
+              !persistedIds.has(message.id),
+          );
+          return [...serverMessages, ...pendingMessages].sort(
+            (left, right) =>
+              new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime(),
+          );
+        });
+        setMessageVersions((current) => ({ ...current, ...versions }));
+        setSelectedMessageVersions((current) => ({ ...current, ...loadedSelections }));
+        setRatings((current) => {
+          const next = { ...current };
+          for (const messageId of messageIds) {
+            for (const key of Object.keys(next)) {
+              if (key.startsWith(`${messageId}:`)) delete next[key];
             }
-          })();
-        }, 80);
+          }
+          return { ...next, ...loadedRatings };
+        });
+        setHasGeminiApiKey(keysResult.data.length > 0);
+        setChatJobs(jobsResult.data);
+        setIsSending(
+          jobsResult.data.some(
+            (job) => job.status === "queued" || job.status === "processing",
+          ),
+        );
+        oldestHistoryCursorRef.current = page.messages[0]
+          ? {
+              id: page.messages[0].id,
+              created_at: page.messages[0].created_at,
+            }
+          : null;
+        hasOlderHistoryRef.current = page.hasMore;
+      } catch (error) {
+        if (isMounted) {
+          setSendError(
+            error instanceof Error
+              ? `Could not sync live chat updates: ${error.message}`
+              : "Could not sync live chat updates.",
+          );
+        }
+      }
+    };
+    const scheduleChatSync = () => {
+      if (!isMounted) return;
+      if (realtimeRefreshTimerRef.current !== null) {
+        window.clearTimeout(realtimeRefreshTimerRef.current);
+      }
+      realtimeRefreshTimerRef.current = window.setTimeout(() => {
+        realtimeRefreshTimerRef.current = null;
+        if (isMounted) void syncChatData();
+      }, 120);
+    };
+    const scheduleJobRefresh = () => {
+      if (!isMounted) return;
+      if (jobRefreshTimerRef.current !== null) {
+        window.clearTimeout(jobRefreshTimerRef.current);
+      }
+      jobRefreshTimerRef.current = window.setTimeout(() => {
+        jobRefreshTimerRef.current = null;
+        void (async () => {
+          try {
+            const { data, error } = await authClient
+              .from("chat_message_jobs")
+              .select("*")
+              .or("status.in.(queued,processing,failed),error.not.is.null")
+              .order("created_at", { ascending: false })
+              .limit(50);
+            if (!isMounted) return;
+            if (error) {
+              setSendError(`Could not refresh chat job status: ${error.message}`);
+              return;
+            }
+            setChatJobs(data);
+            setIsSending(data.some((job) => job.status === "queued" || job.status === "processing"));
+          } catch (error) {
+            if (!isMounted) return;
+            setSendError(
+              error instanceof Error
+                ? `Could not refresh chat job status: ${error.message}`
+                : "Could not refresh chat job status.",
+            );
+          }
+        })();
+      }, 80);
+    };
+    const stopRealtime = subscribeWithReconnect(
+      authClient,
+      `account-live-${authUser.id}`,
+      (initialChannel) => {
+        let channel = initialChannel;
+        for (const table of tables) {
+          channel = channel.on(
+            "postgres_changes",
+            {
+              event: "*",
+              schema: "public",
+              table,
+            },
+            scheduleChatSync,
+          );
+        }
+        return channel.on(
+          "postgres_changes",
+          {
+            event: "*",
+            schema: "public",
+            table: "chat_message_jobs",
+          },
+          scheduleJobRefresh,
+        );
+      },
+      (status) => {
+        if (!isMounted) return;
+        if (status === "SUBSCRIBED") {
+          if (hasConnected) {
+            scheduleChatSync();
+            scheduleJobRefresh();
+          }
+          hasConnected = true;
+          setSendError((current) =>
+            current.startsWith("Live sync disconnected. Reconnecting") ? "" : current,
+          );
+        } else if (
+          status === "CHANNEL_ERROR" ||
+          status === "TIMED_OUT" ||
+          status === "CLOSED"
+        ) {
+          setSendError("Live sync disconnected. Reconnecting…");
+        }
       },
     );
-    channel = channel.subscribe((status) => {
-      if (isMounted && (status === "CHANNEL_ERROR" || status === "TIMED_OUT")) {
-        setSendError("Live sync is unavailable. Check your connection and reload to refresh data.");
-      }
-    });
 
     return () => {
       isMounted = false;
@@ -2067,7 +2813,7 @@ export function App() {
         window.clearTimeout(jobRefreshTimerRef.current);
         jobRefreshTimerRef.current = null;
       }
-      void authClient.removeChannel(channel);
+      stopRealtime();
     };
   }, [authClient, authUser]);
 
@@ -2113,16 +2859,6 @@ export function App() {
   }, [remoteAttachmentView]);
 
   useLayoutEffect(() => {
-    if (pendingInitialConversationScrollRef.current) {
-      pendingInitialConversationScrollRef.current = false;
-      const conversation = conversationRef.current;
-      if (conversation) {
-        conversation.scrollTop = conversation.scrollHeight;
-        shouldScrollToLatestRef.current = false;
-        followLatestRef.current = true;
-      }
-    }
-
     const previousPosition = pendingHistoryScrollRestoreRef.current;
     const conversation = conversationRef.current;
     if (previousPosition && conversation) {
@@ -2132,7 +2868,6 @@ export function App() {
     }
     if (pathname === "/" && shouldScrollToLatestRef.current && conversation) {
       conversation.scrollTop = conversation.scrollHeight;
-      shouldScrollToLatestRef.current = false;
       followLatestRef.current = true;
     }
   }, [messages, pathname]);
@@ -2254,7 +2989,7 @@ export function App() {
       window.history.replaceState({ appRoute: "settings" }, "", "/settings");
       window.history.pushState({ appRoute: "settings-subpage" }, "", sectionPath);
     } else if (window.location.pathname === "/settings") {
-      window.history.pushState({ appRoute: "settings-direct-back-guard" }, "", "/settings");
+      window.history.replaceState({ appRoute: "settings" }, "", "/settings");
     }
 
     const handlePopState = () => {
@@ -2287,7 +3022,13 @@ export function App() {
 
   function navigate(path: string) {
     if (path.startsWith("/settings")) {
-      window.history.pushState(
+      const isSwitchingSettingsSections =
+        window.location.pathname.startsWith("/settings/") &&
+        path.startsWith("/settings/");
+      const updateHistory = isSwitchingSettingsSections
+        ? window.history.replaceState.bind(window.history)
+        : window.history.pushState.bind(window.history);
+      updateHistory(
         { appRoute: path === "/settings" ? "settings" : "settings-subpage" },
         "",
         path,
@@ -2483,6 +3224,7 @@ export function App() {
           ),
         );
       }
+      prepareAiBarcodeRead(uploadable);
       await saveChatAttachmentDraft(
         authUser.id,
         uploadable.id,
@@ -2897,6 +3639,7 @@ export function App() {
       return;
     }
     if (attachment.isUploading) cancelledAttachmentsRef.current.add(attachment.id);
+    barcodeReadsRef.current.delete(attachment.id);
     setAttachedMedia((files) => files.filter((_, index) => index !== indexToRemove));
     try {
       await deleteStoredAttachments([attachment.id]);
@@ -3094,6 +3837,7 @@ export function App() {
         attachment.uploaded ? [attachment.uploaded] : [],
       ),
     };
+    pendingOptimisticMessageIdsRef.current.add(optimisticId);
     setMessages((current) => [...current, optimisticMessage]);
     setAttachedMedia([]);
     if (messageInputRef.current) {
@@ -3109,6 +3853,17 @@ export function App() {
       if (sessionError) throw sessionError;
       if (!session?.access_token) throw new Error("Your account session has expired. Sign in again.");
 
+      const barcodeReadings = (
+        await Promise.all(
+          submittedAttachments.map(async (attachment) => {
+            if (!attachment.uploaded) return null;
+            const scan = prepareAiBarcodeRead(attachment);
+            if (!scan) return null;
+            const reading = await scan;
+            return reading ? { attachmentId: attachment.id, ...reading } : null;
+          }),
+        )
+      ).filter((reading): reading is AiBarcodeReading => reading !== null);
       const response = await fetch("/api/chat-jobs", {
         method: "POST",
         headers: {
@@ -3119,6 +3874,7 @@ export function App() {
           content: prompt,
           thinkingMode: showThinking,
           attachmentIds: submittedAttachments.map((attachment) => attachment.id),
+          barcodeReadings,
         }),
       });
       const result = (await response.json().catch(() => null)) as
@@ -3136,6 +3892,8 @@ export function App() {
       }
 
       jobAccepted = true;
+      pendingOptimisticMessageIdsRef.current.delete(optimisticId);
+      submittedAttachments.forEach((attachment) => barcodeReadsRef.current.delete(attachment.id));
       messageDraftRef.current = "";
       if (messageDraftSaveTimerRef.current) {
         clearTimeout(messageDraftSaveTimerRef.current);
@@ -3183,6 +3941,7 @@ export function App() {
       setThinkingSteps(showThinking ? ["Membaca pesan dan konteks percakapan…"] : []);
     } catch (error) {
       if (!jobAccepted) {
+        pendingOptimisticMessageIdsRef.current.delete(optimisticId);
         setMessages((current) => current.filter((item) => item.id !== optimisticId));
         setAttachedMedia((current) => [...submittedAttachments, ...current]);
         if (messageInputRef.current && !messageInputRef.current.value) {
@@ -3527,6 +4286,33 @@ export function App() {
             history.find((item) => item.id === attachment.message_id)?.createdAt ??
             sourceMessage.createdAt,
         }));
+      const barcodeReadings = (
+        await Promise.all(
+          currentAttachments
+            .filter((attachment) => attachment.mime_type.startsWith("image/"))
+            .slice(0, 10)
+            .map(async (attachment) => {
+              try {
+                const { data, error } = await client.storage
+                  .from(CHAT_ATTACHMENT_BUCKET)
+                  .download(attachment.storage_path);
+                if (error) throw error;
+                const reading = await readBarcodeForAi(
+                  new File([data], attachment.file_name, { type: attachment.mime_type }),
+                );
+                return reading
+                  ? { fileName: attachment.file_name, ...reading }
+                  : null;
+              } catch (error) {
+                console.warn(
+                  `Barcode analysis could not be completed for "${attachment.file_name}" during regeneration.`,
+                  error,
+                );
+                return null;
+              }
+            }),
+        )
+      ).filter((reading): reading is NonNullable<typeof reading> => reading !== null);
       if (showThinking) setThinkingSteps(["Meninjau riwayat dan konteks tersimpan…"]);
 
       const result = await generateGeminiConversation(
@@ -3547,6 +4333,7 @@ export function App() {
           memories: relevantContext.memories,
           insights,
           feedback: recentFeedback,
+          barcodeReadings,
           attachments: attachmentsForModel,
           prepareAttachments: (key, attachments) =>
             prepareGeminiAttachments(key, attachments, async (attachment) => {
@@ -3842,7 +4629,7 @@ export function App() {
 
   if (
     pathname !== "/" &&
-    !/^\/settings(?:\/(?:personal|configure|memory))?\/?$/.test(pathname)
+    !/^\/settings(?:\/(?:personal|configure|memory|account|privacy|terms))?\/?$/.test(pathname)
   ) {
     return (
       <ErrorPage
@@ -4011,6 +4798,7 @@ export function App() {
           onNavigate={navigate}
           onBack={() => navigate("/")}
           client={authClient}
+          accountUserId={authUser.id}
           accountEmail={authUser.email}
           onGeminiKeyChange={setHasGeminiApiKey}
         />
@@ -4112,11 +4900,11 @@ export function App() {
 
   return (
     <main
-      className="fixed inset-0 flex justify-center bg-white p-0 sm:p-5"
+      className="fixed inset-0 flex justify-center bg-[#f5f6f8] p-0 sm:p-5"
     >
       <section
         aria-label="CheyaVerse chat"
-        className="relative flex h-full w-full flex-col overflow-hidden border-[#e7e8eb] bg-white sm:max-w-[580px] sm:rounded-[34px] sm:border"
+        className="relative flex h-full w-full flex-col overflow-hidden border-[#e7e8eb] bg-[#f5f6f8] sm:max-w-[580px] sm:rounded-[34px] sm:border"
         onDragEnter={(event) => {
           if (!Array.from(event.dataTransfer.types).includes("Files")) return;
           event.preventDefault();
@@ -4217,12 +5005,125 @@ export function App() {
           </nav>
         </header>
 
+        {ttsPlayback && (
+          <div className="absolute inset-x-3 top-[68px] z-10 space-y-1.5 sm:inset-x-5">
+            <section
+              aria-label="Text-to-speech player"
+              className="flex min-h-12 items-center gap-0 rounded-2xl border border-[#e6e7eb] bg-white px-1.5 py-1.5 shadow-sm"
+            >
+              {ttsPlayback.status === "loading" ? (
+                <>
+                  <LoaderCircle
+                    aria-hidden="true"
+                    className="ml-1 mr-2 size-4 shrink-0 animate-spin text-[#656871]"
+                  />
+                  <p role="status" className="min-w-0 flex-1 text-xs text-[#656871]">
+                    Preparing speech…
+                  </p>
+                </>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    aria-label={ttsPlayback.status === "playing" ? "Pause speech" : "Play speech"}
+                    onClick={() =>
+                      void playAssistantSpeech(
+                        ttsPlayback.messageId,
+                        ttsPlayback.versionNumber,
+                        ttsPlayback.text,
+                      )
+                    }
+                    className="flex size-7 shrink-0 items-center justify-center rounded-full text-[#303238] transition-colors hover:bg-[#f1f2f4] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
+                  >
+                    {ttsPlayback.status === "playing" ? (
+                      <Pause aria-hidden="true" className="size-4" />
+                    ) : (
+                      <Play aria-hidden="true" className="size-4" />
+                    )}
+                  </button>
+                  {ttsPlayback.errorDetails && (
+                    <button
+                      type="button"
+                      aria-label="Show speech error details"
+                      aria-expanded={isTtsErrorExpanded}
+                      onClick={() => setIsTtsErrorExpanded((expanded) => !expanded)}
+                      className="flex size-7 shrink-0 items-center justify-center rounded-full text-amber-700 transition-colors hover:bg-amber-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-500"
+                    >
+                      <TriangleAlert aria-hidden="true" className="size-4" />
+                    </button>
+                  )}
+                  {ttsPlayback.status === "error" ? (
+                    <p role="alert" className="ml-1 min-w-0 flex-1 truncate text-xs text-[#bd4a4a]">
+                      {ttsPlayback.errorSummary}
+                    </p>
+                  ) : (
+                    <>
+                      <div
+                        aria-label={`${formatSpeechTime(ttsPlayback.elapsedSeconds)} of ${formatSpeechTime(ttsPlayback.durationSeconds)}`}
+                        className="flex shrink-0 items-center gap-1 text-xs tabular-nums text-[#656871]"
+                      >
+                        <span>{formatSpeechTime(ttsPlayback.elapsedSeconds)}</span>
+                        <span className="text-[#a0a2a8]">/</span>
+                        <span>{formatSpeechTime(ttsPlayback.durationSeconds)}</span>
+                      </div>
+                      <div
+                        role="img"
+                        aria-label="Speech waveform"
+                        className="flex h-6 min-w-0 flex-1 items-center justify-between gap-[2px] overflow-hidden px-1.5"
+                      >
+                        {Array.from({ length: 36 }, (_, index) => {
+                          const progress =
+                            ttsPlayback.status === "ended"
+                              ? 1
+                              : ttsPlayback.elapsedSeconds / ttsPlayback.durationSeconds;
+                          return (
+                            <span
+                              key={index}
+                              className={`tts-wave-bar ${
+                                (index + 0.5) / 36 <= progress ? "tts-wave-bar-played" : ""
+                              }`}
+                              style={{
+                                height: `${speechWaveHeight(ttsPlayback.text, index)}%`,
+                              }}
+                            />
+                          );
+                        })}
+                      </div>
+                      {ttsPlayback.errorSummary && (
+                        <span className="sr-only" role="status">
+                          {ttsPlayback.errorSummary}
+                        </span>
+                      )}
+                    </>
+                  )}
+                </>
+              )}
+              <button
+                type="button"
+                aria-label="Close speech player"
+                onClick={closeTts}
+                className="flex size-7 shrink-0 items-center justify-center rounded-full text-[#777a82] transition-colors hover:bg-[#f1f2f4] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
+              >
+                <X aria-hidden="true" className="size-4" />
+              </button>
+            </section>
+            {isTtsErrorExpanded && ttsPlayback.errorDetails && (
+              <div
+                role="alert"
+                className="max-h-40 overflow-y-auto whitespace-pre-wrap break-words rounded-xl border border-[#e6e7eb] bg-white px-3 py-2.5 text-xs leading-5 text-[#55504a] shadow-sm"
+              >
+                {ttsPlayback.errorDetails}
+              </div>
+            )}
+          </div>
+        )}
+
         <div
           ref={conversationRef}
           aria-label="Conversation"
           aria-live="polite"
           onScroll={handleConversationScroll}
-          className="relative min-h-0 flex-1 overflow-y-auto overscroll-contain bg-white px-4 pb-3 pt-[72px] sm:px-6"
+          className="relative min-h-0 flex-1 overflow-y-auto overscroll-contain bg-[#f5f6f8] px-3 pb-3 pt-[64px] sm:px-[22px]"
         >
           <div className="space-y-3">
             {messages.map((chatMessage) => {
@@ -4506,6 +5407,34 @@ export function App() {
                     </button>
                     <button
                       type="button"
+                      aria-label={
+                        ttsPlayback?.messageId === chatMessage.id &&
+                        ttsPlayback.versionNumber === versionNumber
+                          ? "Speech player is open"
+                          : "Read response aloud"
+                      }
+                      aria-pressed={
+                        ttsPlayback?.messageId === chatMessage.id &&
+                        ttsPlayback.versionNumber === versionNumber
+                      }
+                      onClick={() => {
+                        if (
+                          ttsPlayback?.messageId !== chatMessage.id ||
+                          ttsPlayback.versionNumber !== versionNumber
+                        ) {
+                          void playAssistantSpeech(chatMessage.id, versionNumber, visibleText);
+                        }
+                      }}
+                      className={`flex size-8 items-center justify-center rounded-lg transition hover:bg-[#f1f2f4] ${
+                        ttsPlayback?.messageId === chatMessage.id
+                          ? "text-[#2088bf]"
+                          : "text-[#777a82]"
+                      }`}
+                    >
+                      <Volume2 aria-hidden="true" className="size-4" />
+                    </button>
+                    <button
+                      type="button"
                       aria-label={copiedMessageId === chatMessage.id ? "Copied response" : "Copy response"}
                       onClick={() => void copyAssistantMessage(chatMessage)}
                       className="ml-auto flex size-8 items-center justify-center rounded-lg text-[#777a82] transition hover:bg-[#f1f2f4]"
@@ -4542,8 +5471,10 @@ export function App() {
               </div>
             )}
             {!hasGeminiApiKey && !isLoadingHistory && (
-              <div className="flex items-center justify-between gap-3 rounded-2xl border border-[#e6e8eb] bg-white px-3.5 py-3 text-sm text-[#686b72]">
-                <span>Add a Gemini API key to start chatting.</span>
+              <div className="flex h-12 shrink-0 items-center justify-between gap-3 overflow-hidden rounded-2xl border border-[#e6e8eb] bg-white px-3.5 text-sm text-[#686b72]">
+                <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
+                  Add a Gemini API key to start chatting.
+                </span>
                 <button
                   type="button"
                   onClick={() => navigate("/settings/configure")}
@@ -4718,7 +5649,7 @@ export function App() {
                 onPickPhoto={() => fileInputRef.current?.click()}
                 onPickFiles={() => filesInputRef.current?.click()}
               />
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1">
                 <ThinkingModeToggle
                   disabled={!hasGeminiApiKey}
                   onToggle={(enabled) => {
@@ -4753,14 +5684,14 @@ export function App() {
                     <button
                       type="button"
                       aria-label="Use microphone"
-                      className="chat-composer-idle-control flex size-9 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] sm:size-10"
+                      className="chat-composer-idle-control flex size-9 shrink-0 items-center justify-center rounded-full border-0 bg-transparent text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] sm:size-10"
                     >
                       <Mic aria-hidden="true" className="size-[19px]" strokeWidth={1.8} />
                     </button>
                     <button
                       type="button"
                       aria-label="Visualize"
-                      className="chat-composer-idle-control flex size-9 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] sm:size-10"
+                      className="chat-composer-idle-control flex size-9 shrink-0 items-center justify-center rounded-full border border-[#17181b] bg-[#17181b] text-white transition-colors hover:bg-[#34363b] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] sm:size-10"
                     >
                       <AudioLines aria-hidden="true" className="size-5" strokeWidth={1.8} />
                     </button>
@@ -4782,7 +5713,7 @@ export function App() {
                         <Send aria-hidden="true" className="size-[18px]" strokeWidth={1.8} />
                       )}
                     </button>
-                  </>
+                    </>
                 )}
               </div>
             </div>

@@ -3,6 +3,7 @@ import { getServerEnvironmentVariable } from "../src/lib/server-supabase";
 
 const WINDOW_MS = 15 * 60 * 1000;
 const MAX_ATTEMPTS = 5;
+const MAX_TURNSTILE_ATTEMPTS = 2;
 const attemptsByAddress = new Map<string, { count: number; resetAt: number }>();
 
 function isMatchingCode(candidate: string, expected: string): boolean {
@@ -45,22 +46,47 @@ export default defineEventHandler(async (event) => {
     throw createError({ statusCode: 400, statusMessage: "Complete human verification before checking the code." });
   }
 
-  const verificationData = new FormData();
-  verificationData.set("secret", secret);
-  verificationData.set("response", captchaToken);
   const forwardedAddress = getHeader(event, "x-vercel-forwarded-for");
-  if (forwardedAddress) verificationData.set("remoteip", forwardedAddress.split(",")[0].trim());
-  let captchaResponse: Response;
-  try {
-    captchaResponse = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
-      method: "POST",
-      body: verificationData,
-    });
-  } catch (error) {
+  const remoteIp = forwardedAddress?.split(",")[0].trim();
+  const idempotencyKey = crypto.randomUUID();
+  let captchaResponse: Response | null = null;
+  let networkError: unknown;
+
+  for (let attempt = 0; attempt < MAX_TURNSTILE_ATTEMPTS; attempt += 1) {
+    const verificationData = new FormData();
+    verificationData.set("secret", secret);
+    verificationData.set("response", captchaToken);
+    verificationData.set("idempotency_key", idempotencyKey);
+    if (remoteIp) verificationData.set("remoteip", remoteIp);
+
+    try {
+      const response = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+        method: "POST",
+        body: verificationData,
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (
+        response.ok ||
+        (response.status < 500 && response.status !== 408 && response.status !== 425 && response.status !== 429) ||
+        attempt === MAX_TURNSTILE_ATTEMPTS - 1
+      ) {
+        captchaResponse = response;
+        break;
+      }
+      await response.body?.cancel();
+    } catch (error) {
+      networkError = error;
+      if (attempt === MAX_TURNSTILE_ATTEMPTS - 1) break;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+  }
+
+  if (!captchaResponse) {
     throw createError({
       statusCode: 502,
-      statusMessage: `Could not reach Cloudflare Turnstile: ${
-        error instanceof Error ? error.message : "Unknown network error."
+      statusMessage: `Could not reach Cloudflare Turnstile after retrying: ${
+        networkError instanceof Error ? networkError.message : "Unknown network error."
       }`,
     });
   }

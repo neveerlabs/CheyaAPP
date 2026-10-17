@@ -17,6 +17,7 @@ import {
   type GeminiAttempt,
 } from "../src/lib/gemini";
 import { CHAT_ATTACHMENT_BUCKET, MAX_GEMINI_CONTEXT_ATTACHMENTS } from "../src/lib/chat-attachments";
+import type { AiBarcodeReading } from "../src/lib/chat-barcode";
 import { searchWebWithFallback } from "../src/lib/server-web-search";
 import {
   DEFAULT_PERSONALIZATION,
@@ -79,7 +80,7 @@ async function markJobFailed(jobId: string, message: string) {
   if (error) throw new Error(`Could not save the chat failure status: ${error.message}`);
 }
 
-async function processChatJob(jobId: string) {
+async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]) {
   "use step";
   const client = createServiceRoleClient();
   const { data: job, error: jobError } = await client
@@ -228,6 +229,18 @@ async function processChatJob(jobId: string) {
   const currentAttachments = savedAttachments.filter(
     (attachment) => attachment.message_id === userMessage.id,
   );
+  const barcodeContext = barcodeReadings.flatMap((reading) => {
+    const attachment = currentAttachments.find(
+      (item) => item.id === reading.attachmentId && item.mime_type.startsWith("image/"),
+    );
+    return attachment
+      ? [{
+          fileName: attachment.file_name,
+          format: reading.format,
+          text: reading.text,
+        }]
+      : [];
+  });
   const messageRelevance = new Map(relevantUserMessageIds.map((id, index) => [id, index]));
   const relevantMediaAttachments = savedAttachments.filter(
     (attachment) =>
@@ -343,6 +356,7 @@ async function processChatJob(jobId: string) {
       memories,
       insights: insights.slice(0, 12),
       feedback,
+      barcodeReadings: barcodeContext,
       attachments: attachmentsForModel,
       prepareAttachments: (key, attachments) =>
         prepareGeminiAttachments(key, attachments, async (attachment) => {
@@ -526,10 +540,13 @@ async function processChatJob(jobId: string) {
   }
 }
 
-export async function createChatResponseWorkflow(jobId: string) {
+export async function createChatResponseWorkflow(
+  jobId: string,
+  barcodeReadings: AiBarcodeReading[] = [],
+) {
   "use workflow";
   try {
-    await processChatJob(jobId);
+    await processChatJob(jobId, barcodeReadings);
   } catch (error) {
     const message = error instanceof Error ? error.message : "An unexpected chat processing error occurred.";
     await markJobFailed(jobId, message);

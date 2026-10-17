@@ -22,10 +22,10 @@ export function ErrorPage({
     <main className="fixed inset-0 flex items-center justify-center overflow-y-auto bg-[radial-gradient(ellipse_at_top_left,_rgba(48,160,235,0.12),_transparent_48%),#f5f6f8] px-5 py-8 text-[#202126]">
       <section
         aria-labelledby="error-page-title"
-        className="w-full max-w-xl rounded-[28px] border border-[#e2e5e9] bg-white p-6 shadow-[0_18px_60px_rgba(26,36,50,0.08)] sm:p-9"
+        className="w-full max-w-lg py-6 sm:py-8"
       >
         <header className="flex items-start gap-4">
-          <div className="flex size-11 shrink-0 items-center justify-center rounded-2xl bg-[#f1f4f8] text-[#596879]">
+          <div className="flex size-11 shrink-0 items-center justify-center rounded-2xl bg-[#eaf0f6] text-[#596879]">
             <TriangleAlert aria-hidden="true" className="size-5" />
           </div>
           <div className="min-w-0 pt-0.5">
@@ -41,12 +41,12 @@ export function ErrorPage({
         {details && (
           <p
             role="alert"
-            className="mt-5 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-xl border border-[#eceef1] bg-[#f8f9fa] p-3.5 text-xs leading-5 text-[#5f6671]"
+            className="ml-[60px] mt-5 max-h-40 overflow-auto whitespace-pre-wrap break-words text-xs leading-5 text-[#777f8b]"
           >
             {details}
           </p>
         )}
-        <div className="mt-6 flex flex-col-reverse gap-2 sm:flex-row">
+        <div className="ml-[60px] mt-6 flex flex-col-reverse gap-2 sm:flex-row">
           {onHome && (
             <button
               type="button"
@@ -61,7 +61,7 @@ export function ErrorPage({
             <button
               type="button"
               onClick={onRetry}
-              className="flex h-11 items-center justify-center gap-2 rounded-xl border border-[#dfe2e7] px-4 text-sm font-medium text-[#34363b] transition hover:bg-[#f7f8fa] sm:flex-1"
+              className="flex h-11 items-center justify-center gap-2 rounded-xl px-4 text-sm font-medium text-[#34363b] transition hover:bg-black/[0.04] sm:flex-1"
             >
               <RotateCw aria-hidden="true" className="size-4" />
               Try again

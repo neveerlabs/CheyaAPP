@@ -16,19 +16,7 @@ export function LegalPage({ kind }: { kind: LegalPageKind }) {
   return (
     <main className="fixed inset-0 overflow-y-auto overscroll-contain bg-white px-5 py-8 text-[#27282d] sm:px-8 sm:py-12">
       <article className="mx-auto max-w-5xl">
-        <header className="border-b border-[#e7e8eb] px-1 pb-8 sm:pb-10">
-          <h1 className="text-2xl font-semibold tracking-tight text-[#202126] sm:text-3xl">
-            {title}
-          </h1>
-          <p className="mt-2 text-sm text-[#777a82]">Effective October 16, 2026</p>
-          <p className="mt-4 max-w-4xl text-sm leading-7 text-[#5f626a] sm:text-base sm:leading-8">
-            {isPrivacy
-              ? "This policy explains what information is processed when you use CheyaAPP, how it is used, and the choices available to you."
-              : "These terms govern your use of CheyaAPP. By using the service, you agree to the following terms."}
-          </p>
-        </header>
-
-        {isPrivacy ? <PrivacyPolicy /> : <TermsOfService />}
+        <LegalPageContent kind={kind} />
 
         <footer className="mt-2 flex flex-col gap-3 border-t border-[#e7e8eb] px-1 py-6 text-sm sm:flex-row sm:items-center sm:justify-between">
           <a href="/" className="font-medium text-[#356d91] hover:underline">
@@ -48,6 +36,27 @@ export function LegalPage({ kind }: { kind: LegalPageKind }) {
         </footer>
       </article>
     </main>
+  );
+}
+
+export function LegalPageContent({ kind }: { kind: LegalPageKind }) {
+  const isPrivacy = kind === "privacy";
+  const title = isPrivacy ? "Privacy Policy" : "Terms of Service";
+  return (
+    <>
+      <header className="border-b border-[#e7e8eb] px-1 pb-8 sm:pb-10">
+        <h2 className="text-xl font-semibold tracking-tight text-[#202126] sm:text-2xl">
+          {title}
+        </h2>
+        <p className="mt-2 text-sm text-[#777a82]">Effective October 16, 2026</p>
+        <p className="mt-4 max-w-4xl text-sm leading-7 text-[#5f626a] sm:text-base sm:leading-8">
+          {isPrivacy
+            ? "This policy explains what information is processed when you use CheyaAPP, how it is used, and the choices available to you."
+            : "These terms govern your use of CheyaAPP. By using the service, you agree to the following terms."}
+        </p>
+      </header>
+      {isPrivacy ? <PrivacyPolicy /> : <TermsOfService />}
+    </>
   );
 }
 
@@ -88,6 +97,12 @@ function PrivacyPolicy() {
           AI features can use it.
         </p>
         <p>
+          To show active sign-ins, CheyaAPP stores a session identifier, browser and device
+          information, the site origin and current path, and session start and last-active times.
+          Query strings and URL fragments are not stored. Inactive session records are removed after
+          30 days.
+        </p>
+        <p>
           Your browser may also store your sign-in session and unsent message or attachment drafts
           so they can be restored after a page reload.
         </p>
@@ -110,6 +125,11 @@ function PrivacyPolicy() {
           Gemini using the Gemini API key you configured so the model can respond. Your use of
           third-party services is also subject to their respective policies.
         </p>
+        <p>
+          When you request spoken output, the selected message text may be sent to Gemini using
+          your configured TTS keys. If Gemini TTS is unavailable, your browser may use an installed
+          speech voice locally; that browser-generated speech audio is not uploaded to CheyaAPP.
+        </p>
       </PolicySection>
 
       <PolicySection title="Retention and deletion">
@@ -121,8 +141,10 @@ function PrivacyPolicy() {
         <p>
           Messages, versions, insights, memories, settings, and feedback are not covered by the
           24-hour attachment retention period. They remain stored until you delete them using
-          available features or contact us to request deletion. Deleting an attachment does not
-          automatically delete related messages or insights.
+          available features or contact us to request deletion. Generated Gemini speech audio and
+          browser voice fallback details are privately cached for up to 24 hours. You can permanently
+          delete your account and its associated data from Account settings. Deleting an attachment
+          does not automatically delete related messages or insights.
         </p>
         <p>
           For questions or requests about your account data, contact{" "}

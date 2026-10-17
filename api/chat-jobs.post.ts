@@ -2,11 +2,13 @@ import { createError, defineEventHandler, getHeader, readBody } from "nitro/h3";
 import { start } from "workflow/api";
 import { createChatResponseWorkflow } from "../workflows/chat-response";
 import { createAuthenticatedServerClient, createServiceRoleClient } from "../src/lib/server-supabase";
+import type { AiBarcodeReading } from "../src/lib/chat-barcode";
 
 type ChatJobRequest = {
   content?: unknown;
   thinkingMode?: unknown;
   attachmentIds?: unknown;
+  barcodeReadings?: unknown;
 };
 
 export default defineEventHandler(async (event) => {
@@ -48,8 +50,61 @@ export default defineEventHandler(async (event) => {
   }
   const content = typeof body?.content === "string" ? body.content.trim() : "";
   const attachmentIds = (body.attachmentIds ?? []) as string[];
+  const barcodeReadings = body.barcodeReadings ?? [];
   if (!content && attachmentIds.length === 0) {
     throw createError({ statusCode: 400, statusMessage: "Write a message or attach a file." });
+  }
+  if (
+    !Array.isArray(barcodeReadings) ||
+    barcodeReadings.length > 10 ||
+    barcodeReadings.some(
+      (reading) =>
+        typeof reading !== "object" ||
+        reading === null ||
+        !("attachmentId" in reading) ||
+        typeof reading.attachmentId !== "string" ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(reading.attachmentId) ||
+        !attachmentIds.includes(reading.attachmentId) ||
+        !("format" in reading) ||
+        typeof reading.format !== "string" ||
+        reading.format.length < 1 ||
+        reading.format.length > 64 ||
+        !("text" in reading) ||
+        typeof reading.text !== "string" ||
+        reading.text.length < 1 ||
+        reading.text.length > 4096
+    )
+  ) {
+    throw createError({ statusCode: 400, statusMessage: "Scanned barcode context is invalid." });
+  }
+  const typedBarcodeReadings = barcodeReadings as AiBarcodeReading[];
+  const barcodeAttachmentIds = [...new Set(typedBarcodeReadings.map((item) => item.attachmentId))];
+  if (barcodeAttachmentIds.length !== typedBarcodeReadings.length) {
+    throw createError({ statusCode: 400, statusMessage: "Barcode context contains duplicate attachments." });
+  }
+  if (barcodeAttachmentIds.length > 0) {
+    const { data: barcodeAttachments, error: barcodeAttachmentError } = await requestClient
+      .from("chat_message_attachments")
+      .select("id, mime_type")
+      .in("id", barcodeAttachmentIds)
+      .eq("user_id", user.id)
+      .is("deleted_at", null)
+      .gt("expires_at", new Date().toISOString());
+    if (barcodeAttachmentError) {
+      throw createError({
+        statusCode: 500,
+        statusMessage: `Could not verify scanned barcode attachments: ${barcodeAttachmentError.message}`,
+      });
+    }
+    if (
+      barcodeAttachments.length !== barcodeAttachmentIds.length ||
+      barcodeAttachments.some((attachment) => !attachment.mime_type.startsWith("image/"))
+    ) {
+      throw createError({
+        statusCode: 400,
+        statusMessage: "Barcode context must refer to your active image attachments.",
+      });
+    }
   }
 
   const { data: keys, error: keysError } = await requestClient
@@ -75,7 +130,7 @@ export default defineEventHandler(async (event) => {
   if (!job) throw createError({ statusCode: 500, statusMessage: "The database did not return a chat job." });
 
   try {
-    const run = await start(createChatResponseWorkflow, [job.job_id]);
+    const run = await start(createChatResponseWorkflow, [job.job_id, typedBarcodeReadings]);
     return { jobId: job.job_id, messageId: job.message_id, runId: run.runId };
   } catch (error) {
     const message = error instanceof Error ? error.message : "Could not start the durable chat workflow.";

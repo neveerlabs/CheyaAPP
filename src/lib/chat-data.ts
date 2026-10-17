@@ -193,6 +193,26 @@ export interface ChatMessagePage {
   hasMore: boolean;
 }
 
+function isTransientConnectionError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const details = error as { code?: unknown; message?: unknown; cause?: unknown };
+  const cause =
+    typeof details.cause === "object" && details.cause !== null
+      ? (details.cause as { code?: unknown; message?: unknown })
+      : null;
+  const message = [
+    details.message,
+    details.code,
+    cause?.message,
+    cause?.code,
+  ]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ");
+  return /ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT|fetch failed|networkerror|network request failed|socket hang up/i.test(
+    message,
+  );
+}
+
 export async function loadChatMessagePage(
   client: AppSupabaseClient,
   options: {
@@ -202,23 +222,49 @@ export async function loadChatMessagePage(
   } = {},
 ): Promise<ChatMessagePage> {
   const { limit = 50, before, userId } = options;
-  let query = client
-    .from("chat_messages")
-    .select("id, user_id, role, content, embedding, created_at, version_number, thinking_summary, is_active, revision_reason")
-    .eq("is_active", true)
-    .order("created_at", { ascending: false })
-    .order("id", { ascending: false })
-    .limit(limit + 1);
-  if (before) {
-    query = query.or(
-      `created_at.lt.${before.created_at},and(created_at.eq.${before.created_at},id.lt.${before.id})`,
-    );
+  let data: StoredChatMessage[] | null = null;
+  let error: { message: string } | null = null;
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      let query = client
+        .from("chat_messages")
+        .select("id, user_id, role, content, embedding, created_at, version_number, thinking_summary, is_active, revision_reason")
+        .eq("is_active", true)
+        .order("created_at", { ascending: false })
+        .order("id", { ascending: false })
+        .limit(limit + 1);
+      if (before) {
+        query = query.or(
+          `created_at.lt.${before.created_at},and(created_at.eq.${before.created_at},id.lt.${before.id})`,
+        );
+      }
+      if (userId) query = query.eq("user_id", userId);
+      const result = await query;
+      data = result.data;
+      error = result.error;
+    } catch (requestError) {
+      if (!isTransientConnectionError(requestError) || attempt === 2) throw requestError;
+      error = {
+        message:
+          requestError instanceof Error
+            ? requestError.message
+            : "The database connection was interrupted.",
+      };
+    }
+
+    if (!error) break;
+    if (!isTransientConnectionError(error) || attempt === 2) {
+      throw new Error(
+        `Could not load saved chat history: ${error.message} Confirm the latest supabase/schema.sql has been run.`,
+      );
+    }
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 250 * 2 ** attempt));
   }
-  if (userId) query = query.eq("user_id", userId);
-  const { data, error } = await query;
-  if (error) {
+
+  if (error || !data) {
     throw new Error(
-      `Could not load saved chat history: ${error.message} Confirm the latest supabase/schema.sql has been run.`,
+      `Could not load saved chat history: ${error?.message ?? "The database returned no chat history."} Confirm the latest supabase/schema.sql has been run.`,
     );
   }
   return {

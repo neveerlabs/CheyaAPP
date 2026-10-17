@@ -1,5 +1,9 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { ChatAttachment } from "./chat-attachments";
+import {
+  DEFAULT_GEMINI_TTS_VOICE,
+  type GeminiTtsVoice,
+} from "./gemini-tts";
 
 export const DATABASE_CONFIG_KEY = "cheyaverse.supabase.bootstrap";
 export const MULTIMODAL_GEMINI_MODELS = [
@@ -56,10 +60,20 @@ export interface PersonalizationSettings {
   chat_style: string;
 }
 
+export interface GeminiTtsSettings {
+  tts_api_keys: string[];
+  tts_voice: GeminiTtsVoice;
+}
+
 export const DEFAULT_PERSONALIZATION: PersonalizationSettings = {
   display_name: "",
   custom_prompt: "",
   chat_style: "",
+};
+
+export const DEFAULT_GEMINI_TTS_SETTINGS: GeminiTtsSettings = {
+  tts_api_keys: [],
+  tts_voice: DEFAULT_GEMINI_TTS_VOICE,
 };
 
 export type GeminiApiKey = {
@@ -70,6 +84,30 @@ export type GeminiApiKey = {
   last_error: string | null;
   created_at: string;
 }
+
+export type GeminiTtsAudioCache = {
+  id: string;
+  user_id: string;
+  message_id: string;
+  version_number: number;
+  voice: GeminiTtsVoice;
+  storage_path: string | null;
+  source: "gemini" | "browser";
+  browser_voice_name: string | null;
+  error_details: string | null;
+  created_at: string;
+  expires_at: string;
+};
+
+export type AccountSession = {
+  id: string;
+  user_id: string;
+  origin: string;
+  path: string;
+  user_agent: string;
+  started_at: string;
+  last_seen_at: string;
+};
 
 export type StoredChatMessage = {
   id: string;
@@ -165,6 +203,9 @@ export type Database = {
           display_name: string;
           custom_prompt: string;
           chat_style: string;
+          tts_api_key: string;
+          tts_api_keys: string[];
+          tts_voice: string;
           updated_at: string;
         };
         Insert: {
@@ -174,6 +215,9 @@ export type Database = {
           display_name?: string;
           custom_prompt?: string;
           chat_style?: string;
+          tts_api_key?: string;
+          tts_api_keys?: string[];
+          tts_voice?: string;
           updated_at?: string;
         };
         Update: Partial<{
@@ -182,6 +226,9 @@ export type Database = {
           display_name: string;
           custom_prompt: string;
           chat_style: string;
+          tts_api_key: string;
+          tts_api_keys: string[];
+          tts_voice: string;
           updated_at: string;
         }>;
         Relationships: never[];
@@ -296,6 +343,38 @@ export type Database = {
           sha256: string | null;
           deleted_at: string | null;
         }>;
+        Relationships: never[];
+      };
+      chat_tts_audio_cache: {
+        Row: GeminiTtsAudioCache;
+        Insert: {
+          id?: string;
+          user_id?: string;
+          message_id: string;
+          version_number: number;
+          voice: GeminiTtsVoice;
+          storage_path?: string | null;
+          source?: "gemini" | "browser";
+          browser_voice_name?: string | null;
+          error_details?: string | null;
+          created_at?: string;
+          expires_at?: string;
+        };
+        Update: Partial<Pick<GeminiTtsAudioCache, "expires_at" | "source" | "browser_voice_name" | "error_details">>;
+        Relationships: never[];
+      };
+      account_sessions: {
+        Row: AccountSession;
+        Insert: {
+          id: string;
+          user_id: string;
+          origin: string;
+          path: string;
+          user_agent?: string;
+          started_at?: string;
+          last_seen_at?: string;
+        };
+        Update: Partial<Pick<AccountSession, "origin" | "path" | "user_agent" | "last_seen_at">>;
         Relationships: never[];
       };
       message_insights: {

@@ -2,40 +2,64 @@ import {
   ArrowLeft,
   Brain,
   Check,
-  ChevronRight,
+  ChevronDown,
   CircleAlert,
   CircleHelp,
   Bug,
+  Clock3,
   Eye,
   EyeOff,
+  FileText,
+  Laptop,
   LoaderCircle,
-  KeyRound,
+  LogOut,
   Pencil,
   Plus,
+  Play,
+  ShieldCheck,
   SlidersHorizontal,
   Trash2,
   UserRound,
 } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
+import { LegalPageContent } from "./LegalPage";
+import {
+  clearAccountSessionId,
+  getAccountSessionId,
+  getAccountSessionBrowserLabel,
+  getAccountSessionDeviceLabel,
+} from "./lib/account-sessions";
 import { generateGeminiReply, GeminiFailoverError } from "./lib/gemini";
 import {
+  DEFAULT_GEMINI_TTS_VOICE,
+  GEMINI_TTS_MODEL,
+  GEMINI_TTS_VOICES,
+  generateGeminiSpeech,
+  isGeminiTtsVoice,
+  type GeminiTtsVoice,
+} from "./lib/gemini-tts";
+import {
   DEFAULT_PERSONALIZATION,
+  DEFAULT_GEMINI_TTS_SETTINGS,
   ensureSupabaseSession,
   MULTIMODAL_GEMINI_MODELS,
   saveApiStatus,
   type ApiStatus,
+  type AccountSession,
   type AppSupabaseClient,
   type GeminiApiKey,
   type GeminiModel,
   type PersonalizationSettings,
   type UserMemory,
 } from "./lib/supabase";
+import { subscribeWithReconnect } from "./lib/realtime";
 
 interface SettingsPageProps {
   pathname: string;
   onNavigate: (path: string) => void;
   onBack: () => void;
   client: AppSupabaseClient;
+  accountUserId: string;
   accountEmail: string | null;
   onGeminiKeyChange: (isConfigured: boolean) => void;
 }
@@ -56,7 +80,24 @@ function statusStyle(status: ApiStatus): string {
   return "bg-[#f1f2f4] text-[#686b72]";
 }
 
-type SettingsSection = "home" | "personal" | "configure" | "memory";
+function formatAccountDateTime(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? value
+    : new Intl.DateTimeFormat(undefined, {
+        dateStyle: "medium",
+        timeStyle: "short",
+      }).format(date);
+}
+
+type SettingsSection =
+  | "home"
+  | "personal"
+  | "configure"
+  | "memory"
+  | "account"
+  | "privacy"
+  | "terms";
 
 const settingsSections: Array<{
   id: Exclude<SettingsSection, "home">;
@@ -73,7 +114,7 @@ const settingsSections: Array<{
   {
     id: "configure",
     label: "Configure",
-    description: "Account sync and Gemini API keys",
+    description: "Gemini API keys and voice settings",
     icon: SlidersHorizontal,
   },
   {
@@ -82,12 +123,34 @@ const settingsSections: Array<{
     description: "Review and manage facts Cheya remembers long-term",
     icon: Brain,
   },
+  {
+    id: "account",
+    label: "Account",
+    description: "Email, workspace, active sessions, and account controls",
+    icon: UserRound,
+  },
+  {
+    id: "privacy",
+    label: "Privacy Policy",
+    description: "How CheyaAPP handles your information",
+    icon: ShieldCheck,
+  },
+  {
+    id: "terms",
+    label: "Terms of Service",
+    description: "Terms for using CheyaAPP",
+    icon: FileText,
+  },
 ];
+
+const settingsNavigationSections = settingsSections.filter(
+  ({ id }) => id !== "privacy" && id !== "terms",
+);
 
 function sectionFromPath(pathname: string): SettingsSection {
   const section = pathname.split("/")[2];
-  return section === "personal" || section === "configure" || section === "memory"
-    ? section
+  return settingsSections.some((item) => item.id === section)
+    ? (section as Exclude<SettingsSection, "home">)
     : "home";
 }
 
@@ -96,6 +159,7 @@ export function SettingsPage({
   onNavigate,
   onBack,
   client,
+  accountUserId,
   accountEmail,
   onGeminiKeyChange,
 }: SettingsPageProps) {
@@ -105,20 +169,36 @@ export function SettingsPage({
   const [apiKeys, setApiKeys] = useState<GeminiApiKey[]>([]);
   const [personalization, setPersonalization] =
     useState<PersonalizationSettings>(DEFAULT_PERSONALIZATION);
+  const [ttsApiKeys, setTtsApiKeys] = useState(DEFAULT_GEMINI_TTS_SETTINGS.tts_api_keys);
+  const [ttsVoice, setTtsVoice] = useState<GeminiTtsVoice>(DEFAULT_GEMINI_TTS_VOICE);
+  const [isTtsVoiceMenuOpen, setIsTtsVoiceMenuOpen] = useState(false);
+  const [ttsPreviewUrl, setTtsPreviewUrl] = useState("");
+  const [ttsTestMessage, setTtsTestMessage] = useState("");
   const [personalizationError, setPersonalizationError] = useState("");
   const selectedModel: GeminiModel = MULTIMODAL_GEMINI_MODELS[0];
   const [newApiKey, setNewApiKey] = useState("");
   const [isHelpOpen, setIsHelpOpen] = useState(false);
   const [isSavingPersonalization, setIsSavingPersonalization] = useState(false);
+  const [isSavingTtsSettings, setIsSavingTtsSettings] = useState(false);
+  const [isTestingTtsApi, setIsTestingTtsApi] = useState(false);
   const [isLoadingKeys, setIsLoadingKeys] = useState(false);
   const [isLoadingPersonalization, setIsLoadingPersonalization] = useState(false);
   const [isAddingKey, setIsAddingKey] = useState(false);
   const [busyKeyId, setBusyKeyId] = useState<string | null>(null);
   const [showApiKey, setShowApiKey] = useState(false);
+  const [showTtsApiKey, setShowTtsApiKey] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
   const [notice, setNotice] = useState("");
   const [isSigningOut, setIsSigningOut] = useState(false);
-  const [realtimeRevision, setRealtimeRevision] = useState(0);
+  const [accountSessions, setAccountSessions] = useState<AccountSession[]>([]);
+  const [isLoadingAccountSessions, setIsLoadingAccountSessions] = useState(false);
+  const [accountSessionsError, setAccountSessionsError] = useState("");
+  const [currentAccountSessionId, setCurrentAccountSessionId] = useState<string | null>(null);
+  const [deletingSessionIds, setDeletingSessionIds] = useState<string[]>([]);
+  const [isDeletingOtherSessions, setIsDeletingOtherSessions] = useState(false);
+  const [isDeleteAccountDialogOpen, setIsDeleteAccountDialogOpen] = useState(false);
+  const [deleteAccountConfirmation, setDeleteAccountConfirmation] = useState("");
+  const [isDeletingAccount, setIsDeletingAccount] = useState(false);
   const [memories, setMemories] = useState<UserMemory[]>([]);
   const [memoryContent, setMemoryContent] = useState("");
   const [memoryCategory, setMemoryCategory] = useState("general");
@@ -128,6 +208,15 @@ export function SettingsPage({
   const [isClearingChats, setIsClearingChats] = useState(false);
   const [isClearChatsConfirmationOpen, setIsClearChatsConfirmationOpen] = useState(false);
   const settingsContentRef = useRef<HTMLDivElement>(null);
+  const personalizationDraftDirtyRef = useRef(false);
+  const ttsDraftDirtyRef = useRef(false);
+  const memoryDraftDirtyRef = useRef(false);
+  const ttsPreviewAudioRef = useRef<HTMLAudioElement>(null);
+  const ttsPreviewUrlRef = useRef("");
+  const ttsVoicePickerRef = useRef<HTMLDivElement>(null);
+  const normalizedTtsApiKeys = [
+    ...new Set(ttsApiKeys.map((key) => key.trim()).filter(Boolean)),
+  ];
 
   useEffect(() => {
     setActiveSection(sectionFromPath(pathname));
@@ -135,6 +224,24 @@ export function SettingsPage({
     setNotice("");
     if (settingsContentRef.current) settingsContentRef.current.scrollTop = 0;
   }, [pathname]);
+
+  useEffect(() => {
+    if (!isTtsVoiceMenuOpen) return;
+    function handlePointerDown(event: PointerEvent) {
+      if (!ttsVoicePickerRef.current?.contains(event.target as Node)) {
+        setIsTtsVoiceMenuOpen(false);
+      }
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") setIsTtsVoiceMenuOpen(false);
+    }
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [isTtsVoiceMenuOpen]);
 
   function openSection(section: Exclude<SettingsSection, "home">) {
     onNavigate(`/settings/${section}`);
@@ -174,80 +281,200 @@ export function SettingsPage({
   }, [client]);
 
   useEffect(() => {
-    if (!client || !isDatabaseReady) return;
+    if (activeSection !== "account" || !client || !isDatabaseReady) return;
     let isMounted = true;
-    let channel: ReturnType<typeof client.channel> | null = null;
+    let sessionId: string | null = null;
+    setIsLoadingAccountSessions(true);
+    setAccountSessionsError("");
+    try {
+      sessionId = getAccountSessionId();
+      setCurrentAccountSessionId(sessionId);
+    } catch (error) {
+      setAccountSessionsError(getErrorMessage(error));
+    }
 
-    void client.auth
-      .getUser()
-      .then(({ data, error }) => {
-        if (!isMounted) return;
+    let didPurgeStaleSessions = false;
+    const loadSessions = async () => {
+      try {
+        const cutoff = new Date(Date.now() - 2 * 60_000).toISOString();
+        if (!didPurgeStaleSessions) {
+          const staleCutoff = new Date(Date.now() - 30 * 24 * 60 * 60_000).toISOString();
+          const { error: purgeError } = await client
+            .from("account_sessions")
+            .delete()
+            .lt("last_seen_at", staleCutoff);
+          if (purgeError) {
+            throw new Error(
+              `Could not clean old account session records. Apply the latest supabase/schema.sql. ${purgeError.message}`,
+            );
+          }
+          didPurgeStaleSessions = true;
+        }
+        const { data, error } = await client
+          .from("account_sessions")
+          .select("id, user_id, origin, path, user_agent, started_at, last_seen_at")
+          .gte("last_seen_at", cutoff)
+          .order("last_seen_at", { ascending: false });
         if (error) {
-          setErrorMessage(`Could not start live settings sync: ${error.message}`);
-          return;
+          throw new Error(
+            `Could not load active sessions. Apply the latest supabase/schema.sql. ${error.message}`,
+          );
         }
-        if (!data.user) {
-          setErrorMessage("Could not start live settings sync without an account.");
-          return;
-        }
+        if (isMounted) setAccountSessions(data);
+      } catch (error) {
+        if (isMounted) setAccountSessionsError(getErrorMessage(error));
+      } finally {
+        if (isMounted) setIsLoadingAccountSessions(false);
+      }
+    };
 
-        channel = client
-          .channel(`settings-live-${data.user.id}`)
-          .on(
-            "postgres_changes",
-            {
-              event: "*",
-              schema: "public",
-              table: "ai_api_keys",
-            },
-            () => {
-              if (isMounted) setRealtimeRevision((revision) => revision + 1);
-            },
-          )
-          .on(
-            "postgres_changes",
-            {
-              event: "*",
-              schema: "public",
-              table: "user_settings",
-            },
-            () => {
-              if (isMounted) setRealtimeRevision((revision) => revision + 1);
-            },
-          )
-          .on(
-            "postgres_changes",
-            {
-              event: "*",
-              schema: "public",
-              table: "user_memories",
-            },
-            () => {
-              if (isMounted) setRealtimeRevision((revision) => revision + 1);
-            },
-          )
-          .subscribe((status, error) => {
-            if (
-              isMounted &&
-              (status === "CHANNEL_ERROR" || status === "TIMED_OUT")
-            ) {
-              setErrorMessage(
-                `Live settings sync is unavailable: ${error?.message ?? status}.`,
-              );
-            }
-          });
-      })
-      .catch((error: unknown) => {
-        if (isMounted) {
-          setErrorMessage(`Could not start live settings sync: ${getErrorMessage(error)}`);
+    void loadSessions();
+    return () => {
+      isMounted = false;
+    };
+  }, [activeSection, client, isDatabaseReady]);
+
+  useEffect(() => {
+    if (!client || !isDatabaseReady || !accountUserId) return;
+    let isMounted = true;
+    let hasConnected = false;
+    const tables = [
+      "account_sessions",
+      "ai_api_keys",
+      "user_memories",
+      "user_settings",
+    ] as const;
+    const refreshAccountSessions = async () => {
+      const cutoff = new Date(Date.now() - 2 * 60_000).toISOString();
+      const { data, error } = await client
+        .from("account_sessions")
+        .select("id, user_id, origin, path, user_agent, started_at, last_seen_at")
+        .gte("last_seen_at", cutoff)
+        .order("last_seen_at", { ascending: false });
+      if (error) throw error;
+      if (isMounted) setAccountSessions(data);
+    };
+    const refreshApiKeys = async () => {
+      const { data, error } = await client
+        .from("ai_api_keys")
+        .select("id, model, api_key, status, last_error, created_at")
+        .order("created_at", { ascending: true })
+        .order("id", { ascending: true });
+      if (error) throw error;
+      if (isMounted) setApiKeys(data);
+    };
+    const refreshMemories = async () => {
+      const { data, error } = await client
+        .from("user_memories")
+        .select("*")
+        .order("updated_at", { ascending: false });
+      if (error) throw error;
+      if (isMounted) setMemories(data);
+    };
+    const refreshPersonalization = async () => {
+      const { data, error } = await client
+        .from("user_settings")
+        .select("display_name, custom_prompt, chat_style, tts_api_key, tts_api_keys, tts_voice")
+        .eq("user_id", accountUserId)
+        .maybeSingle();
+      if (error) throw error;
+      if (!isMounted) return;
+      if (!personalizationDraftDirtyRef.current) {
+        setPersonalization({
+          display_name: data?.display_name ?? DEFAULT_PERSONALIZATION.display_name,
+          custom_prompt: data?.custom_prompt ?? DEFAULT_PERSONALIZATION.custom_prompt,
+          chat_style: data?.chat_style ?? DEFAULT_PERSONALIZATION.chat_style,
+        });
+      }
+      if (!ttsDraftDirtyRef.current) {
+        const savedTtsKeys = Array.isArray(data?.tts_api_keys)
+          ? data.tts_api_keys
+          : [];
+        setTtsApiKeys(
+          savedTtsKeys.length > 0
+            ? savedTtsKeys
+            : data?.tts_api_key
+              ? [data.tts_api_key]
+              : [],
+        );
+        setTtsVoice(
+          typeof data?.tts_voice === "string" && isGeminiTtsVoice(data.tts_voice)
+            ? data.tts_voice
+            : DEFAULT_GEMINI_TTS_VOICE,
+        );
+      }
+    };
+    const refreshForTable = (table: (typeof tables)[number]) => {
+      const refresh =
+        table === "account_sessions"
+          ? refreshAccountSessions
+          : table === "ai_api_keys"
+            ? refreshApiKeys
+            : table === "user_memories"
+              ? refreshMemories
+              : table === "user_settings"
+                ? refreshPersonalization
+                : null;
+      if (!refresh) return;
+      void refresh().catch((error: unknown) => {
+        if (!isMounted) return;
+        const detail = getErrorMessage(error);
+        if (table === "account_sessions") {
+          setAccountSessionsError(`Could not sync active sessions: ${detail}`);
+        } else {
+          setErrorMessage(`Could not sync ${table.split("_").join(" ")}: ${detail}`);
         }
       });
+    };
+    const stopRealtime = subscribeWithReconnect(
+      client,
+      `settings-live-${accountUserId}`,
+      (initialChannel) => {
+        let channel = initialChannel;
+        for (const table of tables) {
+          channel = channel.on(
+            "postgres_changes",
+            {
+              event: "*",
+              schema: "public",
+              table,
+            },
+            () => {
+              refreshForTable(table);
+            },
+          );
+        }
+        return channel;
+      },
+      (status, error) => {
+        if (!isMounted) return;
+        if (status === "SUBSCRIBED") {
+          if (hasConnected) {
+            for (const table of tables) refreshForTable(table);
+          }
+          hasConnected = true;
+          setErrorMessage((current) =>
+            current.startsWith("Live settings sync disconnected. Reconnecting")
+              ? ""
+              : current,
+          );
+        } else if (
+          status === "CHANNEL_ERROR" ||
+          status === "TIMED_OUT" ||
+          status === "CLOSED"
+        ) {
+          setErrorMessage(
+            `Live settings sync disconnected. Reconnecting… ${error?.message ?? ""}`.trim(),
+          );
+        }
+      },
+    );
 
     return () => {
       isMounted = false;
-      if (channel) void client.removeChannel(channel);
+      stopRealtime();
     };
-  }, [client, isDatabaseReady]);
+  }, [accountUserId, client, isDatabaseReady]);
 
   useEffect(() => {
     if (!client || !isDatabaseReady) {
@@ -275,7 +502,7 @@ export function SettingsPage({
     return () => {
       isMounted = false;
     };
-  }, [client, isDatabaseReady, pathname, realtimeRevision]);
+  }, [client, isDatabaseReady]);
 
   useEffect(() => {
     if (!client || !isDatabaseReady || activeSection !== "memory") return;
@@ -295,7 +522,7 @@ export function SettingsPage({
     return () => {
       isMounted = false;
     };
-  }, [activeSection, client, isDatabaseReady, pathname, realtimeRevision]);
+  }, [activeSection, client, isDatabaseReady, pathname]);
 
   useEffect(() => {
     if (!client || !isDatabaseReady) return;
@@ -311,7 +538,7 @@ export function SettingsPage({
 
         const { data, error } = await client
           .from("user_settings")
-          .select("display_name, custom_prompt, chat_style")
+          .select("display_name, custom_prompt, chat_style, tts_api_key, tts_api_keys, tts_voice")
           .eq("user_id", userData.user.id)
           .maybeSingle();
         if (error) {
@@ -325,6 +552,22 @@ export function SettingsPage({
             custom_prompt: data.custom_prompt,
             chat_style: data.chat_style,
           });
+          const savedTtsKeys = Array.isArray(data.tts_api_keys)
+            ? data.tts_api_keys
+            : [];
+          setTtsApiKeys(
+            savedTtsKeys.length > 0
+              ? savedTtsKeys
+              : data.tts_api_key
+                ? [data.tts_api_key]
+                : [],
+          );
+          setTtsVoice(
+            isGeminiTtsVoice(data.tts_voice) ? data.tts_voice : DEFAULT_GEMINI_TTS_VOICE,
+          );
+        } else if (isMounted) {
+          setTtsApiKeys(DEFAULT_GEMINI_TTS_SETTINGS.tts_api_keys);
+          setTtsVoice(DEFAULT_GEMINI_TTS_SETTINGS.tts_voice);
         }
       } catch (error) {
         if (isMounted) {
@@ -340,7 +583,26 @@ export function SettingsPage({
     return () => {
       isMounted = false;
     };
-  }, [client, isDatabaseReady, pathname, realtimeRevision]);
+  }, [client, isDatabaseReady]);
+
+  useEffect(
+    () => () => {
+      ttsPreviewAudioRef.current?.pause();
+      if (ttsPreviewUrlRef.current) URL.revokeObjectURL(ttsPreviewUrlRef.current);
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!ttsPreviewUrl) return;
+    const audio = ttsPreviewAudioRef.current;
+    if (!audio) return;
+    void audio.play().catch((error: unknown) => {
+      setTtsTestMessage(
+        `The test audio is ready. Press play to listen: ${getErrorMessage(error)}`,
+      );
+    });
+  }, [ttsPreviewUrl]);
 
   useEffect(() => {
     if (!isHelpOpen) return;
@@ -379,6 +641,9 @@ export function SettingsPage({
         {
           user_id: data.user.id,
           ...personalization,
+          tts_api_key: ttsApiKeys.find((key) => key.trim())?.trim() ?? "",
+          tts_api_keys: ttsApiKeys.map((key) => key.trim()).filter(Boolean),
+          tts_voice: ttsVoice,
           updated_at: new Date().toISOString(),
         },
         { onConflict: "user_id" },
@@ -389,6 +654,8 @@ export function SettingsPage({
         );
       }
 
+      personalizationDraftDirtyRef.current = false;
+      ttsDraftDirtyRef.current = false;
       setNotice("Personal settings saved to your CheyaVerse account.");
     } catch (error) {
       const detail = getErrorMessage(error);
@@ -399,16 +666,228 @@ export function SettingsPage({
     }
   }
 
+  async function saveTtsSettings() {
+    clearMessages();
+    setTtsTestMessage("");
+    if (!isDatabaseReady) {
+      setErrorMessage("Sign in with your Google account before saving Gemini TTS settings.");
+      return;
+    }
+    if (isLoadingPersonalization || personalizationError) {
+      setErrorMessage(
+        personalizationError || "Wait for your account settings to finish loading before saving.",
+      );
+      return;
+    }
+
+    setIsSavingTtsSettings(true);
+    try {
+      const { data, error: userError } = await client.auth.getUser();
+      if (userError) throw userError;
+      if (!data.user) throw new Error("The private Supabase session has no user ID.");
+
+      const { error } = await client.from("user_settings").upsert(
+        {
+          user_id: data.user.id,
+          ...personalization,
+          tts_api_key: normalizedTtsApiKeys[0] ?? "",
+          tts_api_keys: normalizedTtsApiKeys,
+          tts_voice: ttsVoice,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "user_id" },
+      );
+      if (error) {
+        throw new Error(
+          `Could not save Gemini TTS settings. The CheyaVerse database may need the latest supabase/schema.sql. ${error.message}`,
+        );
+      }
+      setTtsApiKeys(normalizedTtsApiKeys);
+      ttsDraftDirtyRef.current = false;
+      personalizationDraftDirtyRef.current = false;
+      setNotice(`${normalizedTtsApiKeys.length} Gemini TTS API key(s) and voice saved to your CheyaVerse account.`);
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error));
+    } finally {
+      setIsSavingTtsSettings(false);
+    }
+  }
+
+  async function testGeminiTts() {
+    clearMessages();
+    setTtsTestMessage("");
+    ttsPreviewAudioRef.current?.pause();
+    if (ttsPreviewUrlRef.current) URL.revokeObjectURL(ttsPreviewUrlRef.current);
+    ttsPreviewUrlRef.current = "";
+    setTtsPreviewUrl("");
+    if (normalizedTtsApiKeys.length === 0) {
+      setTtsTestMessage("Add at least one separate Gemini TTS API key before testing.");
+      return;
+    }
+
+    setIsTestingTtsApi(true);
+    try {
+      const sample = GEMINI_TTS_VOICES.find((voice) => voice.id === ttsVoice);
+      if (!sample) throw new Error("The selected Gemini TTS voice is unavailable.");
+      const audioBlob = await generateGeminiSpeech(normalizedTtsApiKeys, sample.sample, ttsVoice);
+      const url = URL.createObjectURL(audioBlob);
+      ttsPreviewUrlRef.current = url;
+      setTtsPreviewUrl(url);
+      setTtsTestMessage(`${GEMINI_TTS_MODEL} returned audio successfully.`);
+    } catch (error) {
+      setTtsTestMessage(getErrorMessage(error));
+    } finally {
+      setIsTestingTtsApi(false);
+    }
+  }
+
   async function signOut() {
     clearMessages();
     setIsSigningOut(true);
     try {
+      let sessionCleanupWarning = "";
+      try {
+        const sessionId = getAccountSessionId();
+        const { error: sessionError } = await client
+          .from("account_sessions")
+          .delete()
+          .eq("id", sessionId);
+        if (sessionError) sessionCleanupWarning = sessionError.message;
+      } catch (error) {
+        sessionCleanupWarning = getErrorMessage(error);
+      }
       const { error } = await client.auth.signOut();
-      if (error) setErrorMessage(`Could not sign out: ${error.message}`);
+      if (error) {
+        setErrorMessage(`Could not sign out: ${error.message}`);
+      } else {
+        clearAccountSessionId();
+        if (sessionCleanupWarning) {
+          setNotice(`Signed out. This session will disappear from the active list shortly. ${sessionCleanupWarning}`);
+        }
+      }
     } catch (error) {
       setErrorMessage(`Could not sign out: ${getErrorMessage(error)}`);
     } finally {
       setIsSigningOut(false);
+    }
+  }
+
+  async function deleteAccountSession(session: AccountSession) {
+    if (
+      !window.confirm(
+        session.id === currentAccountSessionId
+          ? "Delete this session and sign out this device?"
+          : "Delete this session? Its device will be signed out the next time it checks in.",
+      )
+    ) {
+      return;
+    }
+
+    clearMessages();
+    setAccountSessionsError("");
+    setDeletingSessionIds((current) => [...current, session.id]);
+    try {
+      const { data: userData, error: userError } = await client.auth.getUser();
+      if (userError) throw userError;
+      if (!userData.user) throw new Error("Sign in before deleting a session.");
+      const { data, error } = await client
+        .from("account_sessions")
+        .delete()
+        .eq("id", session.id)
+        .eq("user_id", userData.user.id)
+        .select("id");
+      if (error) throw error;
+      if (data.length === 0) throw new Error("This session was already removed. Refresh the list and try again.");
+
+      setAccountSessions((current) => current.filter((item) => item.id !== session.id));
+      if (session.id === currentAccountSessionId) {
+        clearAccountSessionId();
+        const { error: signOutError } = await client.auth.signOut({ scope: "local" });
+        if (signOutError) throw signOutError;
+      } else {
+        setNotice("Session deleted. Its device will be signed out when it checks in.");
+      }
+    } catch (error) {
+      setAccountSessionsError(`Could not delete this session: ${getErrorMessage(error)}`);
+    } finally {
+      setDeletingSessionIds((current) => current.filter((id) => id !== session.id));
+    }
+  }
+
+  async function deleteOtherAccountSessions() {
+    if (!currentAccountSessionId) {
+      setAccountSessionsError("This device's active session could not be identified.");
+      return;
+    }
+    if (!window.confirm("Delete all other sessions? Their devices will be signed out when they check in.")) {
+      return;
+    }
+
+    clearMessages();
+    setAccountSessionsError("");
+    setIsDeletingOtherSessions(true);
+    try {
+      const { data: userData, error: userError } = await client.auth.getUser();
+      if (userError) throw userError;
+      if (!userData.user) throw new Error("Sign in before deleting other sessions.");
+      const { error } = await client
+        .from("account_sessions")
+        .delete()
+        .eq("user_id", userData.user.id)
+        .neq("id", currentAccountSessionId)
+        .select("id");
+      if (error) throw error;
+
+      setAccountSessions((current) =>
+        current.filter((session) => session.id === currentAccountSessionId),
+      );
+      setNotice("All other sessions were deleted. Their devices will be signed out when they check in.");
+    } catch (error) {
+      setAccountSessionsError(`Could not delete other sessions: ${getErrorMessage(error)}`);
+    } finally {
+      setIsDeletingOtherSessions(false);
+    }
+  }
+
+  async function deleteAccount() {
+    clearMessages();
+    setIsDeletingAccount(true);
+    try {
+      const { data, error } = await client.auth.getSession();
+      if (error) throw new Error(`Could not verify your account session: ${error.message}`);
+      const accessToken = data.session?.access_token;
+      if (!accessToken) throw new Error("Sign in again before deleting your account.");
+      const response = await fetch("/api/account-delete", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      if (!response.ok) {
+        const body = await response.text();
+        let message = body || `Account deletion failed (HTTP ${response.status}).`;
+        try {
+          const payload: unknown = JSON.parse(body);
+          if (
+            typeof payload === "object" &&
+            payload !== null &&
+            "statusMessage" in payload &&
+            typeof payload.statusMessage === "string"
+          ) {
+            message = payload.statusMessage;
+          }
+        } catch {
+          if (!body) message = `Account deletion failed (HTTP ${response.status}).`;
+        }
+        throw new Error(message);
+      }
+      clearAccountSessionId();
+      setIsDeleteAccountDialogOpen(false);
+      setDeleteAccountConfirmation("");
+      await client.auth.signOut({ scope: "local" });
+      onNavigate("/");
+    } catch (error) {
+      setErrorMessage(`Could not delete your account: ${getErrorMessage(error)}`);
+    } finally {
+      setIsDeletingAccount(false);
     }
   }
 
@@ -528,6 +1007,7 @@ export function SettingsPage({
     setEditingMemoryId(null);
     setMemoryContent("");
     setMemoryCategory("general");
+    memoryDraftDirtyRef.current = false;
   }
 
   async function saveMemory(event: FormEvent<HTMLFormElement>) {
@@ -642,9 +1122,65 @@ export function SettingsPage({
     <main className="fixed inset-0 flex justify-center bg-[#f5f6f8]">
       <section
         aria-label="Settings"
-        className="relative h-full w-full max-w-4xl overflow-hidden bg-[#f5f6f8] sm:my-5 sm:h-[calc(100%-40px)]"
+        className={`relative flex h-full w-full overflow-hidden bg-transparent lg:flex-row ${
+          activeSection === "home" ? "max-w-[720px]" : ""
+        }`}
       >
-        <header className="absolute inset-x-0 top-0 z-20 flex h-[68px] items-center gap-2 border-0 bg-transparent px-1 shadow-none sm:px-4">
+        <aside
+          className={`${
+            activeSection === "home" ? "hidden" : "hidden lg:flex"
+          } w-[360px] shrink-0 flex-col border-r border-[#e5e6e9] bg-white`}
+        >
+          <header className="flex h-[68px] shrink-0 items-center justify-between px-7">
+            <h1 className="text-lg font-semibold text-[#17181b]">Settings</h1>
+            <nav aria-label="Legal pages" className="flex items-center gap-1">
+              <button
+                type="button"
+                aria-label="Privacy Policy"
+                title="Privacy Policy"
+                onClick={() => openSection("privacy")}
+                className="flex size-9 items-center justify-center rounded-full text-[#34363b] transition hover:bg-[#f1f2f4]"
+              >
+                <ShieldCheck aria-hidden="true" className="size-5" />
+              </button>
+              <button
+                type="button"
+                aria-label="Terms of Service"
+                title="Terms of Service"
+                onClick={() => openSection("terms")}
+                className="flex size-9 items-center justify-center rounded-full text-[#34363b] transition hover:bg-[#f1f2f4]"
+              >
+                <FileText aria-hidden="true" className="size-5" />
+              </button>
+            </nav>
+          </header>
+          <nav aria-label="Settings pages" className="flex-1 space-y-2 overflow-y-auto px-4 pb-6">
+            {settingsNavigationSections.map(({ id, label, description, icon: Icon }) => (
+              <button
+                key={id}
+                type="button"
+                aria-current={activeSection === id ? "page" : undefined}
+                onClick={() => openSection(id)}
+                className={`flex min-h-[76px] w-full items-center gap-3 rounded-2xl border px-3 py-2.5 text-left transition ${
+                  activeSection === id
+                    ? "border-[#cfd1d6] bg-[#f1f2f4] text-[#17181b]"
+                    : "border-[#e1e3e8] bg-white text-[#202126] hover:border-[#cfd1d6] hover:bg-[#f1f2f4]"
+                }`}
+              >
+                <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-[#f1f2f4] text-[#17181b]">
+                  <Icon aria-hidden="true" className="size-5" />
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block text-sm font-semibold text-[#17181b]">{label}</span>
+                  <span className="mt-1 block text-xs leading-5 text-[#777a81]">{description}</span>
+                </span>
+              </button>
+            ))}
+          </nav>
+        </aside>
+
+        <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+        <header className="absolute inset-x-0 top-0 z-20 flex h-[68px] shrink-0 items-center gap-2 border-0 bg-transparent px-1 shadow-none sm:px-4 lg:px-7">
           <button
             type="button"
             aria-label={activeSection === "home" ? "Back to chat" : "Back to settings"}
@@ -670,6 +1206,28 @@ export function SettingsPage({
             >
               <Bug aria-hidden="true" className="size-[21px]" strokeWidth={1.8} />
             </button>
+            <button
+              type="button"
+              aria-label="Privacy Policy"
+              title="Privacy Policy"
+              onClick={() => openSection("privacy")}
+              className={`${
+                activeSection === "home" ? "flex" : "flex lg:hidden"
+              } size-9 items-center justify-center rounded-full text-[#34363b] transition hover:bg-[#f7f8fa]`}
+            >
+              <ShieldCheck aria-hidden="true" className="size-5" />
+            </button>
+            <button
+              type="button"
+              aria-label="Terms of Service"
+              title="Terms of Service"
+              onClick={() => openSection("terms")}
+              className={`${
+                activeSection === "home" ? "flex" : "flex lg:hidden"
+              } size-9 items-center justify-center rounded-full text-[#34363b] transition hover:bg-[#f7f8fa]`}
+            >
+              <FileText aria-hidden="true" className="size-5" />
+            </button>
             {activeSection === "configure" && (
               <button
                 type="button"
@@ -686,36 +1244,41 @@ export function SettingsPage({
 
         <div
           ref={settingsContentRef}
-          className="absolute inset-0 overflow-y-auto overscroll-contain bg-transparent px-5 pb-8 pt-[68px] sm:px-8 sm:pb-10"
+          className={`absolute inset-0 overflow-y-auto overscroll-contain bg-[#f5f6f8] pb-8 pt-[68px] sm:pb-10 ${
+            activeSection === "home"
+              ? "px-3 sm:px-5"
+              : "px-3 sm:px-6 lg:px-6"
+          }`}
         >
           {activeSection === "home" && (
-            <nav aria-label="Settings pages" className="divide-y divide-[#dfe2e7]">
-              {settingsSections.map(({ id, label, description, icon: Icon }) => (
+            <>
+            <nav aria-label="Settings pages" className="flex flex-col gap-3 pt-2">
+              {settingsNavigationSections.map(({ id, label, description, icon: Icon }) => (
                 <button
                   key={id}
                   type="button"
                   onClick={() => openSection(id)}
-                  className="flex w-full items-center gap-4 py-5 text-left transition hover:bg-white/50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#9380dc] sm:py-6"
+                  className="flex min-h-[68px] w-full items-center gap-3 rounded-2xl border border-[#e1e3e8] bg-white px-3 py-2 text-left transition hover:border-[#cfd1d6] hover:bg-[#f1f2f4] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#777a81]"
                 >
-                  <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-white text-[#7754ce]">
+                  <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-[#f1f2f4] text-[#17181b]">
                     <Icon aria-hidden="true" className="size-5" />
                   </span>
                   <span className="min-w-0 flex-1">
-                    <span className="block font-semibold text-[#202126]">{label}</span>
-                    <span className="mt-1 block text-sm leading-5 text-[#777a81]">
+                    <span className="block text-sm font-semibold leading-5 text-[#202126]">{label}</span>
+                    <span className="block text-xs leading-4 text-[#777a81]">
                       {description}
                     </span>
                   </span>
-                  <ChevronRight aria-hidden="true" className="size-5 shrink-0 text-[#96989d]" />
                 </button>
               ))}
             </nav>
+            </>
           )}
 
           {activeSection === "personal" && (
             <section
               aria-labelledby="personal-settings-title"
-              className="py-6 sm:py-8"
+              className="py-2 sm:py-3"
             >
               <div className="mb-4">
                 <h2 id="personal-settings-title" className="font-semibold text-[#202126]">
@@ -760,12 +1323,13 @@ export function SettingsPage({
                     Name
                     <input
                       value={personalization.display_name}
-                      onChange={(event) =>
+                      onChange={(event) => {
+                        personalizationDraftDirtyRef.current = true;
                         setPersonalization((current) => ({
                           ...current,
                           display_name: event.target.value,
-                        }))
-                      }
+                        }));
+                      }}
                       maxLength={80}
                       placeholder="What should CheyaVerse call you?"
                       className="mt-1.5 h-11 w-full rounded-xl border border-[#e1e3e7] bg-white px-3 text-sm text-[#26272c] outline-none focus:border-[#9380dc]"
@@ -775,12 +1339,13 @@ export function SettingsPage({
                     Custom prompt
                     <textarea
                       value={personalization.custom_prompt}
-                      onChange={(event) =>
+                      onChange={(event) => {
+                        personalizationDraftDirtyRef.current = true;
                         setPersonalization((current) => ({
                           ...current,
                           custom_prompt: event.target.value,
-                        }))
-                      }
+                        }));
+                      }}
                       maxLength={4000}
                       rows={5}
                       placeholder="Tell CheyaVerse what to keep in mind when responding."
@@ -791,12 +1356,13 @@ export function SettingsPage({
                     Conversation style
                     <input
                       value={personalization.chat_style}
-                      onChange={(event) =>
+                      onChange={(event) => {
+                        personalizationDraftDirtyRef.current = true;
                         setPersonalization((current) => ({
                           ...current,
                           chat_style: event.target.value,
-                        }))
-                      }
+                        }));
+                      }}
                       maxLength={120}
                       placeholder="For example: friendly, concise, and casual"
                       className="mt-1.5 h-11 w-full rounded-xl border border-[#e1e3e7] bg-white px-3 text-sm text-[#26272c] outline-none focus:border-[#9380dc]"
@@ -810,7 +1376,11 @@ export function SettingsPage({
                   <button
                     type="submit"
                     disabled={
-                      !isDatabaseReady || isLoadingPersonalization || !!personalizationError || isSavingPersonalization
+                      !isDatabaseReady ||
+                      isLoadingPersonalization ||
+                      !!personalizationError ||
+                      isSavingPersonalization ||
+                      isSavingTtsSettings
                     }
                     className="flex h-10 w-full items-center justify-center gap-2 rounded-xl bg-[#26272c] px-4 text-sm font-medium text-white transition hover:bg-[#3a3b41] disabled:opacity-60"
                   >
@@ -822,6 +1392,225 @@ export function SettingsPage({
                 </form>
               )}
             </section>
+          )}
+
+          {activeSection === "account" && (
+            <section aria-labelledby="account-page-title" className="space-y-7 py-2 sm:py-3">
+              <div>
+                <h2 id="account-page-title" className="font-semibold text-[#202126]">
+                  Account
+                </h2>
+                <p className="mt-1 text-sm leading-5 text-[#777a81]">
+                  Review your account, workspace, and active sign-in sessions.
+                </p>
+              </div>
+              {errorMessage && (
+                <div role="alert" className="rounded-2xl bg-red-50 px-3.5 py-3 text-sm text-red-800">
+                  {errorMessage}
+                </div>
+              )}
+              {notice && (
+                <div role="status" className="rounded-2xl bg-emerald-50 px-3.5 py-3 text-sm text-emerald-800">
+                  {notice}
+                </div>
+              )}
+              <div className="divide-y divide-[#eceef1] rounded-2xl border border-[#e2e4e8] bg-white px-4">
+                <div className="flex min-h-16 items-center justify-between gap-4 py-3">
+                  <span className="text-sm text-[#777a81]">Email</span>
+                  <span className="min-w-0 break-all text-right text-sm font-medium text-[#292a30]">
+                    {accountEmail ?? "Not available"}
+                  </span>
+                </div>
+                <div className="flex min-h-16 items-center justify-between gap-4 py-3">
+                  <span className="text-sm text-[#777a81]">Account sync</span>
+                  <span className="flex items-center gap-1.5 text-sm font-medium text-emerald-700">
+                    <Check aria-hidden="true" className="size-4" />
+                    {isDatabaseReady ? "Synced" : "Connecting"}
+                  </span>
+                </div>
+                <div className="flex min-h-16 items-center justify-between gap-4 py-3">
+                  <span className="text-sm text-[#777a81]">Workspace</span>
+                  <span className="text-sm font-medium text-[#292a30]">Personal</span>
+                </div>
+              </div>
+
+              <div>
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-sm font-semibold text-[#292a30]">Active sessions</h3>
+                    <p className="mt-1 text-xs leading-5 text-[#858890]">
+                      Sessions seen in the last two minutes. Location paths exclude query strings.
+                    </p>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-2">
+                    {isLoadingAccountSessions && (
+                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin text-[#777a81]" />
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => void deleteOtherAccountSessions()}
+                      disabled={
+                        !isDatabaseReady ||
+                        isDeletingOtherSessions ||
+                        accountSessions.length === 0
+                      }
+                      className="inline-flex h-9 items-center gap-1.5 rounded-xl border border-[#e1e3e8] bg-white px-3 text-xs font-medium text-[#55575e] transition hover:border-red-200 hover:bg-red-50 hover:text-red-700 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {isDeletingOtherSessions ? (
+                        <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+                      ) : (
+                        <Trash2 aria-hidden="true" className="size-3.5" />
+                      )}
+                      <span className="hidden sm:inline">Remove other sessions</span>
+                      <span className="sm:hidden">Others</span>
+                    </button>
+                  </div>
+                </div>
+                {accountSessionsError ? (
+                  <p role="alert" className="rounded-xl bg-red-50 px-3.5 py-3 text-sm leading-5 text-red-800">
+                    {accountSessionsError}
+                  </p>
+                ) : accountSessions.length === 0 && !isLoadingAccountSessions ? (
+                  <p className="rounded-xl bg-[#f7f8fa] px-3.5 py-3 text-sm text-[#777a81]">
+                    No active sessions were found.
+                  </p>
+                ) : (
+                  <div className="space-y-2">
+                    {accountSessions.map((session) => {
+                      const isCurrent = session.id === currentAccountSessionId;
+                      const device = getAccountSessionDeviceLabel(session.user_agent);
+                      const browser = getAccountSessionBrowserLabel(session.user_agent);
+                      const sessionUrl = `${session.origin}${session.path}`;
+                      return (
+                        <article
+                          key={session.id}
+                          className="rounded-2xl border border-[#e2e4e8] bg-white p-3.5"
+                        >
+                          <div className="flex items-start gap-3">
+                            <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-[#f1f2f4] text-[#17181b]">
+                              <Laptop aria-hidden="true" className="size-4" />
+                            </span>
+                            <div className="min-w-0 flex-1">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <h4 className="text-sm font-medium text-[#292a30]">
+                                  {device} · {browser}
+                                </h4>
+                                {isCurrent && (
+                                  <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700">
+                                    This device
+                                  </span>
+                                )}
+                              </div>
+                              <a
+                                href={sessionUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="mt-1 block break-all text-xs text-[#416e91] hover:underline"
+                              >
+                                {sessionUrl}
+                              </a>
+                              <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] leading-4 text-[#858890]">
+                                <span className="inline-flex items-center gap-1">
+                                  <Clock3 aria-hidden="true" className="size-3" />
+                                  Started {formatAccountDateTime(session.started_at)}
+                                </span>
+                                <span>Last active {formatAccountDateTime(session.last_seen_at)}</span>
+                              </div>
+                              <details className="mt-2">
+                                <summary className="cursor-pointer text-[11px] font-medium text-[#777a81]">
+                                  Device details
+                                </summary>
+                                <p className="mt-1 break-all text-[11px] leading-4 text-[#858890]">
+                                  {session.user_agent || "Browser details unavailable"}
+                                </p>
+                              </details>
+                              <button
+                                type="button"
+                                onClick={() => void deleteAccountSession(session)}
+                                disabled={!isDatabaseReady || deletingSessionIds.includes(session.id)}
+                                className="mt-3 inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-xs font-medium text-[#777a81] transition hover:bg-red-50 hover:text-red-700 disabled:cursor-wait disabled:opacity-50"
+                              >
+                                {deletingSessionIds.includes(session.id) ? (
+                                  <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+                                ) : (
+                                  <Trash2 aria-hidden="true" className="size-3.5" />
+                                )}
+                                Delete session
+                              </button>
+                            </div>
+                          </div>
+                        </article>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {!isDatabaseReady && (
+                <p className="text-xs leading-5 text-[#858890]">
+                  Sign in to manage account settings and active sessions.
+                </p>
+              )}
+              <div className="grid gap-3 border-t border-[#eceef1] pt-5 sm:grid-cols-2">
+                <button
+                  type="button"
+                  onClick={() => void signOut()}
+                  disabled={isSigningOut || !isDatabaseReady}
+                  className="group flex min-h-[76px] items-center gap-3 rounded-2xl border border-[#e1e3e7] bg-white p-4 text-left transition hover:border-[#c9c4dc] hover:bg-[#fcfbff] disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-[#f2f3f5] text-[#565961] group-hover:bg-[#eceaf5] group-hover:text-[#59458e]">
+                    {isSigningOut ? (
+                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                    ) : (
+                      <LogOut aria-hidden="true" className="size-4" />
+                    )}
+                  </span>
+                  <span>
+                    <span className="block text-sm font-semibold text-[#292a30]">Sign out</span>
+                    <span className="mt-1 block text-xs text-[#777a81]">Sign out on this device</span>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDeleteAccountConfirmation("");
+                    setIsDeleteAccountDialogOpen(true);
+                  }}
+                  disabled={!isDatabaseReady || isDeletingAccount}
+                  className="group flex min-h-[76px] items-center gap-3 rounded-2xl border border-red-100 bg-white p-4 text-left transition hover:border-red-200 hover:bg-red-50/70 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-red-50 text-red-700">
+                    <Trash2 aria-hidden="true" className="size-4" />
+                  </span>
+                  <span>
+                    <span className="block text-sm font-semibold text-red-800">Delete account</span>
+                    <span className="mt-1 block text-xs text-red-700/75">Permanently remove your data</span>
+                  </span>
+                </button>
+              </div>
+            </section>
+          )}
+
+          {(activeSection === "privacy" || activeSection === "terms") && (
+            <article className="mx-auto max-w-5xl py-2 sm:py-3">
+              <LegalPageContent kind={activeSection} />
+              <nav aria-label="Legal pages" className="mt-5 flex justify-center gap-4 border-t border-[#e7e8eb] pt-5 text-center text-sm">
+                <button
+                  type="button"
+                  onClick={() => openSection("privacy")}
+                  className="text-[#356d91] hover:underline"
+                >
+                  Privacy Policy
+                </button>
+                <button
+                  type="button"
+                  onClick={() => openSection("terms")}
+                  className="text-[#356d91] hover:underline"
+                >
+                  Terms of Service
+                </button>
+              </nav>
+            </article>
           )}
 
           {activeSection === "configure" && (
@@ -847,21 +1636,16 @@ export function SettingsPage({
 
           <section
             aria-labelledby="ai-settings-title"
-            className="py-6 sm:py-8"
+            className="py-2 sm:py-3"
           >
-            <div className="mb-4 flex items-start gap-3">
-              <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-white text-[#7754ce]">
-                <KeyRound aria-hidden="true" className="size-5" />
-              </div>
-              <div className="min-w-0 flex-1">
-                <h2 id="ai-settings-title" className="font-semibold text-[#202126]">
-                  Gemini APIs
-                </h2>
-                <p className="mt-1 text-sm leading-5 text-[#777a81]">
-                  Gemini API keys are private to your signed-in account and sync across its devices.
-                  Keys are tried one by one, rotating after each successful request.
-                </p>
-              </div>
+            <div className="mb-4">
+              <h2 id="ai-settings-title" className="font-semibold text-[#202126]">
+                Gemini APIs
+              </h2>
+              <p className="mt-1 text-sm leading-5 text-[#777a81]">
+                Gemini API keys are private to your signed-in account and sync across its devices.
+                Keys are tried one by one, rotating after each successful request.
+              </p>
             </div>
 
             {!isDatabaseReady && !databaseSessionError ? (
@@ -1006,54 +1790,231 @@ export function SettingsPage({
           </section>
 
           <section
-            aria-labelledby="account-settings-title"
-            className="py-6 sm:py-8"
+            aria-labelledby="gemini-tts-settings-title"
+            className="border-t border-[#eceef1] py-2 sm:py-3"
           >
             <div className="mb-4">
-              <h2 id="account-settings-title" className="font-semibold text-[#202126]">
-                Account sync
+              <h2 id="gemini-tts-settings-title" className="font-semibold text-[#202126]">
+                Gemini text-to-speech
               </h2>
               <p className="mt-1 text-sm leading-5 text-[#777a81]">
-                Your private settings, Gemini API keys, chats, and memories sync through your account.
+                Add multiple keys; Cheya will try them in order and move to the next key if one
+                fails. Keys are stored separately from chat keys. Speech uses {GEMINI_TTS_MODEL};
+                access, billing, and quota may differ from your chat model. Testing generates a
+                real audio sample and uses TTS quota.
               </p>
             </div>
-            {!isDatabaseReady ? (
-              <p className="rounded-2xl bg-[#f7f8fa] px-3.5 py-3 text-sm leading-5 text-[#686b72]">
-                Preparing your signed-in account…
-              </p>
-            ) : (
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="flex min-w-0 items-center gap-2 rounded-2xl bg-emerald-50 px-3.5 py-3 text-sm text-emerald-800">
-                  <Check aria-hidden="true" className="size-4 shrink-0" />
-                  <span className="min-w-0 truncate">
-                    {accountEmail ?? "Google account connected"}
-                  </span>
-                </div>
+
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <p className="text-xs font-medium text-[#656870]">Gemini TTS API keys</p>
+                {ttsApiKeys.map((apiKey, index) => (
+                  <div key={index} className="flex items-center gap-2">
+                    <span className="flex h-11 min-w-0 flex-1 items-center rounded-xl border border-[#e1e3e7] bg-white px-3 focus-within:border-[#9380dc]">
+                      <input
+                        aria-label={`Gemini TTS API key ${index + 1}`}
+                        type={showTtsApiKey ? "text" : "password"}
+                        value={apiKey}
+                        onChange={(event) => {
+                          ttsDraftDirtyRef.current = true;
+                          setTtsApiKeys((keys) =>
+                            keys.map((key, keyIndex) =>
+                              keyIndex === index ? event.target.value : key,
+                            ),
+                          );
+                        }}
+                        autoComplete="new-password"
+                        spellCheck={false}
+                        placeholder={`Paste Gemini TTS API key ${index + 1}`}
+                        className="min-w-0 flex-1 bg-transparent text-sm text-[#26272c] outline-none placeholder:text-[#a2a3a7]"
+                      />
+                      <button
+                        type="button"
+                        aria-label={showTtsApiKey ? "Hide TTS API keys" : "Show TTS API keys"}
+                        onClick={() => setShowTtsApiKey((visible) => !visible)}
+                        className="ml-2 flex size-8 items-center justify-center rounded-full text-[#777a81] hover:bg-[#f4f5f7]"
+                      >
+                        {showTtsApiKey ? (
+                          <EyeOff aria-hidden="true" className="size-4" />
+                        ) : (
+                          <Eye aria-hidden="true" className="size-4" />
+                        )}
+                      </button>
+                    </span>
+                    <button
+                      type="button"
+                      aria-label={`Remove Gemini TTS API key ${index + 1}`}
+                      onClick={() => {
+                        ttsDraftDirtyRef.current = true;
+                        setTtsApiKeys((keys) => keys.filter((_, keyIndex) => keyIndex !== index));
+                      }}
+                      className="flex size-10 shrink-0 items-center justify-center rounded-full text-[#777a81] transition hover:bg-red-50 hover:text-red-700"
+                    >
+                      <Trash2 aria-hidden="true" className="size-4" />
+                    </button>
+                  </div>
+                ))}
                 <button
                   type="button"
-                  onClick={() => void signOut()}
-                  disabled={isSigningOut}
-                  className="flex h-10 items-center justify-center gap-2 rounded-full border border-[#e1e3e7] px-4 text-sm font-medium text-[#34363b] hover:bg-[#f7f8fa] disabled:opacity-60"
+                  onClick={() => {
+                    ttsDraftDirtyRef.current = true;
+                    setTtsApiKeys((keys) => [...keys, ""]);
+                  }}
+                  className="flex h-9 items-center gap-1.5 rounded-full px-2 text-sm font-medium text-[#565961] transition hover:bg-[#f1f2f4]"
                 >
-                  {isSigningOut ? (
-                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                  ) : null}
-                  Sign out
+                  <Plus aria-hidden="true" className="size-4" />
+                  Add another TTS API key
                 </button>
               </div>
-            )}
-            <p className="mt-3 text-xs leading-5 text-[#858890]">
-              CheyaVerse manages the shared database. Your data is isolated from other accounts;
-              configure only your Gemini API key below.
-            </p>
+
+              <div>
+                <label className="text-xs font-medium text-[#656870]" id="tts-voice-label">
+                  Voice used for all TTS API keys
+                </label>
+                <div ref={ttsVoicePickerRef} className="relative mt-1.5">
+                  <button
+                    type="button"
+                    aria-labelledby="tts-voice-label"
+                    aria-haspopup="listbox"
+                    aria-expanded={isTtsVoiceMenuOpen}
+                    onClick={() => setIsTtsVoiceMenuOpen((open) => !open)}
+                    className="flex min-h-12 w-full items-center justify-between gap-3 rounded-xl border border-[#e1e3e7] bg-white px-3.5 py-2.5 text-left transition hover:border-[#c9c4dc] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a89bdf]"
+                  >
+                    <span className="flex min-w-0 items-center gap-2.5">
+                      <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-[#f3f1fb] text-xs font-semibold text-[#6554a4]">
+                        {ttsVoice.slice(0, 1)}
+                      </span>
+                      <span className="min-w-0">
+                        <span className="block text-sm font-medium text-[#292a30]">
+                          {ttsVoice}
+                        </span>
+                        <span className="block text-xs text-[#858890]">
+                          {GEMINI_TTS_VOICES.find((voice) => voice.id === ttsVoice)?.description}
+                        </span>
+                      </span>
+                    </span>
+                    <ChevronDown
+                      aria-hidden="true"
+                      className={`size-4 shrink-0 text-[#777a81] transition-transform ${
+                        isTtsVoiceMenuOpen ? "rotate-180" : ""
+                      }`}
+                    />
+                  </button>
+                  {isTtsVoiceMenuOpen && (
+                    <div
+                      role="listbox"
+                      aria-labelledby="tts-voice-label"
+                      className="absolute inset-x-0 top-[calc(100%+0.4rem)] z-20 max-h-64 overflow-y-auto rounded-xl border border-[#e6e7eb] bg-white p-1.5 shadow-[0_12px_32px_rgba(30,25,50,0.14)]"
+                    >
+                      {GEMINI_TTS_VOICES.map((voice) => {
+                        const isSelected = ttsVoice === voice.id;
+                        return (
+                          <button
+                            key={voice.id}
+                            type="button"
+                            role="option"
+                            aria-selected={isSelected}
+                            onClick={() => {
+                              ttsDraftDirtyRef.current = true;
+                              setTtsVoice(voice.id);
+                              setIsTtsVoiceMenuOpen(false);
+                            }}
+                            className={`flex min-h-11 w-full items-center justify-between gap-3 rounded-lg px-2.5 py-2 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a89bdf] ${
+                              isSelected ? "bg-[#f5f3fc]" : "hover:bg-[#f7f8fa]"
+                            }`}
+                          >
+                            <span className="flex min-w-0 items-center gap-2.5">
+                              <span className="flex size-7 shrink-0 items-center justify-center rounded-lg bg-white text-[11px] font-semibold text-[#6554a4] shadow-sm ring-1 ring-[#eceaf2]">
+                                {voice.id.slice(0, 1)}
+                              </span>
+                              <span>
+                                <span className="block text-sm font-medium text-[#292a30]">
+                                  {voice.id}
+                                </span>
+                                <span className="block text-xs text-[#858890]">
+                                  {voice.description}
+                                </span>
+                              </span>
+                            </span>
+                            {isSelected && (
+                              <Check aria-hidden="true" className="size-4 shrink-0 text-[#7864c6]" />
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+                <p className="mt-2 text-xs leading-5 text-[#858890]">
+                  This single voice setting applies to every key above, including fallback keys.
+                  Cheya derives the delivery, mood, and intonation from each message.
+                </p>
+              </div>
+
+              {ttsTestMessage && (
+                <p
+                  role={ttsPreviewUrl ? "status" : "alert"}
+                  className={`text-sm leading-5 ${
+                    ttsPreviewUrl ? "text-emerald-700" : "text-red-700"
+                  }`}
+                >
+                  {ttsTestMessage}
+                </p>
+              )}
+              {ttsPreviewUrl && (
+                <audio
+                  ref={ttsPreviewAudioRef}
+                  aria-label="Gemini TTS voice preview"
+                  className="w-full"
+                  controls
+                  src={ttsPreviewUrl}
+                />
+              )}
+
+              <div className="grid gap-2 sm:grid-cols-2">
+                <button
+                  type="button"
+                  onClick={() => void saveTtsSettings()}
+                  disabled={
+                    !isDatabaseReady ||
+                    isLoadingPersonalization ||
+                    !!personalizationError ||
+                      isSavingTtsSettings ||
+                      isSavingPersonalization
+                    }
+                  className="flex h-10 items-center justify-center gap-2 rounded-xl bg-[#26272c] px-4 text-sm font-medium text-white transition hover:bg-[#3a3b41] disabled:opacity-60"
+                >
+                  {isSavingTtsSettings ? (
+                    <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                  ) : (
+                    <Check aria-hidden="true" className="size-4" />
+                  )}
+                  Save TTS settings
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void testGeminiTts()}
+                  disabled={!isDatabaseReady || isTestingTtsApi}
+                  className="flex h-10 items-center justify-center gap-2 rounded-xl border border-[#e1e3e7] bg-white px-4 text-sm font-medium text-[#34363b] transition hover:bg-[#f7f8fa] disabled:opacity-60"
+                >
+                  {isTestingTtsApi ? (
+                    <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                  ) : (
+                    <Play aria-hidden="true" className="size-4" />
+                  )}
+                  {isTestingTtsApi ? "Generating voice sample…" : "Test API & preview voice"}
+                </button>
+              </div>
+            </div>
           </section>
+
             </>
           )}
 
           {activeSection === "memory" && (
             <section
               aria-labelledby="long-term-memory-title"
-              className="py-6 sm:py-8"
+              className="py-2 sm:py-3"
             >
               <div className="mb-4">
                 <h2 id="long-term-memory-title" className="font-semibold text-[#202126]">
@@ -1090,7 +2051,10 @@ export function SettingsPage({
                     Category
                     <input
                       value={memoryCategory}
-                      onChange={(event) => setMemoryCategory(event.target.value)}
+                      onChange={(event) => {
+                        memoryDraftDirtyRef.current = true;
+                        setMemoryCategory(event.target.value);
+                      }}
                       maxLength={80}
                       placeholder="e.g. preferences, goals, projects"
                       className="mt-1.5 h-11 w-full rounded-xl border border-[#e1e3e7] bg-white px-3 text-sm text-[#26272c] outline-none focus:border-[#9380dc]"
@@ -1100,7 +2064,10 @@ export function SettingsPage({
                     What should Cheya remember?
                     <textarea
                       value={memoryContent}
-                      onChange={(event) => setMemoryContent(event.target.value)}
+                      onChange={(event) => {
+                        memoryDraftDirtyRef.current = true;
+                        setMemoryContent(event.target.value);
+                      }}
                       maxLength={10000}
                       rows={3}
                       placeholder="A stable preference, important fact, goal, or ongoing project"
@@ -1171,6 +2138,7 @@ export function SettingsPage({
                         aria-label={`Edit memory: ${memory.content.slice(0, 40)}`}
                         onClick={() => {
                           setEditingMemoryId(memory.id);
+                          memoryDraftDirtyRef.current = false;
                           setMemoryContent(memory.content);
                           setMemoryCategory(memory.category);
                           settingsContentRef.current?.scrollTo({ top: 0, behavior: "smooth" });
@@ -1214,6 +2182,7 @@ export function SettingsPage({
               </div>
             </section>
           )}
+        </div>
         </div>
       </section>
 
@@ -1260,6 +2229,70 @@ export function SettingsPage({
               >
                 {isClearingChats && <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />}
                 Clear chats
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {isDeleteAccountDialogOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !isDeletingAccount) {
+              setIsDeleteAccountDialogOpen(false);
+            }
+          }}
+        >
+          <section
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="delete-account-title"
+            aria-describedby="delete-account-description"
+            className="w-full max-w-md rounded-[26px] border border-[#e2e4e8] bg-white p-5 shadow-2xl"
+          >
+            <h2 id="delete-account-title" className="text-base font-semibold text-[#22242a]">
+              Delete your account permanently?
+            </h2>
+            <p id="delete-account-description" className="mt-2 text-sm leading-6 text-[#64666d]">
+              This permanently deletes your CheyaAPP account, conversations, settings, API keys,
+              memories, and stored files. This cannot be undone. Type <strong>DELETE</strong> to
+              confirm.
+            </p>
+            <input
+              autoFocus
+              value={deleteAccountConfirmation}
+              onChange={(event) => setDeleteAccountConfirmation(event.target.value)}
+              aria-label="Type DELETE to confirm account deletion"
+              autoComplete="off"
+              className="mt-4 h-11 w-full rounded-xl border border-[#e1e3e7] bg-white px-3 text-sm outline-none focus:border-red-500"
+            />
+            {errorMessage && (
+              <p role="alert" className="mt-3 text-sm leading-5 text-red-700">
+                {errorMessage}
+              </p>
+            )}
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={isDeletingAccount}
+                onClick={() => setIsDeleteAccountDialogOpen(false)}
+                className="h-10 rounded-full border border-[#e5e6e9] px-4 text-sm font-medium text-[#34363b] hover:bg-[#f7f8fa] disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isDeletingAccount || deleteAccountConfirmation !== "DELETE"}
+                onClick={() => void deleteAccount()}
+                className="flex h-10 items-center gap-2 rounded-full bg-red-700 px-4 text-sm font-medium text-white hover:bg-red-800 disabled:opacity-50"
+              >
+                {isDeletingAccount ? (
+                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                ) : (
+                  <Trash2 aria-hidden="true" className="size-4" />
+                )}
+                Delete account
               </button>
             </div>
           </section>

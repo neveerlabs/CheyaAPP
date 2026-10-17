@@ -5,6 +5,9 @@ create table if not exists public.user_settings (
   display_name text not null default '',
   custom_prompt text not null default '',
   chat_style text not null default '',
+  tts_api_key text not null default '',
+  tts_api_keys jsonb not null default '[]'::jsonb,
+  tts_voice text not null default 'Kore',
   updated_at timestamptz not null default now()
 );
 
@@ -13,7 +16,14 @@ alter table public.user_settings
   alter column publishable_key set default '',
   add column if not exists display_name text not null default '',
   add column if not exists custom_prompt text not null default '',
-  add column if not exists chat_style text not null default '';
+  add column if not exists chat_style text not null default '',
+  add column if not exists tts_api_key text not null default '',
+  add column if not exists tts_api_keys jsonb not null default '[]'::jsonb,
+  add column if not exists tts_voice text not null default 'Kore';
+
+update public.user_settings
+set tts_api_keys = jsonb_build_array(tts_api_key)
+where tts_api_keys = '[]'::jsonb and length(trim(tts_api_key)) > 0;
 
 update public.user_settings
 set supabase_url = '', publishable_key = ''
@@ -90,6 +100,15 @@ create table if not exists public.chat_messages (
 do $$
 begin
   if not exists (
+    select 1 from pg_constraint
+    where conrelid = 'public.chat_tts_audio_cache'::regclass
+      and conname = 'chat_tts_audio_cache_source_check'
+  ) then
+    alter table public.chat_tts_audio_cache
+      add constraint chat_tts_audio_cache_source_check
+      check (source in ('gemini', 'browser'));
+  end if;
+  if not exists (
     select 1
     from pg_constraint
     where conrelid = 'public.chat_messages'::regclass
@@ -162,6 +181,107 @@ create policy "Users can read their own message versions"
   using (auth.uid() = user_id);
 
 grant select on public.chat_message_versions to authenticated;
+
+create table if not exists public.chat_tts_audio_cache (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null,
+  message_id uuid not null,
+  version_number integer not null check (version_number >= 1),
+  voice text not null check (voice in (
+    'Kore', 'Aoede', 'Leda', 'Callirrhoe', 'Achernar',
+    'Vindemiatrix', 'Sulafat', 'Erinome', 'Laomedeia'
+  )),
+  storage_path text unique,
+  source text not null default 'gemini' check (source in ('gemini', 'browser')),
+  browser_voice_name text,
+  error_details text,
+  created_at timestamptz not null default now(),
+  expires_at timestamptz not null default (now() + interval '24 hours'),
+  unique (user_id, message_id, version_number, voice)
+);
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_constraint
+    where conrelid = 'public.chat_tts_audio_cache'::regclass
+      and conname = 'chat_tts_audio_cache_user_id_fkey'
+  ) then
+    delete from public.chat_tts_audio_cache as cache
+    where not exists (
+      select 1 from auth.users as account where account.id = cache.user_id
+    );
+    alter table public.chat_tts_audio_cache
+      add constraint chat_tts_audio_cache_user_id_fkey
+      foreign key (user_id)
+      references auth.users (id)
+      on delete cascade;
+  end if;
+end;
+$$;
+
+create table if not exists public.account_sessions (
+  id uuid primary key,
+  user_id uuid not null references auth.users (id) on delete cascade,
+  origin text not null,
+  path text not null,
+  user_agent text not null default '',
+  started_at timestamptz not null default now(),
+  last_seen_at timestamptz not null default now()
+);
+
+create index if not exists account_sessions_user_last_seen_idx
+  on public.account_sessions (user_id, last_seen_at desc);
+
+alter table public.account_sessions enable row level security;
+drop policy if exists "Users can read their own account sessions" on public.account_sessions;
+create policy "Users can read their own account sessions"
+  on public.account_sessions for select to authenticated
+  using (auth.uid() = user_id);
+drop policy if exists "Users can register their own account sessions" on public.account_sessions;
+create policy "Users can register their own account sessions"
+  on public.account_sessions for insert to authenticated
+  with check (auth.uid() = user_id);
+drop policy if exists "Users can update their own account sessions" on public.account_sessions;
+create policy "Users can update their own account sessions"
+  on public.account_sessions for update to authenticated
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+drop policy if exists "Users can delete their own account sessions" on public.account_sessions;
+create policy "Users can delete their own account sessions"
+  on public.account_sessions for delete to authenticated
+  using (auth.uid() = user_id);
+grant select, insert, update, delete on public.account_sessions to authenticated;
+
+alter table public.chat_tts_audio_cache
+  alter column storage_path drop not null,
+  add column if not exists source text not null default 'gemini',
+  add column if not exists browser_voice_name text,
+  add column if not exists error_details text;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint
+    where conrelid = 'public.chat_tts_audio_cache'::regclass
+      and conname = 'chat_tts_audio_cache_source_path_check'
+  ) then
+    alter table public.chat_tts_audio_cache
+      add constraint chat_tts_audio_cache_source_path_check
+      check (
+        (source = 'gemini' and storage_path is not null)
+        or (source = 'browser' and storage_path is null)
+      );
+  end if;
+end;
+$$;
+
+create index if not exists chat_tts_audio_cache_expiry_idx
+  on public.chat_tts_audio_cache (expires_at);
+
+alter table public.chat_tts_audio_cache enable row level security;
+revoke all on public.chat_tts_audio_cache from anon, authenticated;
 
 insert into public.chat_message_versions (
   user_id,
@@ -324,6 +444,13 @@ values (
     'text/plain', 'text/csv', 'text/markdown', 'text/html'
   ]
 )
+on conflict (id) do update
+set public = false,
+    file_size_limit = excluded.file_size_limit,
+    allowed_mime_types = excluded.allowed_mime_types;
+
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('chat-tts-cache', 'chat-tts-cache', false, 20971520, array['audio/wav'])
 on conflict (id) do update
 set public = false,
     file_size_limit = excluded.file_size_limit,
@@ -1429,18 +1556,31 @@ begin
   end if;
 
   insert into public.user_settings (
-    user_id, supabase_url, publishable_key, display_name, custom_prompt, chat_style, updated_at
+    user_id, supabase_url, publishable_key, display_name, custom_prompt, chat_style,
+    tts_api_key, tts_api_keys, tts_voice, updated_at
   )
   select
     auth.uid(), '', '',
     coalesce(incoming.display_name, ''), coalesce(incoming.custom_prompt, ''),
-    coalesce(incoming.chat_style, ''), coalesce(incoming.updated_at, now())
+    coalesce(incoming.chat_style, ''), coalesce(incoming.tts_api_key, ''),
+    coalesce(
+      incoming.tts_api_keys,
+      case
+        when length(trim(coalesce(incoming.tts_api_key, ''))) > 0
+          then jsonb_build_array(incoming.tts_api_key)
+        else '[]'::jsonb
+      end
+    ),
+    coalesce(incoming.tts_voice, 'Kore'), coalesce(incoming.updated_at, now())
   from jsonb_to_record(p_data -> 'user_settings') as incoming(
     supabase_url text,
     publishable_key text,
     display_name text,
     custom_prompt text,
     chat_style text,
+    tts_api_key text,
+    tts_api_keys jsonb,
+    tts_voice text,
     updated_at timestamptz
   )
   where jsonb_typeof(p_data -> 'user_settings') = 'object'
@@ -1450,6 +1590,21 @@ begin
         display_name = excluded.display_name,
         custom_prompt = excluded.custom_prompt,
         chat_style = excluded.chat_style,
+        tts_api_key = case
+          when (p_data -> 'user_settings') ? 'tts_api_key' then excluded.tts_api_key
+          else public.user_settings.tts_api_key
+        end,
+        tts_api_keys = case
+          when (p_data -> 'user_settings') ? 'tts_api_keys' then excluded.tts_api_keys
+          when (p_data -> 'user_settings') ? 'tts_api_key'
+            and length(trim(coalesce(excluded.tts_api_key, ''))) > 0
+            then jsonb_build_array(excluded.tts_api_key)
+          else public.user_settings.tts_api_keys
+        end,
+        tts_voice = case
+          when (p_data -> 'user_settings') ? 'tts_voice' then excluded.tts_voice
+          else public.user_settings.tts_voice
+        end,
         updated_at = excluded.updated_at
     where excluded.updated_at > public.user_settings.updated_at;
   get diagnostics inserted_rows = row_count;
@@ -1657,6 +1812,7 @@ begin
       'chat_conversation_branches',
       'chat_message_jobs',
       'chat_message_attachments',
+      'account_sessions',
       'message_feedback',
       'message_insights',
       'user_memories',
