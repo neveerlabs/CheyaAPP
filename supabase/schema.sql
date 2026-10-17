@@ -100,15 +100,6 @@ create table if not exists public.chat_messages (
 do $$
 begin
   if not exists (
-    select 1 from pg_constraint
-    where conrelid = 'public.chat_tts_audio_cache'::regclass
-      and conname = 'chat_tts_audio_cache_source_check'
-  ) then
-    alter table public.chat_tts_audio_cache
-      add constraint chat_tts_audio_cache_source_check
-      check (source in ('gemini', 'browser'));
-  end if;
-  if not exists (
     select 1
     from pg_constraint
     where conrelid = 'public.chat_messages'::regclass
@@ -259,6 +250,21 @@ alter table public.chat_tts_audio_cache
   add column if not exists source text not null default 'gemini',
   add column if not exists browser_voice_name text,
   add column if not exists error_details text;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_constraint
+    where conrelid = 'public.chat_tts_audio_cache'::regclass
+      and conname = 'chat_tts_audio_cache_source_check'
+  ) then
+    alter table public.chat_tts_audio_cache
+      add constraint chat_tts_audio_cache_source_check
+      check (source in ('gemini', 'browser'));
+  end if;
+end;
+$$;
 
 do $$
 begin
