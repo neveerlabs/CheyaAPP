@@ -1184,6 +1184,7 @@ export function App() {
   const [editorError, setEditorError] = useState("");
   const [isEditorLoading, setIsEditorLoading] = useState(false);
   const conversationRef = useRef<HTMLDivElement>(null);
+  const chatFooterObserverRef = useRef<ResizeObserver | null>(null);
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
   const ttsUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   const ttsAudioUrlRef = useRef("");
@@ -1213,6 +1214,31 @@ export function App() {
   const followLatestRef = useRef(true);
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
+  const observeChatFooter = useCallback((footer: HTMLElement | null) => {
+    chatFooterObserverRef.current?.disconnect();
+    chatFooterObserverRef.current = null;
+    if (!footer) {
+      if (conversationRef.current) conversationRef.current.style.paddingBottom = "";
+      return;
+    }
+
+    const updateFooterHeight = () => {
+      const conversation = conversationRef.current;
+      if (!conversation) return;
+      conversation.style.paddingBottom = `${Math.ceil(footer.getBoundingClientRect().height)}px`;
+      if (followLatestRef.current) {
+        requestAnimationFrame(() => {
+          const current = conversationRef.current;
+          if (current) current.scrollTop = current.scrollHeight;
+        });
+      }
+    };
+
+    updateFooterHeight();
+    const observer = new ResizeObserver(updateFooterHeight);
+    observer.observe(footer);
+    chatFooterObserverRef.current = observer;
+  }, []);
   const pendingOptimisticMessageIdsRef = useRef(new Set<string>());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const filesInputRef = useRef<HTMLInputElement>(null);
@@ -5123,7 +5149,7 @@ export function App() {
           aria-label="Conversation"
           aria-live="polite"
           onScroll={handleConversationScroll}
-          className="relative min-h-0 flex-1 overflow-y-auto overscroll-contain bg-[#f5f6f8] px-3 pb-3 pt-[64px] sm:px-[22px]"
+          className="relative min-h-0 flex-1 overflow-y-auto overscroll-contain bg-[#f5f6f8] px-3 pt-[64px] sm:px-[22px]"
         >
           <div className="space-y-3">
             {messages.map((chatMessage) => {
@@ -5496,7 +5522,8 @@ export function App() {
         </div>
 
         <footer
-          className="relative z-20 shrink-0 bg-transparent px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-2.5 sm:px-5"
+          ref={observeChatFooter}
+          className="absolute inset-x-0 bottom-0 z-20 bg-transparent px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-2.5 sm:px-5"
         >
           {showScrollToLatest && pathname === "/" && (
             <button
@@ -5512,7 +5539,7 @@ export function App() {
           )}
           <form
             aria-label="Send message"
-            className="chat-composer rounded-[25px] border border-[#e5e6e9] bg-white p-1 shadow-[0_2px_10px_rgba(20,24,32,0.05)]"
+            className="chat-composer rounded-[25px] border border-[#e5e6e9] bg-white p-1"
             onSubmit={(event) => {
               event.preventDefault();
             }}
