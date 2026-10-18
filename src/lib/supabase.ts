@@ -91,10 +91,8 @@ export type GeminiTtsAudioCache = {
   message_id: string;
   version_number: number;
   voice: GeminiTtsVoice;
-  storage_path: string | null;
-  source: "gemini" | "browser";
-  browser_voice_name: string | null;
-  error_details: string | null;
+  storage_path: string;
+  source: "gemini";
   created_at: string;
   expires_at: string;
 };
@@ -353,14 +351,12 @@ export type Database = {
           message_id: string;
           version_number: number;
           voice: GeminiTtsVoice;
-          storage_path?: string | null;
-          source?: "gemini" | "browser";
-          browser_voice_name?: string | null;
-          error_details?: string | null;
+          storage_path: string;
+          source?: "gemini";
           created_at?: string;
           expires_at?: string;
         };
-        Update: Partial<Pick<GeminiTtsAudioCache, "expires_at" | "source" | "browser_voice_name" | "error_details">>;
+        Update: Partial<Pick<GeminiTtsAudioCache, "expires_at">>;
         Relationships: never[];
       };
       account_sessions: {

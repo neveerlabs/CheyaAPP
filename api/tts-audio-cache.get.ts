@@ -40,11 +40,12 @@ export default defineEventHandler(async (event) => {
   const serviceClient = createServiceRoleClient();
   const { data: cache, error: cacheError } = await serviceClient
     .from("chat_tts_audio_cache")
-    .select("storage_path, source, browser_voice_name, error_details, expires_at")
+    .select("storage_path, expires_at")
     .eq("user_id", user.id)
     .eq("message_id", messageId)
     .eq("version_number", versionNumber)
     .eq("voice", voice)
+    .eq("source", "gemini")
     .maybeSingle();
   if (cacheError) {
     throw createError({
@@ -82,13 +83,6 @@ export default defineEventHandler(async (event) => {
     throw createError({ statusCode: 404, statusMessage: "No unexpired cached speech was found." });
   }
 
-  if (cache.source === "browser") {
-    return {
-      source: "browser",
-      voiceName: cache.browser_voice_name,
-      errors: cache.error_details,
-    };
-  }
   if (!cache.storage_path) {
     throw createError({
       statusCode: 500,

@@ -14,10 +14,24 @@ type SpeechPreparation = {
 };
 
 type CachedSpeech = {
-  audio: Blob | null;
-  browserVoiceName?: string;
-  errors?: string[];
+  audio: Blob;
 };
+
+const inMemorySpeechCache = new Map<string, CachedSpeech>();
+const MAX_IN_MEMORY_SPEECH_CACHE_ENTRIES = 8;
+
+function speechCacheKey(messageId: string, versionNumber: number, voice: GeminiTtsVoice): string {
+  return `${messageId}:${versionNumber}:${voice}`;
+}
+
+function rememberSpeech(key: string, speech: CachedSpeech): void {
+  inMemorySpeechCache.delete(key);
+  inMemorySpeechCache.set(key, speech);
+  if (inMemorySpeechCache.size > MAX_IN_MEMORY_SPEECH_CACHE_ENTRIES) {
+    const oldestKey = inMemorySpeechCache.keys().next().value;
+    if (oldestKey) inMemorySpeechCache.delete(oldestKey);
+  }
+}
 
 function responseErrorMessage(body: string, fallback: string): string {
   try {
@@ -54,23 +68,6 @@ async function getCachedAudio(
   }
 
   const payload: unknown = await response.json();
-  if (typeof payload === "object" && payload !== null && "source" in payload) {
-    if (payload.source === "browser") {
-      const voiceName =
-        "voiceName" in payload && typeof payload.voiceName === "string"
-          ? payload.voiceName
-          : "";
-      if (!voiceName) throw new Error("The saved browser speech fallback is missing its voice name.");
-      return {
-        audio: null,
-        browserVoiceName: voiceName,
-        errors:
-          "errors" in payload && typeof payload.errors === "string"
-            ? payload.errors.split("\n\n").filter(Boolean)
-            : [],
-      };
-    }
-  }
   const signedUrl =
     typeof payload === "object" &&
     payload !== null &&
@@ -147,26 +144,28 @@ export async function prepareAssistantSpeech(
   cacheUrl.searchParams.set("versionNumber", String(versionNumber));
   cacheUrl.searchParams.set("voice", voice);
 
-  if (authorization) {
-    try {
-      const cached = await getCachedAudio(cacheUrl, authorization, signal);
-      if (cached?.browserVoiceName && apiKeys.length === 0) {
-        return {
-          audio: null,
-          voice,
-          browserVoiceName: cached.browserVoiceName,
-          errors: [...errors, ...(cached.errors ?? [])],
-        };
-      }
-      if (cached?.audio) return { audio: cached.audio, voice, errors };
-    } catch (error) {
-      if (signal.aborted) throw error;
-      errors.push(
-        `Saved audio could not be loaded: ${
-          error instanceof Error ? error.message : "Unknown cache read error."
-        }`,
-      );
+  if (!authorization) {
+    errors.push("Sign in is required to check or save generated speech.");
+    return { audio: null, voice, errors };
+  }
+
+  const memoryCached = inMemorySpeechCache.get(speechCacheKey(messageId, versionNumber, voice));
+  if (memoryCached) return { audio: memoryCached.audio, voice, errors };
+
+  try {
+    const cached = await getCachedAudio(cacheUrl, authorization, signal);
+    if (cached) {
+      rememberSpeech(speechCacheKey(messageId, versionNumber, voice), cached);
+      return { audio: cached.audio, voice, errors };
     }
+  } catch (error) {
+    if (signal.aborted) throw error;
+    errors.push(
+      `Saved audio could not be checked, so Gemini was not called: ${
+        error instanceof Error ? error.message : "Unknown cache read error."
+      }`,
+    );
+    return { audio: null, voice, errors };
   }
 
   let audio: Blob | null = null;
@@ -182,20 +181,18 @@ export async function prepareAssistantSpeech(
   }
 
   if (!audio) return { audio: null, voice, errors };
-  if (!authorization) {
-    errors.push("Generated audio cannot be saved without a signed-in account session.");
-    return { audio, voice, errors };
-  }
 
   try {
-    const response = await fetch("/api/tts-audio-cache", {
+    const postUrl = new URL("/api/tts-audio-cache", window.location.origin);
+    postUrl.searchParams.set("id", messageId);
+    postUrl.searchParams.set("versionNumber", String(versionNumber));
+    postUrl.searchParams.set("voice", voice);
+    const response = await fetch(postUrl, {
       method: "POST",
       headers: {
         Authorization: authorization,
         "Content-Type": "audio/wav",
-        "X-Chat-Message-Id": messageId,
-        "X-Chat-Version-Number": String(versionNumber),
-        "X-Gemini-TTS-Voice": voice,
+        "X-Gemini-TTS-Source": "gemini",
       },
       body: audio,
       signal,
@@ -232,75 +229,6 @@ export async function prepareAssistantSpeech(
     );
   }
 
+  rememberSpeech(speechCacheKey(messageId, versionNumber, voice), { audio });
   return { audio, voice, errors };
-}
-
-export async function persistBrowserSpeechFallback(
-  client: AppSupabaseClient | null,
-  messageId: string,
-  versionNumber: number,
-  voice: GeminiTtsVoice,
-  voiceName: string,
-  errors: string[],
-  signal: AbortSignal,
-): Promise<void> {
-  if (!client) throw new Error("Sign in to save this browser voice fallback for reuse.");
-  const { data, error } = await client.auth.getSession();
-  if (error) throw new Error(`Could not read the account session: ${error.message}`);
-  const accessToken = data.session?.access_token;
-  if (!accessToken) throw new Error("Sign in to save this browser voice fallback for reuse.");
-
-  const response = await fetch("/api/tts-audio-cache", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-      "X-Chat-Message-Id": messageId,
-      "X-Chat-Version-Number": String(versionNumber),
-      "X-Gemini-TTS-Voice": voice,
-      "X-Gemini-TTS-Source": "browser",
-    },
-    body: JSON.stringify({ voiceName, errors: errors.join("\n\n").slice(0, 8000) }),
-    signal,
-  });
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(
-      responseErrorMessage(body, `Browser speech cache returned HTTP ${response.status}.`),
-    );
-  }
-  const saved: unknown = await response.json();
-  if (
-    typeof saved !== "object" ||
-    saved === null ||
-    !("cached" in saved) ||
-    saved.cached !== true
-  ) {
-    throw new Error("The database did not confirm that the browser voice fallback was saved.");
-  }
-  const cacheUrl = new URL("/api/tts-audio-cache", window.location.origin);
-  cacheUrl.searchParams.set("messageId", messageId);
-  cacheUrl.searchParams.set("versionNumber", String(versionNumber));
-  cacheUrl.searchParams.set("voice", voice);
-  const verification = await fetch(cacheUrl, {
-    headers: { Authorization: `Bearer ${accessToken}` },
-    signal,
-  });
-  if (!verification.ok) {
-    const body = await verification.text();
-    throw new Error(
-      responseErrorMessage(body, `Browser voice cache verification returned HTTP ${verification.status}.`),
-    );
-  }
-  const verified: unknown = await verification.json();
-  if (
-    typeof verified !== "object" ||
-    verified === null ||
-    !("source" in verified) ||
-    verified.source !== "browser" ||
-    !("voiceName" in verified) ||
-    verified.voiceName !== voiceName
-  ) {
-    throw new Error("The saved browser voice could not be verified in the database.");
-  }
 }

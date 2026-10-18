@@ -1,4 +1,4 @@
-import { createError, defineEventHandler, getHeader, readBody, readRawBody } from "nitro/h3";
+import { createError, defineEventHandler, getHeader, getQuery, readRawBody } from "nitro/h3";
 import { start } from "workflow/api";
 import { createAuthenticatedServerClient, createServiceRoleClient } from "../src/lib/server-supabase";
 import {
@@ -13,7 +13,7 @@ const MAX_TTS_AUDIO_BYTES = 20 * 1024 * 1024;
 function getUuid(value: string | undefined): value is string {
   return (
     typeof value === "string" &&
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{12}$/i.test(value)
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
   );
 }
 
@@ -31,45 +31,28 @@ export default defineEventHandler(async (event) => {
     throw createError({ statusCode: 401, statusMessage: "Your account session is invalid or expired." });
   }
 
-  const messageId = getHeader(event, "x-chat-message-id");
-  const versionNumber = Number(getHeader(event, "x-chat-version-number"));
-  const voice = getHeader(event, "x-gemini-tts-voice");
-  if (
-    !getUuid(messageId) ||
-    !Number.isInteger(versionNumber) ||
-    versionNumber < 1 ||
-    !voice ||
-    !isGeminiTtsVoice(voice)
-  ) {
-    throw createError({ statusCode: 400, statusMessage: "The cached speech reference is invalid." });
+  const query = getQuery(event);
+  const messageId = typeof query.id === "string" ? query.id : undefined;
+  const versionNumber = typeof query.versionNumber === "string"
+    ? Number(query.versionNumber)
+    : Number.NaN;
+  const voice = typeof query.voice === "string" ? query.voice : undefined;
+  if (!getUuid(messageId)) {
+    throw createError({ statusCode: 400, statusMessage: "The cached speech message ID is invalid." });
+  }
+  if (!Number.isInteger(versionNumber) || versionNumber < 1) {
+    throw createError({ statusCode: 400, statusMessage: "The cached speech version number is invalid." });
+  }
+  if (!voice || !isGeminiTtsVoice(voice)) {
+    throw createError({ statusCode: 400, statusMessage: "The cached speech voice is invalid." });
   }
 
-  const source = getHeader(event, "x-gemini-tts-source") === "browser" ? "browser" : "gemini";
-  let browserVoiceName: string | null = null;
-  let fallbackErrors: string | null = null;
-  let audioBytes: Uint8Array | undefined;
-  if (source === "browser") {
-    const fallback = await readBody<{
-      voiceName?: unknown;
-      errors?: unknown;
-    }>(event);
-    if (
-      !fallback ||
-      typeof fallback.voiceName !== "string" ||
-      !fallback.voiceName.trim() ||
-      fallback.voiceName.length > 200 ||
-      (fallback.errors !== undefined &&
-        (typeof fallback.errors !== "string" || fallback.errors.length > 8000))
-    ) {
-      throw createError({ statusCode: 400, statusMessage: "The browser speech fallback is invalid." });
-    }
-    browserVoiceName = fallback.voiceName.trim();
-    fallbackErrors = typeof fallback.errors === "string" ? fallback.errors : null;
-  } else {
-    audioBytes = await readRawBody(event, false);
-    if (!audioBytes?.byteLength || audioBytes.byteLength > MAX_TTS_AUDIO_BYTES) {
-      throw createError({ statusCode: 413, statusMessage: "The generated audio is empty or too large to cache." });
-    }
+  if (getHeader(event, "x-gemini-tts-source") !== "gemini") {
+    throw createError({ statusCode: 400, statusMessage: "Only Gemini TTS audio can be cached." });
+  }
+  const audioBytes = await readRawBody(event, false);
+  if (!audioBytes?.byteLength || audioBytes.byteLength > MAX_TTS_AUDIO_BYTES) {
+    throw createError({ statusCode: 413, statusMessage: "The generated audio is empty or too large to cache." });
   }
 
   const serviceClient = createServiceRoleClient();
@@ -149,7 +132,7 @@ export default defineEventHandler(async (event) => {
 
   const { data: existing, error: existingError } = await serviceClient
     .from("chat_tts_audio_cache")
-    .select("id, storage_path")
+    .select("id, storage_path, expires_at")
     .eq("user_id", user.id)
     .eq("message_id", messageId)
     .eq("version_number", versionNumber)
@@ -163,43 +146,24 @@ export default defineEventHandler(async (event) => {
     });
   }
   if (existing) {
-    if (existing.storage_path) {
-      const { error: storageError } = await serviceClient.storage
-        .from(GEMINI_TTS_CACHE_BUCKET)
-        .remove([existing.storage_path]);
-      if (storageError) {
-        throw createError({
-          statusCode: 502,
-          statusMessage: `Could not replace the existing speech file: ${storageError.message}`,
-        });
-      }
-    }
-    const { error: deleteError } = await serviceClient
-      .from("chat_tts_audio_cache")
-      .delete()
-      .eq("id", existing.id)
-      .eq("user_id", user.id);
-    if (deleteError) {
-      throw createError({
-        statusCode: 500,
-        statusMessage: `Could not replace the existing speech metadata: ${deleteError.message}`,
-      });
-    }
+    return {
+      cached: true,
+      expiresAt: existing.expires_at,
+      cleanupScheduled: true,
+      source: "gemini",
+    };
   }
 
   const cacheId = crypto.randomUUID();
-  const storagePath =
-    source === "gemini" ? `${user.id}/${messageId}/${versionNumber}/${voice}/${cacheId}.wav` : null;
-  if (storagePath && audioBytes) {
-    const { error: uploadError } = await serviceClient.storage
-      .from(GEMINI_TTS_CACHE_BUCKET)
-      .upload(storagePath, audioBytes, { contentType: "audio/wav", upsert: false });
-    if (uploadError) {
-      throw createError({
-        statusCode: 502,
-        statusMessage: `Could not store generated speech: ${uploadError.message}`,
-      });
-    }
+  const storagePath = `${user.id}/${messageId}/${versionNumber}/${voice}/${cacheId}.wav`;
+  const { error: uploadError } = await serviceClient.storage
+    .from(GEMINI_TTS_CACHE_BUCKET)
+    .upload(storagePath, audioBytes, { contentType: "audio/wav", upsert: false });
+  if (uploadError) {
+    throw createError({
+      statusCode: 502,
+      statusMessage: `Could not store generated speech: ${uploadError.message}`,
+    });
   }
 
   const expiresAt = new Date(Date.now() + GEMINI_TTS_CACHE_RETENTION_MS).toISOString();
@@ -210,21 +174,38 @@ export default defineEventHandler(async (event) => {
     version_number: versionNumber,
     voice,
     storage_path: storagePath,
-    source,
-    browser_voice_name: browserVoiceName,
-    error_details: fallbackErrors,
+    source: "gemini",
     expires_at: expiresAt,
   });
   if (insertError) {
-    const { error: cleanupError } = storagePath
-      ? await serviceClient.storage.from(GEMINI_TTS_CACHE_BUCKET).remove([storagePath])
-      : { error: null };
+    const { error: cleanupError } = await serviceClient.storage
+      .from(GEMINI_TTS_CACHE_BUCKET)
+      .remove([storagePath]);
+    const { data: racedCache, error: racedCacheError } = await serviceClient
+      .from("chat_tts_audio_cache")
+      .select("expires_at")
+      .eq("user_id", user.id)
+      .eq("message_id", messageId)
+      .eq("version_number", versionNumber)
+      .eq("voice", voice)
+      .gt("expires_at", new Date().toISOString())
+      .maybeSingle();
+    if (!racedCacheError && racedCache) {
+      return {
+        cached: true,
+        expiresAt: racedCache.expires_at,
+        cleanupScheduled: true,
+        source: "gemini",
+      };
+    }
     throw createError({
       statusCode: 500,
       statusMessage: `Could not save generated speech metadata: ${insertError.message}${
         cleanupError && "message" in cleanupError
           ? ` Storage cleanup also failed: ${cleanupError.message}`
-          : ""
+          : racedCacheError
+            ? ` Could not confirm a concurrent cache write: ${racedCacheError.message}`
+            : ""
       }`,
     });
   }
@@ -236,7 +217,7 @@ export default defineEventHandler(async (event) => {
       `Could not schedule automatic cleanup for TTS cache ${cacheId}; the cache remains available until it expires.`,
       error,
     );
-    return { cached: true, expiresAt, cleanupScheduled: false, source };
+    return { cached: true, expiresAt, cleanupScheduled: false, source: "gemini" };
   }
-  return { cached: true, expiresAt, cleanupScheduled: true, source };
+  return { cached: true, expiresAt, cleanupScheduled: true, source: "gemini" };
 });
