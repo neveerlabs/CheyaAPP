@@ -8,6 +8,11 @@ export default defineConfig({
   plugins: [nitro(), workflow(), react(), tailwindcss()],
   nitro: {
     serverDir: "./",
+    vercel: {
+      functions: {
+        runtime: "nodejs24.x",
+      },
+    },
   },
   server: {
     allowedHosts: [".trycloudflare.com"],

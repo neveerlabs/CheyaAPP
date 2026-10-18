@@ -4,7 +4,7 @@ A mobile-first personal AI chat interface built with React, TypeScript, Vite, an
 
 ## Requirements
 
-- Node.js 20 or newer
+- Node.js 24.x
 - npm
 
 ## Getting started

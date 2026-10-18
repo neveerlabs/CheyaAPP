@@ -168,10 +168,10 @@ function PageLoadingSkeleton({ pathname }: { pathname: string }) {
   }
 
   return (
-    <main className="fixed inset-0 flex justify-center bg-white p-0 sm:p-5">
+    <main className="fixed inset-0 flex justify-center bg-white p-0 sm:px-5 sm:py-0">
       <section
         aria-label="Loading chat"
-        className="relative flex h-full w-full max-w-[580px] flex-col overflow-hidden bg-white sm:rounded-[34px] sm:border sm:border-[#e7e8eb]"
+        className="relative flex h-full w-full flex-col overflow-hidden bg-white"
       >
         <header className="flex h-[64px] shrink-0 items-center justify-between gap-2 px-2 py-1 sm:gap-3 sm:px-5">
           <div className="flex h-12 min-w-0 flex-1 items-center gap-2 rounded-full border border-[#e8e9ec] bg-white py-1 pl-1 pr-2">
@@ -200,7 +200,7 @@ function PageLoadingSkeleton({ pathname }: { pathname: string }) {
           </div>
           <div className="chat-loading-skeleton ml-auto h-10 w-48 rounded-[18px] rounded-br-md" />
         </div>
-        <footer className="shrink-0 px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-2.5 sm:px-5 sm:pb-5">
+        <footer className="shrink-0 px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-2.5 sm:px-5">
           <div className="chat-loading-skeleton h-[88px] rounded-[25px] border border-[#e5e6e9] bg-white p-1" />
         </footer>
       </section>
@@ -4900,11 +4900,11 @@ export function App() {
 
   return (
     <main
-      className="fixed inset-0 flex justify-center bg-[#f5f6f8] p-0 sm:p-5"
+      className="fixed inset-0 flex justify-center bg-[#f5f6f8] p-0 sm:px-5 sm:py-0"
     >
       <section
         aria-label="CheyaVerse chat"
-        className="relative flex h-full w-full flex-col overflow-hidden border-[#e7e8eb] bg-[#f5f6f8] sm:max-w-[580px] sm:rounded-[34px] sm:border"
+        className="relative flex h-full w-full flex-col overflow-hidden bg-[#f5f6f8]"
         onDragEnter={(event) => {
           if (!Array.from(event.dataTransfer.types).includes("Files")) return;
           event.preventDefault();
@@ -5496,7 +5496,7 @@ export function App() {
         </div>
 
         <footer
-          className="relative z-20 shrink-0 bg-transparent px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-2.5 sm:px-5 sm:pb-5"
+          className="relative z-20 shrink-0 bg-transparent px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-2.5 sm:px-5"
         >
           {showScrollToLatest && pathname === "/" && (
             <button
