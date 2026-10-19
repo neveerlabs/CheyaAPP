@@ -652,7 +652,7 @@ const UserMessageAttachmentTile = memo(function UserMessageAttachmentTile({
     return () => {
       cancelled = true;
     };
-  }, [attachment, expired, getPreviewUrl, isMedia]);
+  }, [attachment.id, attachment.mime_type, expired, getPreviewUrl, isMedia]);
 
   return (
     <button
@@ -1144,6 +1144,8 @@ export function App() {
   const [attachmentToast, setAttachmentToast] = useState("");
   const [isDraggingAttachments, setIsDraggingAttachments] = useState(false);
   const [attachedMedia, setAttachedMedia] = useState<PendingChatAttachment[]>([]);
+  const [mediaPreviews, setMediaPreviews] = useState<Map<File, string>>(() => new Map());
+  const mediaPreviewUrlsRef = useRef(new Map<File, string>());
   const barcodeReadsRef = useRef(
     new Map<string, Promise<Omit<AiBarcodeReading, "attachmentId"> | null>>(),
   );
@@ -1210,6 +1212,12 @@ export function App() {
   const messageDraftUserIdRef = useRef<string | null>(null);
   const dragEnterDepthRef = useRef(0);
   const pendingAssistantAnchorRef = useRef<string | null>(null);
+  const directReplyProcessingRef = useRef(false);
+  const hiddenChatMessageIdsRef = useRef(new Set<string>());
+  const attachmentPreviewUrlCacheRef = useRef(
+    new Map<string, { url: string; expiresAt: number }>(),
+  );
+  const attachmentPreviewRequestRef = useRef(new Map<string, Promise<string>>());
   const shouldScrollToLatestRef = useRef(true);
   const followLatestRef = useRef(true);
   const messagesRef = useRef(messages);
@@ -1267,14 +1275,16 @@ export function App() {
     let isActive = true;
     let sessionId: string;
     try {
-      sessionId = getAccountSessionId();
+      sessionId = getAccountSessionId(authenticatedUserId);
     } catch (error) {
       console.error("Could not initialize this account session tracker.", error);
       return;
     }
     let hasRegisteredSession = false;
 
-    const reportSession = async () => {
+    const reportSession = async (
+      isVisible = document.visibilityState === "visible",
+    ) => {
       if (!isActive) return;
       try {
         const { origin, path } = getAccountSessionLocation();
@@ -1288,6 +1298,7 @@ export function App() {
               path,
               user_agent: navigator.userAgent,
               last_seen_at: lastSeenAt,
+              is_active: isVisible,
             },
             { onConflict: "id" },
           );
@@ -1299,14 +1310,20 @@ export function App() {
         // Later heartbeats must not recreate a session removed from Account settings.
         const { data, error } = await authClient
           .from("account_sessions")
-          .update({ origin, path, user_agent: navigator.userAgent, last_seen_at: lastSeenAt })
+          .update({
+            origin,
+            path,
+            user_agent: navigator.userAgent,
+            last_seen_at: lastSeenAt,
+            is_active: isVisible,
+          })
           .eq("id", sessionId)
           .eq("user_id", authenticatedUserId)
           .select("id");
         if (error) throw new Error(error.message);
         if (data.length === 0) {
           isActive = false;
-          clearAccountSessionId();
+          clearAccountSessionId(authenticatedUserId);
           const { error: signOutError } = await authClient.auth.signOut({ scope: "local" });
           if (signOutError) throw new Error(signOutError.message);
         }
@@ -1316,14 +1333,25 @@ export function App() {
     };
 
     void reportSession();
-    const heartbeat = window.setInterval(() => void reportSession(), 30_000);
-    document.addEventListener("visibilitychange", reportSession);
+    const heartbeat = window.setInterval(() => {
+      if (document.visibilityState === "visible") void reportSession();
+    }, 15_000);
+    const handleVisibilityChange = () => void reportSession();
+    const handlePageHide = () => void reportSession(false);
+    const handleWindowFocus = () => {
+      if (document.visibilityState === "visible") void reportSession(true);
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("pagehide", handlePageHide);
+    window.addEventListener("focus", handleWindowFocus);
     return () => {
       isActive = false;
       window.clearInterval(heartbeat);
-      document.removeEventListener("visibilitychange", reportSession);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("pagehide", handlePageHide);
+      window.removeEventListener("focus", handleWindowFocus);
     };
-  }, [authClient, authenticatedUserId]);
+  }, [authClient, authenticatedUserId, pathname]);
 
   function closeTts() {
     ttsTokenRef.current += 1;
@@ -1879,24 +1907,38 @@ export function App() {
       }
     }, 100);
   }
-  const mediaPreviews = useMemo(
-    () =>
-      new Map(
-        attachedMedia
-          .filter(
-            ({ mimeType, isBlocked }) =>
-              !isBlocked &&
-              (mimeType.startsWith("image/") || mimeType.startsWith("video/")),
-          )
-          .map(({ file }) => [file, URL.createObjectURL(file)]),
-      ),
-    [attachedMedia],
+  const previewableAttachments = attachedMedia.filter(
+    ({ mimeType }) => mimeType.startsWith("image/") || mimeType.startsWith("video/"),
   );
+  const mediaPreviewSignature = previewableAttachments
+    .map(({ id, file, mimeType }) =>
+      [id, file.name, file.size, file.lastModified, mimeType].join(":"),
+    )
+    .join("|");
+  useEffect(() => {
+    const activeFiles = new Set(previewableAttachments.map(({ file }) => file));
+    for (const [file, url] of mediaPreviewUrlsRef.current) {
+      if (activeFiles.has(file)) continue;
+      URL.revokeObjectURL(url);
+      mediaPreviewUrlsRef.current.delete(file);
+    }
+    const nextPreviews = new Map<File, string>();
+    for (const file of activeFiles) {
+      let url = mediaPreviewUrlsRef.current.get(file);
+      if (!url) {
+        url = URL.createObjectURL(file);
+        mediaPreviewUrlsRef.current.set(file, url);
+      }
+      nextPreviews.set(file, url);
+    }
+    setMediaPreviews(nextPreviews);
+  }, [mediaPreviewSignature]);
   useEffect(
     () => () => {
-      mediaPreviews.forEach((url) => URL.revokeObjectURL(url));
+      for (const url of mediaPreviewUrlsRef.current.values()) URL.revokeObjectURL(url);
+      mediaPreviewUrlsRef.current.clear();
     },
-    [mediaPreviews],
+    [],
   );
 
   function requestDeleteConfirmation(label: string, preview: string): Promise<boolean> {
@@ -2117,13 +2159,6 @@ export function App() {
     };
   }, [authenticatedUserId]);
 
-  useEffect(
-    () => () => {
-      mediaPreviews.forEach((preview) => URL.revokeObjectURL(preview));
-    },
-    [mediaPreviews],
-  );
-
   useEffect(() => {
     const previousRestoration = window.history.scrollRestoration;
     window.history.scrollRestoration = "manual";
@@ -2140,6 +2175,23 @@ export function App() {
     });
     return () => window.cancelAnimationFrame(frame);
   }, [isSending, thinkingSteps, messages.length]);
+
+  useEffect(() => {
+    if (!isSending || !followLatestRef.current) return;
+    const viewport = window.visualViewport;
+    const scrollToLatest = () => {
+      if (!followLatestRef.current) return;
+      window.requestAnimationFrame(() => scrollConversationToLatest("auto"));
+    };
+    viewport?.addEventListener("resize", scrollToLatest);
+    viewport?.addEventListener("scroll", scrollToLatest);
+    window.addEventListener("resize", scrollToLatest);
+    return () => {
+      viewport?.removeEventListener("resize", scrollToLatest);
+      viewport?.removeEventListener("scroll", scrollToLatest);
+      window.removeEventListener("resize", scrollToLatest);
+    };
+  }, [isSending]);
 
   useEffect(() => {
     if (
@@ -2425,7 +2477,7 @@ export function App() {
             pendingAssistantAnchorRef.current = null;
           }
           setIsSending(
-            Boolean(pendingJob),
+            Boolean(pendingJob) || directReplyProcessingRef.current,
           );
           setRatings(loadedRatings);
           setMessageVersions(loadedVersions);
@@ -2699,10 +2751,12 @@ export function App() {
               pendingOptimisticMessageIdsRef.current.has(message.id) &&
               !persistedIds.has(message.id),
           );
-          return [...serverMessages, ...pendingMessages].sort(
-            (left, right) =>
-              new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime(),
-          );
+          return [...serverMessages, ...pendingMessages]
+            .filter((message) => !hiddenChatMessageIdsRef.current.has(message.id))
+            .sort(
+              (left, right) =>
+                new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime(),
+            );
         });
         setMessageVersions((current) => ({ ...current, ...versions }));
         setSelectedMessageVersions((current) => ({ ...current, ...loadedSelections }));
@@ -2720,7 +2774,7 @@ export function App() {
         setIsSending(
           jobsResult.data.some(
             (job) => job.status === "queued" || job.status === "processing",
-          ),
+          ) || directReplyProcessingRef.current,
         );
         oldestHistoryCursorRef.current = page.messages[0]
           ? {
@@ -2756,32 +2810,54 @@ export function App() {
       }
       jobRefreshTimerRef.current = window.setTimeout(() => {
         jobRefreshTimerRef.current = null;
-        void (async () => {
-          try {
-            const { data, error } = await authClient
-              .from("chat_message_jobs")
-              .select("*")
-              .or("status.in.(queued,processing,failed),error.not.is.null")
-              .order("created_at", { ascending: false })
-              .limit(50);
-            if (!isMounted) return;
-            if (error) {
-              setSendError(`Could not refresh chat job status: ${error.message}`);
-              return;
-            }
-            setChatJobs(data);
-            setIsSending(data.some((job) => job.status === "queued" || job.status === "processing"));
-          } catch (error) {
-            if (!isMounted) return;
-            setSendError(
-              error instanceof Error
-                ? `Could not refresh chat job status: ${error.message}`
-                : "Could not refresh chat job status.",
-            );
-          }
-        })();
+        void refreshJobStatus();
       }, 80);
     };
+    let previousPendingJob = false;
+    let isRefreshingJobStatus = false;
+    const refreshJobStatus = async () => {
+      if (!isMounted || isRefreshingJobStatus) return;
+      isRefreshingJobStatus = true;
+      try {
+        const { data, error } = await authClient
+          .from("chat_message_jobs")
+          .select("*")
+          .or("status.in.(queued,processing,failed),error.not.is.null")
+          .order("created_at", { ascending: false })
+          .limit(50);
+        if (!isMounted) return;
+        if (error) {
+          setSendError(`Could not refresh chat job status: ${error.message}`);
+          return;
+        }
+        const hasPendingJob = data.some(
+          (job) => job.status === "queued" || job.status === "processing",
+        );
+        setChatJobs(data);
+        setIsSending(hasPendingJob || directReplyProcessingRef.current);
+        if (previousPendingJob && !hasPendingJob) void syncChatData();
+        previousPendingJob = hasPendingJob;
+      } catch (error) {
+        if (isMounted) {
+          setSendError(
+            error instanceof Error
+              ? `Could not refresh chat job status: ${error.message}`
+              : "Could not refresh chat job status.",
+          );
+        }
+      } finally {
+        isRefreshingJobStatus = false;
+      }
+    };
+    const refreshOnVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      scheduleJobRefresh();
+      scheduleChatSync();
+    };
+    const jobStatusPoll = window.setInterval(() => void refreshJobStatus(), 5_000);
+    document.addEventListener("visibilitychange", refreshOnVisible);
+    window.addEventListener("pageshow", refreshOnVisible);
+    void refreshJobStatus();
     const stopRealtime = subscribeWithReconnect(
       authClient,
       `account-live-${authUser.id}`,
@@ -2839,6 +2915,9 @@ export function App() {
         window.clearTimeout(jobRefreshTimerRef.current);
         jobRefreshTimerRef.current = null;
       }
+      window.clearInterval(jobStatusPoll);
+      document.removeEventListener("visibilitychange", refreshOnVisible);
+      window.removeEventListener("pageshow", refreshOnVisible);
       stopRealtime();
     };
   }, [authClient, authUser]);
@@ -3079,35 +3158,54 @@ export function App() {
 
   const getAttachmentPreviewUrl = useCallback(
     async (attachment: ChatAttachment): Promise<string> => {
-      const accessToken = await getAccessToken();
-      const response = await fetch("/api/chat-attachment-link", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
+      const cached = attachmentPreviewUrlCacheRef.current.get(attachment.id);
+      if (cached && cached.expiresAt > Date.now()) return cached.url;
+      const pending = attachmentPreviewRequestRef.current.get(attachment.id);
+      if (pending) return pending;
+
+      const request = (async () => {
+        const accessToken = await getAccessToken();
+        const response = await fetch("/api/chat-attachment-link", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
           "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ id: attachment.id }),
-      });
-      const payload: unknown = await response.json().catch(() => null);
-      if (!response.ok) {
-        const message =
-          typeof payload === "object" &&
-          payload !== null &&
-          "statusMessage" in payload &&
-          typeof payload.statusMessage === "string"
-            ? payload.statusMessage
-            : `Could not load attachment preview (${response.status}).`;
-        throw new Error(message);
+          },
+          body: JSON.stringify({ id: attachment.id }),
+        });
+        const payload: unknown = await response.json().catch(() => null);
+        if (!response.ok) {
+          const message =
+            typeof payload === "object" &&
+            payload !== null &&
+            "statusMessage" in payload &&
+            typeof payload.statusMessage === "string"
+              ? payload.statusMessage
+              : `Could not load attachment preview (${response.status}).`;
+          throw new Error(message);
+        }
+        if (
+          typeof payload !== "object" ||
+          payload === null ||
+          !("signedUrl" in payload) ||
+          typeof payload.signedUrl !== "string"
+        ) {
+          throw new Error("The attachment service returned an invalid preview link.");
+        }
+        attachmentPreviewUrlCacheRef.current.set(attachment.id, {
+          url: payload.signedUrl,
+          expiresAt: Date.now() + 55_000,
+        });
+        return payload.signedUrl;
+      })();
+      attachmentPreviewRequestRef.current.set(attachment.id, request);
+      try {
+        return await request;
+      } finally {
+        if (attachmentPreviewRequestRef.current.get(attachment.id) === request) {
+          attachmentPreviewRequestRef.current.delete(attachment.id);
+        }
       }
-      if (
-        typeof payload !== "object" ||
-        payload === null ||
-        !("signedUrl" in payload) ||
-        typeof payload.signedUrl !== "string"
-      ) {
-        throw new Error("The attachment service returned an invalid preview link.");
-      }
-      return payload.signedUrl;
     },
     [authClient],
   );
@@ -3848,6 +3946,9 @@ export function App() {
 
     setSendError("");
     setIsSending(true);
+    directReplyProcessingRef.current = true;
+    followLatestRef.current = true;
+    shouldScrollToLatestRef.current = true;
     const showThinking = thinkingModeRef.current;
     let jobAccepted = false;
     const optimisticId = crypto.randomUUID();
@@ -3918,6 +4019,7 @@ export function App() {
       }
 
       jobAccepted = true;
+      directReplyProcessingRef.current = false;
       pendingOptimisticMessageIdsRef.current.delete(optimisticId);
       submittedAttachments.forEach((attachment) => barcodeReadsRef.current.delete(attachment.id));
       messageDraftRef.current = "";
@@ -3979,7 +4081,10 @@ export function App() {
       setSendError(error instanceof Error ? error.message : "Could not send your message.");
     } finally {
       setThinkingSteps([]);
-      if (!jobAccepted) setIsSending(false);
+      if (!jobAccepted) {
+        directReplyProcessingRef.current = false;
+        setIsSending(false);
+      }
     }
   }
 
@@ -4126,6 +4231,10 @@ export function App() {
     editedSource?: { text: string; versionNumber: number },
   ) {
     if (isSending) return;
+    if (!authUser) {
+      setSendError("Sign in before regenerating a response.");
+      return;
+    }
     const assistantIndex = messages.findIndex((item) => item.id === messageId);
     const sourceIndex = assistantIndex - 1;
     const sourceMessage = sourceIndex >= 0 ? messages[sourceIndex] : undefined;
@@ -4139,13 +4248,27 @@ export function App() {
       return;
     }
     const sourceText = editedSource?.text ?? displayedMessageText(sourceMessage);
-    const previousAnswer = displayedMessageText(messages[assistantIndex]);
-    const previousVersionNumber = displayedVersionNumber(messages[assistantIndex]);
+    const previousAssistant = messages[assistantIndex];
+    const previousAnswer = displayedMessageText(previousAssistant);
+    const previousVersionNumber = displayedVersionNumber(previousAssistant);
 
     setIsSending(true);
+    directReplyProcessingRef.current = true;
+    followLatestRef.current = true;
+    shouldScrollToLatestRef.current = true;
     setSendError("");
+    pendingAssistantAnchorRef.current = sourceMessage.id;
+    setTypingAssistant(null);
+    messages
+      .slice(assistantIndex + 1)
+      .forEach((message) => hiddenChatMessageIdsRef.current.add(message.id));
+    setMessages((current) => {
+      const currentAssistantIndex = current.findIndex((item) => item.id === messageId);
+      return currentAssistantIndex < 0 ? current : current.slice(0, currentAssistantIndex);
+    });
     const showThinking = thinkingModeRef.current;
-    setThinkingSteps(showThinking ? ["Mencari konteks untuk menyusun ulang jawaban…"] : []);
+    setThinkingSteps(["Checking the conversation and relevant context…"]);
+    let responseSaved = false;
     try {
       const [
         {
@@ -4285,6 +4408,7 @@ export function App() {
       const insights =
         insightsContextResult.status === "fulfilled" ? insightsContextResult.value : [];
       const attachmentMessageIds = [...history.map((item) => item.id), sourceMessage.id];
+      setThinkingSteps(["Preparing the message and attachments for Cheya…"]);
       const { data: savedAttachments, error: attachmentsError } = await client
         .from("chat_message_attachments")
         .select("id, file_name, mime_type, storage_path, message_id, created_at, expires_at, deleted_at")
@@ -4339,7 +4463,7 @@ export function App() {
             }),
         )
       ).filter((reading): reading is NonNullable<typeof reading> => reading !== null);
-      if (showThinking) setThinkingSteps(["Meninjau riwayat dan konteks tersimpan…"]);
+      setThinkingSteps(["Preparing Cheya's response…"]);
 
       const result = await generateGeminiConversation(
         keys,
@@ -4394,6 +4518,7 @@ export function App() {
                 typeof input.query === "string"
                   ? input.query
                   : "";
+              if (!query.trim()) throw new Error("The search query was empty.");
               if (!authClient) throw new Error("Sign in before searching the web.");
               return authClient.auth.getSession().then(async ({ data, error }) => {
                 if (error) throw error;
@@ -4422,6 +4547,7 @@ export function App() {
                 if (!payload || typeof payload !== "object") {
                   throw new Error("The web search service returned an invalid result.");
                 }
+                setThinkingSteps(["Reviewing search results…"]);
                 return payload;
               });
             }
@@ -4431,13 +4557,14 @@ export function App() {
               name,
               input,
               requestDeleteConfirmation,
-              undefined,
+              authUser.id,
               sourceMessage.id,
               async (id) => deleteStoredAttachments([id]),
             );
           },
         },
       );
+      setThinkingSteps(["Saving Cheya's response…"]);
       regenerationWarnings.push(
         ...result.toolErrors.map((detail) => `A tool reported an error: ${detail}`),
       );
@@ -4500,6 +4627,8 @@ export function App() {
         !editedSource,
       );
       if (!updatedMessage) throw new Error("This reply could not be found in the database.");
+      responseSaved = true;
+      hiddenChatMessageIdsRef.current.delete(messageId);
 
       try {
         await saveChatBranch(client, updatedMessage.id, updatedMessage.version_number);
@@ -4511,25 +4640,26 @@ export function App() {
         );
       }
 
+      setMessages((current) => {
+        const sourceIndex = current.findIndex((item) => item.id === sourceMessage.id);
+        const retained = sourceIndex >= 0 ? current.slice(0, sourceIndex + 1) : current;
+        return [
+          ...retained,
+          {
+            ...previousAssistant,
+            text: updatedMessage.content,
+            createdAt: updatedMessage.created_at,
+            versionNumber: updatedMessage.version_number,
+            thinkingSummary: updatedMessage.thinking_summary,
+          },
+        ];
+      });
       const updatedVersions = await loadMessageVersions(client, [messageId]);
       setMessageVersions((current) => ({ ...current, ...updatedVersions }));
       setSelectedMessageVersions((current) => ({
         ...current,
         [messageId]: updatedMessage.version_number,
       }));
-      setMessages((current) =>
-        current.map((item) =>
-          item.id === messageId
-            ? {
-                ...item,
-                text: updatedMessage.content,
-                createdAt: updatedMessage.created_at,
-                versionNumber: updatedMessage.version_number,
-                thinkingSummary: updatedMessage.thinking_summary,
-              }
-            : item,
-        ),
-      );
       nextApiIndexRef.current = (result.keyIndex + 1) % keys.length;
       await Promise.all(
         result.attempts.map((attempt) =>
@@ -4547,8 +4677,18 @@ export function App() {
       }
     } catch (error) {
       setSendError(error instanceof Error ? error.message : "Could not regenerate this reply.");
+      pendingAssistantAnchorRef.current = null;
+      if (!responseSaved) {
+        hiddenChatMessageIdsRef.current.delete(messageId);
+        setMessages((current) => {
+          const sourceIndex = current.findIndex((item) => item.id === sourceMessage.id);
+          const retained = sourceIndex >= 0 ? current.slice(0, sourceIndex + 1) : current;
+          return [...retained, previousAssistant];
+        });
+      }
     } finally {
       setThinkingSteps([]);
+      directReplyProcessingRef.current = false;
       setIsSending(false);
     }
   }
@@ -4569,11 +4709,18 @@ export function App() {
     }
 
     setIsSending(true);
+    directReplyProcessingRef.current = true;
+    followLatestRef.current = true;
+    shouldScrollToLatestRef.current = true;
     setSendError("");
+    setThinkingSteps(["Saving the edit and preparing a new reply…"]);
+    messages
+      .slice(messageIndex + 1)
+      .forEach((message) => hiddenChatMessageIdsRef.current.add(message.id));
     try {
       const [
         { createSupabaseClient, ensureSupabaseSession, loadDatabaseConfig },
-        { createEmbedding, loadMessageVersions, saveChatBranch, updateChatMessage },
+        { createEmbedding, loadMessageVersions, updateChatMessage },
       ] = await Promise.all([import("./lib/supabase"), import("./lib/chat-data")]);
       const config = loadDatabaseConfig();
       if (!config) throw new Error("The CheyaVerse account service is not configured.");
@@ -4607,25 +4754,26 @@ export function App() {
         true,
       );
       if (!updatedMessage) throw new Error("The edited message was not found.");
+      setMessages((current) => {
+        const targetIndex = current.findIndex((item) => item.id === userEditTarget);
+        if (targetIndex < 0) return current;
+        return [
+          ...current.slice(0, targetIndex),
+          {
+            ...current[targetIndex],
+            text: updatedMessage.content,
+            createdAt: updatedMessage.created_at,
+            versionNumber: updatedMessage.version_number,
+            thinkingSummary: null,
+          },
+        ];
+      });
       const versions = await loadMessageVersions(client, [userEditTarget]);
       setMessageVersions((current) => ({ ...current, ...versions }));
       setSelectedMessageVersions((current) => ({
         ...current,
         [userEditTarget]: updatedMessage.version_number,
       }));
-      setMessages((current) =>
-        current.map((item) =>
-          item.id === userEditTarget
-            ? {
-                ...item,
-                text: updatedMessage.content,
-                createdAt: updatedMessage.created_at,
-                versionNumber: updatedMessage.version_number,
-                thinkingSummary: null,
-              }
-            : item,
-        ),
-      );
       closeUserMessageEditor();
       userEditTextRef.current = "";
       setActiveUserActions(null);
@@ -4635,20 +4783,11 @@ export function App() {
           text: updatedMessage.content,
           versionNumber: updatedMessage.version_number,
         });
-      } else {
-        try {
-          await saveChatBranch(client, updatedMessage.id, updatedMessage.version_number);
-        } catch (error) {
-          setSendError(
-            error instanceof Error
-              ? error.message
-              : "The edited message was saved, but its conversation branch could not be saved.",
-          );
-        }
       }
     } catch (error) {
       setSendError(error instanceof Error ? error.message : "Could not edit this message.");
     } finally {
+      directReplyProcessingRef.current = false;
       setIsSending(false);
     }
   }
@@ -4924,6 +5063,16 @@ export function App() {
     );
   }
 
+  const pendingAssistantAnchorIndex = messages.findIndex(
+    (message) => message.id === pendingAssistantAnchorRef.current,
+  );
+  const pendingAssistantResponseId =
+    pendingAssistantAnchorIndex >= 0
+      ? messages
+          .slice(pendingAssistantAnchorIndex + 1)
+          .find((message) => message.role === "assistant")?.id
+      : undefined;
+
   return (
     <main
       className="fixed inset-0 flex justify-center bg-[#f5f6f8] p-0 sm:px-5 sm:py-0"
@@ -5161,8 +5310,9 @@ export function App() {
               const visibleText = displayedMessageText(chatMessage);
               const visibleThinkingSummary = displayedThinkingSummary(chatMessage);
               const animateAssistant =
-                typingAssistant?.id === chatMessage.id &&
-                typingAssistant.content === visibleText;
+                (typingAssistant?.id === chatMessage.id &&
+                  typingAssistant.content === visibleText) ||
+                pendingAssistantResponseId === chatMessage.id;
               const ratingKey = `${chatMessage.id}:${versionNumber}`;
               const chatJob = chatJobsByMessageId.get(chatMessage.id);
               const versionLabel =
@@ -5687,6 +5837,9 @@ export function App() {
                   <button
                     type="button"
                     aria-label="Send message"
+                    onPointerDown={(event) => {
+                      if (event.pointerType === "touch") event.preventDefault();
+                    }}
                     onClick={sendMessage}
                     disabled={
                       isSending ||
@@ -5725,6 +5878,9 @@ export function App() {
                     <button
                       type="button"
                       aria-label="Send message"
+                      onPointerDown={(event) => {
+                        if (event.pointerType === "touch") event.preventDefault();
+                      }}
                       onClick={sendMessage}
                       disabled={
                         isSending ||

@@ -1,14 +1,27 @@
 const ACCOUNT_SESSION_STORAGE_KEY = "cheyaverse.account-session-id";
 
-export function getAccountSessionId(): string {
-  const existing = window.sessionStorage.getItem(ACCOUNT_SESSION_STORAGE_KEY);
+function accountSessionStorageKey(userId: string): string {
+  return `${ACCOUNT_SESSION_STORAGE_KEY}.${userId}`;
+}
+
+export function getAccountSessionId(userId: string): string {
+  const storageKey = accountSessionStorageKey(userId);
+  const existing = window.localStorage.getItem(storageKey);
   if (existing && /^[0-9a-f-]{36}$/i.test(existing)) return existing;
+
+  const legacySessionId = window.sessionStorage.getItem(ACCOUNT_SESSION_STORAGE_KEY);
+  if (legacySessionId && /^[0-9a-f-]{36}$/i.test(legacySessionId)) {
+    window.localStorage.setItem(storageKey, legacySessionId);
+    return legacySessionId;
+  }
+
   const id = crypto.randomUUID();
-  window.sessionStorage.setItem(ACCOUNT_SESSION_STORAGE_KEY, id);
+  window.localStorage.setItem(storageKey, id);
   return id;
 }
 
-export function clearAccountSessionId(): void {
+export function clearAccountSessionId(userId: string): void {
+  window.localStorage.removeItem(accountSessionStorageKey(userId));
   window.sessionStorage.removeItem(ACCOUNT_SESSION_STORAGE_KEY);
 }
 

@@ -161,12 +161,103 @@ function getMediaCaptureStream(media: HTMLMediaElement): MediaStream {
   return capture.call(media);
 }
 
+async function reencodeVideoWithWebCodecs(file: File): Promise<Blob> {
+  const {
+    ALL_FORMATS,
+    BlobSource,
+    BufferTarget,
+    Conversion,
+    Input,
+    Mp4OutputFormat,
+    Output,
+    Quality,
+  } = await import("mediabunny");
+  const input = new Input({ source: new BlobSource(file), formats: ALL_FORMATS });
+  try {
+    const videoTrack = await input.getPrimaryVideoTrack();
+    if (!videoTrack) throw new Error("No video track was found.");
+    const duration =
+      (await input.getDurationFromMetadata([videoTrack])) ??
+      (await input.computeDuration([videoTrack]));
+    if (!Number.isFinite(duration) || duration <= 0) {
+      throw new Error("The video duration could not be read.");
+    }
+
+    const audioTrack = await input.getPrimaryAudioTrack();
+    const outputTarget = new BufferTarget();
+    const output = new Output({ format: new Mp4OutputFormat(), target: outputTarget });
+    const totalBitrate = Math.floor((MAX_CHAT_ATTACHMENT_BYTES * 8 * 0.78) / duration);
+    const videoBitrate = Math.max(
+      250_000,
+      Math.min(6_000_000, totalBitrate - (audioTrack ? 96_000 : 0)),
+    );
+    const conversion = await Conversion.init({
+      input,
+      output,
+      tracks: "primary",
+      video: {
+        codec: "avc",
+        quality: new Quality({ bitrate: videoBitrate, bitrateMode: "variable" }),
+        forceTranscode: true,
+        allowTransformationMetadata: false,
+        hardwareAcceleration: "prefer-hardware",
+      },
+      ...(audioTrack
+        ? {
+            audio: {
+              codec: "aac" as const,
+              quality: new Quality({ bitrate: 96_000, bitrateMode: "variable" }),
+              forceTranscode: true,
+            },
+          }
+        : {}),
+      tags: {},
+      showWarnings: false,
+    });
+    const discardedMediaTracks = conversion.discardedTracks.filter(
+      ({ track }) => track.type === "video" || track.type === "audio",
+    );
+    if (!conversion.isValid || discardedMediaTracks.length > 0) {
+      throw new Error("This browser cannot decode and encode all required video tracks.");
+    }
+
+    await conversion.execute();
+    const buffer = outputTarget.buffer;
+    if (!buffer?.byteLength) throw new Error("The video converter returned an empty file.");
+    return new Blob([buffer], { type: "video/mp4" });
+  } finally {
+    input.dispose();
+  }
+}
+
+async function reencodeVideo(file: File, sourceMimeType: string): Promise<Blob> {
+  try {
+    return await reencodeVideoWithWebCodecs(file);
+  } catch (webCodecsError) {
+    try {
+      return await reencodeMedia(file, sourceMimeType);
+    } catch (fallbackError) {
+      const webCodecsMessage =
+        webCodecsError instanceof Error ? webCodecsError.message : "WebCodecs conversion failed.";
+      const fallbackMessage =
+        fallbackError instanceof Error ? fallbackError.message : "Browser fallback failed.";
+      throw new Error(`${webCodecsMessage} The compatibility fallback also failed: ${fallbackMessage}`);
+    }
+  }
+}
+
 async function reencodeMedia(file: File, sourceMimeType: string): Promise<Blob> {
   const isVideo = sourceMimeType.startsWith("video/");
-  const mimeType = isVideo ? "video/mp4" : "audio/mp4";
-  if (typeof MediaRecorder === "undefined" || !MediaRecorder.isTypeSupported(mimeType)) {
+  const supportedTypes = isVideo
+    ? ["video/mp4", "video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"]
+    : ["audio/mp4"];
+  const mimeType =
+    typeof MediaRecorder === "undefined"
+      ? undefined
+      : supportedTypes.find((candidate) => MediaRecorder.isTypeSupported(candidate));
+  if (!mimeType) {
     throw new Error(
-      `This browser cannot create ${mimeType} files, so this media was not uploaded.`,
+      `This browser cannot create a supported ${isVideo ? "video" : "audio"} file, so this media was not uploaded.`,
     );
   }
 
@@ -259,24 +350,42 @@ async function reencodeMedia(file: File, sourceMimeType: string): Promise<Blob> 
     recorder = new MediaRecorder(stream, {
       mimeType,
       ...(isVideo
-        ? { videoBitsPerSecond: 1_200_000, audioBitsPerSecond: 96_000 }
+        ? {
+            videoBitsPerSecond: Math.max(
+              250_000,
+              Math.min(
+                6_000_000,
+                Math.floor((MAX_CHAT_ATTACHMENT_BYTES * 8 * 0.86) / media.duration) - 96_000,
+                Math.max(2_500_000, (file.size * 8 * 0.9) / media.duration),
+              ),
+            ),
+            audioBitsPerSecond: 96_000,
+          }
         : { audioBitsPerSecond: 128_000 }),
     });
 
     const recording = new Promise<Blob>((resolve, reject) => {
       const chunks: Blob[] = [];
       let recordedBytes = 0;
+      let exceededSizeLimit = false;
       recorder!.ondataavailable = (event) => {
         if (event.data.size === 0) return;
         chunks.push(event.data);
         recordedBytes += event.data.size;
-        if (recordedBytes > MAX_CHAT_ATTACHMENT_BYTES && recorder!.state === "recording") {
-          recorder!.stop();
+        if (recordedBytes > MAX_CHAT_ATTACHMENT_BYTES) {
+          exceededSizeLimit = true;
+          if (recorder!.state === "recording") recorder!.stop();
         }
       };
       recorder!.onerror = () =>
         reject(new Error("Media re-encoding failed. No file was uploaded."));
-      recorder!.onstop = () => resolve(new Blob(chunks, { type: mimeType }));
+      recorder!.onstop = () => {
+        if (exceededSizeLimit) {
+          reject(new Error("This media is still too large after compression. No partial media file was uploaded."));
+          return;
+        }
+        resolve(new Blob(chunks, { type: mimeType }));
+      };
       media.onended = () => {
         if (recorder!.state === "recording") recorder!.stop();
       };
@@ -288,7 +397,10 @@ async function reencodeMedia(file: File, sourceMimeType: string): Promise<Blob> 
     });
 
     const blob = await recording;
-    if (blob.size === 0 || !blob.type.toLowerCase().startsWith(mimeType)) {
+    if (
+      blob.size === 0 ||
+      blob.type.toLowerCase().split(";")[0] !== mimeType.toLowerCase().split(";")[0]
+    ) {
       throw new Error("The browser produced an invalid media file. No file was uploaded.");
     }
     return blob;
@@ -333,13 +445,21 @@ export async function preprocessChatAttachment(
             : "webp";
     processedFile = createFile(blob, file, outputMimeType, extension);
   } else if (mimeType.startsWith("video/") || mimeType.startsWith("audio/")) {
-    const blob = await reencodeMedia(file, mimeType);
-    const outputMimeType = mimeType.startsWith("video/") ? "video/mp4" : "audio/mp4";
+    const blob = mimeType.startsWith("video/")
+      ? await reencodeVideo(file, mimeType)
+      : await reencodeMedia(file, mimeType);
+    const outputMimeType = blob.type.toLowerCase().split(";")[0];
+    const extension =
+      outputMimeType === "video/webm"
+        ? "webm"
+        : outputMimeType === "video/mp4"
+          ? "mp4"
+          : "m4a";
     processedFile = createFile(
       blob,
       file,
       outputMimeType,
-      mimeType.startsWith("video/") ? "mp4" : "m4a",
+      extension,
     );
   }
 

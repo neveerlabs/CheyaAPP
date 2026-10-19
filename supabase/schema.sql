@@ -219,8 +219,12 @@ create table if not exists public.account_sessions (
   path text not null,
   user_agent text not null default '',
   started_at timestamptz not null default now(),
-  last_seen_at timestamptz not null default now()
+  last_seen_at timestamptz not null default now(),
+  is_active boolean not null default false
 );
+
+alter table public.account_sessions
+  add column if not exists is_active boolean not null default false;
 
 create index if not exists account_sessions_user_last_seen_idx
   on public.account_sessions (user_id, last_seen_at desc);

@@ -115,8 +115,18 @@ database infrastructure are managed by the operator.
 
 Text chat messages, per-message conversation insights, semantic embeddings, and job status are
 stored in the connected Supabase project and protected by row-level security. A server-side Vercel
-Workflow processes each queued chat job, so refreshing the browser does not cancel generation.
-Supabase Realtime keeps chat and settings data in sync across tabs and signed-in devices. Cheya's
+Workflow processes each queued chat job independently of the browser, so navigating away, refreshing,
+or closing the page does not cancel generation after the job has been accepted. Chat status follows
+Supabase Realtime with a five-second polling fallback and refreshes when the page becomes visible
+again. For local development, keep the local server running until its workflow finishes; stopping
+that server stops its local workflow runtime. Supabase Realtime keeps chat and settings data in sync
+across tabs and signed-in devices. Account settings list all recorded web sessions, mark sessions
+active when their heartbeat is under 90 seconds old, and show a live elapsed time for inactive ones.
+The current browser reuses a persistent account-scoped session ID across page reloads and browser
+restarts, while signed-in accounts in the same browser keep separate session IDs.
+Session presence is marked active only while a web-app tab is visible, refreshed every 15 seconds,
+and marked inactive when the browser reports the tab hidden or page closed.
+Cheya's
 primary role is a personal friend and listening companion; database and web tools are secondary and
 used when useful or requested. Gemini analyzes every incoming message in recent context for tentative,
 non-clinical conversation insight, but routine messages do not create a saved insight. Cheya may
@@ -144,11 +154,12 @@ a copy control.
 New assistant replies render with a fast typewriter effect. On opening the chat, the conversation
 automatically scrolls to its latest message. The **Think** toggle shows progress stages and an
 optional user-facing summary of the context used; it does not expose private internal reasoning.
-Edited user messages and regenerated replies keep their earlier versions. Version navigation is
-available on both user messages and assistant replies and restores the associated full conversation
-branch, including later messages. Branch snapshots are refreshed as the conversation grows so an
-older version does not restore as a short, truncated chat. Run the latest
-`supabase/schema.sql` in the shared project's SQL Editor to enable this for an existing project.
+Submitting from a mobile device keeps the keyboard open and scrolls the active response into view.
+Editing a user message or regenerating an assistant reply hides later messages from the current chat
+view and generates a replacement reply; the messages remain stored. Version navigation is available
+on both user messages and assistant replies and restores the associated full conversation branch,
+including later messages. Branch snapshots are refreshed as the conversation grows so an older
+version does not restore as a short, truncated chat.
 If an older version has no snapshot, the app saves a fallback branch using the currently active
 conversation and that selected version.
 Like/dislike feedback is stored per reply version, and regeneration retrieves chat context and
@@ -189,6 +200,9 @@ never pause a project; monitor Cron execution in Vercel and database status in S
   square previews, other files show an extension tile, and each attachment can be removed before
   sending. Tap an image or video for a full-screen preview, or a text file to edit it before
   committing it back to the attachment.
+- Uploaded videos are metadata-stripped and compressed with WebCodecs when the browser supports
+  it; older or incompatible browsers use the slower media-recording fallback. Output videos that
+  exceed the attachment size limit are rejected instead of being uploaded partially.
 - A browser cannot force Android to open a specific file-manager app; the OS chooses the picker
   based on the user's device configuration.
 - Camera access requires browser permission and a secure context (HTTPS, or localhost).

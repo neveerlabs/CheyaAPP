@@ -17,6 +17,7 @@
     "@zxing/browser": "^0.2.1",
     "@zxing/library": "^0.23.0",
     "lucide-react": "^0.468.0",
+    "mediabunny": "^1.61.6",
     "nitro": "^3.0.260903-beta",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",

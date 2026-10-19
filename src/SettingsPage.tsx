@@ -14,6 +14,7 @@ import {
   LoaderCircle,
   LogOut,
   Pencil,
+  Smartphone,
   Plus,
   Play,
   ShieldCheck,
@@ -90,6 +91,33 @@ function formatAccountDateTime(value: string): string {
       }).format(date);
 }
 
+function formatSessionElapsed(lastSeenAt: string, now: number): string {
+  const lastSeen = Date.parse(lastSeenAt);
+  if (!Number.isFinite(lastSeen)) return "Last activity time unavailable";
+  const elapsedSeconds = Math.max(0, Math.floor((now - lastSeen) / 1_000));
+  if (elapsedSeconds < 60) {
+    return `${elapsedSeconds} second${elapsedSeconds === 1 ? "" : "s"} ago`;
+  }
+  const elapsedMinutes = Math.floor(elapsedSeconds / 60);
+  if (elapsedMinutes < 60) {
+    return `${elapsedMinutes} minute${elapsedMinutes === 1 ? "" : "s"} ago`;
+  }
+  const elapsedHours = Math.floor(elapsedMinutes / 60);
+  if (elapsedHours < 24) {
+    return `${elapsedHours} hour${elapsedHours === 1 ? "" : "s"} ago`;
+  }
+  const elapsedDays = Math.floor(elapsedHours / 24);
+  if (elapsedDays < 7) {
+    return `${elapsedDays} day${elapsedDays === 1 ? "" : "s"} ago`;
+  }
+  const elapsedWeeks = Math.floor(elapsedDays / 7);
+  if (elapsedWeeks < 5) {
+    return `${elapsedWeeks} week${elapsedWeeks === 1 ? "" : "s"} ago`;
+  }
+  const elapsedMonths = Math.floor(elapsedDays / 30);
+  return `${elapsedMonths} month${elapsedMonths === 1 ? "" : "s"} ago`;
+}
+
 type SettingsSection =
   | "home"
   | "personal"
@@ -126,7 +154,7 @@ const settingsSections: Array<{
   {
     id: "account",
     label: "Account",
-    description: "Email, workspace, active sessions, and account controls",
+    description: "Email, workspace, all sessions, and account controls",
     icon: UserRound,
   },
   {
@@ -194,6 +222,7 @@ export function SettingsPage({
   const [isLoadingAccountSessions, setIsLoadingAccountSessions] = useState(false);
   const [accountSessionsError, setAccountSessionsError] = useState("");
   const [currentAccountSessionId, setCurrentAccountSessionId] = useState<string | null>(null);
+  const [sessionClock, setSessionClock] = useState(() => Date.now());
   const [deletingSessionIds, setDeletingSessionIds] = useState<string[]>([]);
   const [isDeletingOtherSessions, setIsDeletingOtherSessions] = useState(false);
   const [isDeleteAccountDialogOpen, setIsDeleteAccountDialogOpen] = useState(false);
@@ -219,6 +248,30 @@ export function SettingsPage({
   const normalizedTtsApiKeys = [
     ...new Set(ttsApiKeys.map((key) => key.trim()).filter(Boolean)),
   ];
+
+  useEffect(() => {
+    if (activeSection !== "account") return;
+    let timer: number;
+    const updateSessionClock = () => {
+      const now = Date.now();
+      setSessionClock(now);
+      timer = window.setTimeout(updateSessionClock, 1_000 - (now % 1_000));
+    };
+    const refreshSessionClock = () => {
+      if (document.visibilityState === "visible") {
+        window.clearTimeout(timer);
+        updateSessionClock();
+      }
+    };
+    updateSessionClock();
+    document.addEventListener("visibilitychange", refreshSessionClock);
+    window.addEventListener("pageshow", refreshSessionClock);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", refreshSessionClock);
+      window.removeEventListener("pageshow", refreshSessionClock);
+    };
+  }, [activeSection]);
 
   useEffect(() => {
     setActiveSection(sectionFromPath(pathname));
@@ -289,37 +342,22 @@ export function SettingsPage({
     setIsLoadingAccountSessions(true);
     setAccountSessionsError("");
     try {
-      sessionId = getAccountSessionId();
+      sessionId = getAccountSessionId(accountUserId);
       setCurrentAccountSessionId(sessionId);
     } catch (error) {
       setAccountSessionsError(getErrorMessage(error));
     }
 
-    let didPurgeStaleSessions = false;
     const loadSessions = async () => {
       try {
-        const cutoff = new Date(Date.now() - 2 * 60_000).toISOString();
-        if (!didPurgeStaleSessions) {
-          const staleCutoff = new Date(Date.now() - 30 * 24 * 60 * 60_000).toISOString();
-          const { error: purgeError } = await client
-            .from("account_sessions")
-            .delete()
-            .lt("last_seen_at", staleCutoff);
-          if (purgeError) {
-            throw new Error(
-              `Could not clean old account session records. Apply the latest supabase/schema.sql. ${purgeError.message}`,
-            );
-          }
-          didPurgeStaleSessions = true;
-        }
         const { data, error } = await client
           .from("account_sessions")
-          .select("id, user_id, origin, path, user_agent, started_at, last_seen_at")
-          .gte("last_seen_at", cutoff)
-          .order("last_seen_at", { ascending: false });
+          .select("id, user_id, origin, path, user_agent, started_at, last_seen_at, is_active")
+          .order("started_at", { ascending: false })
+          .order("id", { ascending: true });
         if (error) {
           throw new Error(
-            `Could not load active sessions. Apply the latest supabase/schema.sql. ${error.message}`,
+            `Could not load account sessions. Apply the latest supabase/schema.sql. ${error.message}`,
           );
         }
         if (isMounted) setAccountSessions(data);
@@ -334,6 +372,44 @@ export function SettingsPage({
     return () => {
       isMounted = false;
     };
+  }, [activeSection, accountUserId, client, isDatabaseReady]);
+
+  useEffect(() => {
+    if (activeSection !== "account" || !client || !isDatabaseReady) return;
+    let isMounted = true;
+    let isRefreshing = false;
+    const refreshAccountSessions = async () => {
+      if (isRefreshing) return;
+      isRefreshing = true;
+      try {
+        const { data, error } = await client
+          .from("account_sessions")
+          .select("id, user_id, origin, path, user_agent, started_at, last_seen_at, is_active")
+          .order("started_at", { ascending: false })
+          .order("id", { ascending: true });
+        if (error) throw error;
+        if (isMounted) {
+          setAccountSessions(data);
+          setAccountSessionsError("");
+        }
+      } catch (error) {
+        if (isMounted) {
+          setAccountSessionsError(`Could not refresh active sessions: ${getErrorMessage(error)}`);
+        }
+      } finally {
+        isRefreshing = false;
+      }
+    };
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === "visible") void refreshAccountSessions();
+    };
+    const timer = window.setInterval(() => void refreshAccountSessions(), 10_000);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    return () => {
+      isMounted = false;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
   }, [activeSection, client, isDatabaseReady]);
 
   useEffect(() => {
@@ -347,14 +423,16 @@ export function SettingsPage({
       "user_settings",
     ] as const;
     const refreshAccountSessions = async () => {
-      const cutoff = new Date(Date.now() - 2 * 60_000).toISOString();
       const { data, error } = await client
         .from("account_sessions")
-        .select("id, user_id, origin, path, user_agent, started_at, last_seen_at")
-        .gte("last_seen_at", cutoff)
-        .order("last_seen_at", { ascending: false });
+        .select("id, user_id, origin, path, user_agent, started_at, last_seen_at, is_active")
+        .order("started_at", { ascending: false })
+        .order("id", { ascending: true });
       if (error) throw error;
-      if (isMounted) setAccountSessions(data);
+      if (isMounted) {
+        setAccountSessions(data);
+        setAccountSessionsError("");
+      }
     };
     const refreshApiKeys = async () => {
       const { data, error } = await client
@@ -749,7 +827,7 @@ export function SettingsPage({
     try {
       let sessionCleanupWarning = "";
       try {
-        const sessionId = getAccountSessionId();
+        const sessionId = getAccountSessionId(accountUserId);
         const { error: sessionError } = await client
           .from("account_sessions")
           .delete()
@@ -762,7 +840,7 @@ export function SettingsPage({
       if (error) {
         setErrorMessage(`Could not sign out: ${error.message}`);
       } else {
-        clearAccountSessionId();
+        clearAccountSessionId(accountUserId);
         if (sessionCleanupWarning) {
           setNotice(`Signed out. This session will disappear from the active list shortly. ${sessionCleanupWarning}`);
         }
@@ -803,7 +881,7 @@ export function SettingsPage({
 
       setAccountSessions((current) => current.filter((item) => item.id !== session.id));
       if (session.id === currentAccountSessionId) {
-        clearAccountSessionId();
+        clearAccountSessionId(accountUserId);
         const { error: signOutError } = await client.auth.signOut({ scope: "local" });
         if (signOutError) throw signOutError;
       } else {
@@ -882,7 +960,7 @@ export function SettingsPage({
         }
         throw new Error(message);
       }
-      clearAccountSessionId();
+      clearAccountSessionId(accountUserId);
       setIsDeleteAccountDialogOpen(false);
       deleteAccountConfirmationValidRef.current = false;
       setIsDeleteAccountConfirmationValid(false);
@@ -1405,7 +1483,7 @@ export function SettingsPage({
                   Account
                 </h2>
                 <p className="mt-1 text-sm leading-5 text-[#777a81]">
-                  Review your account, workspace, and active sign-in sessions.
+                  Review your account, workspace, and all recorded sessions.
                 </p>
               </div>
               {errorMessage && (
@@ -1441,9 +1519,9 @@ export function SettingsPage({
               <div>
                 <div className="mb-3 flex items-center justify-between gap-3">
                   <div>
-                    <h3 className="text-sm font-semibold text-[#292a30]">Active sessions</h3>
+                    <h3 className="text-sm font-semibold text-[#292a30]">Account sessions</h3>
                     <p className="mt-1 text-xs leading-5 text-[#858890]">
-                      Sessions seen in the last two minutes. Location paths exclude query strings.
+                      All recorded sessions. A session is active while its browser tab is visible.
                     </p>
                   </div>
                   <div className="flex shrink-0 items-center gap-2">
@@ -1476,15 +1554,17 @@ export function SettingsPage({
                   </p>
                 ) : accountSessions.length === 0 && !isLoadingAccountSessions ? (
                   <p className="rounded-xl bg-[#f7f8fa] px-3.5 py-3 text-sm text-[#777a81]">
-                    No active sessions were found.
+                    No account sessions were found.
                   </p>
                 ) : (
                   <div className="space-y-2">
                     {accountSessions.map((session) => {
                       const isCurrent = session.id === currentAccountSessionId;
+                      const isActive = isCurrent || session.is_active;
                       const device = getAccountSessionDeviceLabel(session.user_agent);
                       const browser = getAccountSessionBrowserLabel(session.user_agent);
                       const sessionUrl = `${session.origin}${session.path}`;
+                      const DeviceIcon = device === "Mobile" ? Smartphone : Laptop;
                       return (
                         <article
                           key={session.id}
@@ -1492,18 +1572,29 @@ export function SettingsPage({
                         >
                           <div className="flex items-start gap-3">
                             <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-[#f1f2f4] text-[#17181b]">
-                              <Laptop aria-hidden="true" className="size-4" />
+                              <DeviceIcon aria-hidden="true" className="size-4" />
                             </span>
                             <div className="min-w-0 flex-1">
-                              <div className="flex flex-wrap items-center gap-2">
-                                <h4 className="text-sm font-medium text-[#292a30]">
+                              <div className="flex min-w-0 items-center gap-2">
+                                <h4 className="min-w-0 truncate text-sm font-medium text-[#292a30]">
                                   {device} · {browser}
                                 </h4>
-                                {isCurrent && (
-                                  <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700">
-                                    This device
-                                  </span>
-                                )}
+                                <span
+                                  className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium ${
+                                    isActive
+                                      ? "bg-emerald-50 text-emerald-700"
+                                      : "bg-[#f1f2f4] text-[#686b72]"
+                                  }`}
+                                >
+                                  {isCurrent
+                                    ? "This device"
+                                    : isActive
+                                      ? "Active"
+                                      : formatSessionElapsed(
+                                          session.last_seen_at,
+                                          sessionClock,
+                                        )}
+                                </span>
                               </div>
                               <a
                                 href={sessionUrl}
@@ -1518,7 +1609,7 @@ export function SettingsPage({
                                   <Clock3 aria-hidden="true" className="size-3" />
                                   Started {formatAccountDateTime(session.started_at)}
                                 </span>
-                                <span>Last active {formatAccountDateTime(session.last_seen_at)}</span>
+                                <span>Last seen {formatAccountDateTime(session.last_seen_at)}</span>
                               </div>
                               <details className="mt-2">
                                 <summary className="cursor-pointer text-[11px] font-medium text-[#777a81]">
@@ -1555,7 +1646,7 @@ export function SettingsPage({
                   Sign in to manage account settings and active sessions.
                 </p>
               )}
-              <div className="grid gap-3 border-t border-[#eceef1] pt-5 sm:grid-cols-2">
+              <div className="grid gap-3 border-t-2 border-[#d1d3d8] pt-5 sm:grid-cols-2">
                 <button
                   type="button"
                   onClick={() => void signOut()}

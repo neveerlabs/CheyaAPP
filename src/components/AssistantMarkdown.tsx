@@ -269,14 +269,14 @@ export function AssistantMarkdown({
     let index = 0;
     setRenderedContent("");
     const timer = window.setInterval(() => {
-      index = Math.min(index + 8, characters.length);
+      index = Math.min(index + 2, characters.length);
       setRenderedContent(characters.slice(0, index).join(""));
       progressCallback.current?.();
       if (index === characters.length) {
         window.clearInterval(timer);
         completeCallback.current?.();
       }
-    }, 18);
+    }, 30);
 
     return () => window.clearInterval(timer);
   }, [animate, content]);

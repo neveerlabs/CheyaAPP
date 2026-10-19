@@ -105,6 +105,7 @@ export type AccountSession = {
   user_agent: string;
   started_at: string;
   last_seen_at: string;
+  is_active: boolean;
 };
 
 export type StoredChatMessage = {
@@ -369,8 +370,11 @@ export type Database = {
           user_agent?: string;
           started_at?: string;
           last_seen_at?: string;
+          is_active?: boolean;
         };
-        Update: Partial<Pick<AccountSession, "origin" | "path" | "user_agent" | "last_seen_at">>;
+        Update: Partial<
+          Pick<AccountSession, "origin" | "path" | "user_agent" | "last_seen_at" | "is_active">
+        >;
         Relationships: never[];
       };
       message_insights: {
