@@ -47,6 +47,7 @@ import {
   saveApiStatus,
   type ApiStatus,
   type AccountSession,
+  type AccountRole,
   type AppSupabaseClient,
   type GeminiApiKey,
   type GeminiModel,
@@ -62,6 +63,9 @@ interface SettingsPageProps {
   client: AppSupabaseClient;
   accountUserId: string;
   accountEmail: string | null;
+  accountProvider: "google" | "github";
+  githubUsername: string | null;
+  accountRole: AccountRole;
   onGeminiKeyChange: (isConfigured: boolean) => void;
 }
 
@@ -189,6 +193,9 @@ export function SettingsPage({
   client,
   accountUserId,
   accountEmail,
+  accountProvider,
+  githubUsername,
+  accountRole,
   onGeminiKeyChange,
 }: SettingsPageProps) {
   const [activeSection, setActiveSection] = useState(() => sectionFromPath(pathname));
@@ -707,7 +714,7 @@ export function SettingsPage({
     clearMessages();
     setPersonalizationError("");
     if (!isDatabaseReady) {
-      setErrorMessage("Sign in with your Google account before saving Personal settings.");
+      setErrorMessage("Sign in to your account before saving Personal settings.");
       return;
     }
 
@@ -750,7 +757,7 @@ export function SettingsPage({
     clearMessages();
     setTtsTestMessage("");
     if (!isDatabaseReady) {
-      setErrorMessage("Sign in with your Google account before saving Gemini TTS settings.");
+      setErrorMessage("Sign in to your account before saving Gemini TTS settings.");
       return;
     }
     if (isLoadingPersonalization || personalizationError) {
@@ -836,7 +843,7 @@ export function SettingsPage({
       } catch (error) {
         sessionCleanupWarning = getErrorMessage(error);
       }
-      const { error } = await client.auth.signOut();
+      const { error } = await client.auth.signOut({ scope: "local" });
       if (error) {
         setErrorMessage(`Could not sign out: ${error.message}`);
       } else {
@@ -1498,9 +1505,27 @@ export function SettingsPage({
               )}
               <div className="divide-y divide-[#eceef1] rounded-2xl border border-[#e2e4e8] bg-white px-4">
                 <div className="flex min-h-16 items-center justify-between gap-4 py-3">
-                  <span className="text-sm text-[#777a81]">Email</span>
+                  <span className="text-sm text-[#777a81]">
+                    {accountProvider === "github" ? "GitHub username" : "Email"}
+                  </span>
                   <span className="min-w-0 break-all text-right text-sm font-medium text-[#292a30]">
-                    {accountEmail ?? "Not available"}
+                    {accountProvider === "github"
+                      ? githubUsername
+                        ? `@${githubUsername}`
+                        : "Not available"
+                      : accountEmail ?? "Not available"}
+                  </span>
+                </div>
+                <div className="flex min-h-16 items-center justify-between gap-4 py-3">
+                  <span className="text-sm text-[#777a81]">Role</span>
+                  <span
+                    className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
+                      accountRole === "admin"
+                        ? "bg-violet-50 text-violet-700"
+                        : "bg-[#f1f2f4] text-[#55575e]"
+                    }`}
+                  >
+                    {accountRole}
                   </span>
                 </div>
                 <div className="flex min-h-16 items-center justify-between gap-4 py-3">

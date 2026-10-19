@@ -14,6 +14,31 @@ export const GEMINI_MODELS = MULTIMODAL_GEMINI_MODELS;
 
 export type GeminiModel = (typeof GEMINI_MODELS)[number];
 export type ApiStatus = "untested" | "active" | "error";
+export type AccountRole = "admin" | "user";
+export type AccountProvider = "google" | "github";
+
+const AUTH_PROVIDER_INTENT_KEY = "cheyaverse.auth-provider-intent";
+
+export function getPendingAuthProvider(): AccountProvider | null {
+  const provider = window.sessionStorage.getItem(AUTH_PROVIDER_INTENT_KEY);
+  return provider === "google" || provider === "github" ? provider : null;
+}
+
+export function clearPendingAuthProvider(): void {
+  window.sessionStorage.removeItem(AUTH_PROVIDER_INTENT_KEY);
+}
+
+function setPendingAuthProvider(provider: AccountProvider): void {
+  window.sessionStorage.setItem(AUTH_PROVIDER_INTENT_KEY, provider);
+}
+
+export type AccountProfile = {
+  user_id: string;
+  role: AccountRole;
+  provider: string;
+  github_username: string | null;
+  updated_at: string;
+};
 
 export interface DatabaseConfig {
   url: string;
@@ -192,6 +217,12 @@ export type Database = {
           status: ApiStatus;
           last_error: string | null;
         }>;
+        Relationships: never[];
+      };
+      account_profiles: {
+        Row: AccountProfile;
+        Insert: never;
+        Update: never;
         Relationships: never[];
       };
       user_settings: {
@@ -842,7 +873,7 @@ async function importPendingAccountData(client: AppSupabaseClient): Promise<void
       await importAccountSnapshot(client, snapshot);
     } catch (error) {
       throw new Error(
-        `Your Google account is connected, but existing browser data could not be imported. Run the latest supabase/schema.sql and retry. ${
+        `Your account is connected, but existing browser data could not be imported. Run the latest supabase/schema.sql and retry. ${
           error instanceof Error ? error.message : "Unknown database error."
         }`,
       );
@@ -857,31 +888,40 @@ async function importPendingAccountData(client: AppSupabaseClient): Promise<void
   });
 }
 
+async function prepareLegacyAccountDataMigration(): Promise<void> {
+  const legacyConfig = loadLegacyDatabaseConfig();
+  if (!legacyConfig) return;
+
+  const legacyClient = createSupabaseClient(legacyConfig);
+  await ensureAnonymousSession(legacyClient);
+  const exported = await exportAccountData(legacyClient);
+  const previous = await readMigrationSnapshot();
+  await writeMigrationSnapshot(mergeAccountSnapshots(previous, exported));
+}
+
 export async function signInWithGoogle(
   client: AppSupabaseClient,
   googleIdToken: string,
   captchaToken: string,
 ): Promise<void> {
-  const legacyConfig = loadLegacyDatabaseConfig();
-  if (legacyConfig) {
-    const legacyClient = createSupabaseClient(legacyConfig);
-    await ensureAnonymousSession(legacyClient);
-    const exported = await exportAccountData(legacyClient);
-    const previous = await readMigrationSnapshot();
-    await writeMigrationSnapshot(mergeAccountSnapshots(previous, exported));
-  }
+  await prepareLegacyAccountDataMigration();
 
+  setPendingAuthProvider("google");
   const { error } = await client.auth.signInWithIdToken({
     provider: "google",
     token: googleIdToken,
     options: { captchaToken },
   });
-  if (error) throw error;
+  if (error) {
+    clearPendingAuthProvider();
+    throw error;
+  }
 
   try {
     await importPendingAccountData(client);
   } catch (importError) {
     const { error: signOutError } = await client.auth.signOut({ scope: "local" });
+    clearPendingAuthProvider();
     if (signOutError) {
       throw new Error(
         `Existing data could not be imported, and sign-out failed: ${
@@ -890,6 +930,22 @@ export async function signInWithGoogle(
       );
     }
     throw importError;
+  }
+}
+
+export async function signInWithGithub(client: AppSupabaseClient): Promise<void> {
+  await prepareLegacyAccountDataMigration();
+  setPendingAuthProvider("github");
+  const { error } = await client.auth.signInWithOAuth({
+    provider: "github",
+    options: {
+      redirectTo: window.location.origin,
+      scopes: "read:user",
+    },
+  });
+  if (error) {
+    clearPendingAuthProvider();
+    throw error;
   }
 }
 
@@ -935,6 +991,7 @@ export function createSupabaseClient(config: DatabaseConfig): AppSupabaseClient 
       autoRefreshToken: true,
       persistSession: true,
       detectSessionInUrl: true,
+      flowType: "pkce",
     },
   });
   clients.set(cacheKey, client);
@@ -952,7 +1009,7 @@ export function ensureSupabaseSession(client: AppSupabaseClient): Promise<void> 
     } = await client.auth.getSession();
     if (sessionError) throw sessionError;
     if (!session?.user || session.user.is_anonymous) {
-      throw new Error("Sign in with your Google account before using CheyaVerse.");
+      throw new Error("Sign in with your account before using CheyaVerse.");
     }
     await importPendingAccountData(client);
   })();

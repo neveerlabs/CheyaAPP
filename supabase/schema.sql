@@ -1,3 +1,154 @@
+create table if not exists public.account_profiles (
+  user_id uuid primary key references auth.users (id) on delete cascade,
+  role text not null default 'user' check (role in ('admin', 'user')),
+  provider text not null default 'google',
+  github_username text,
+  updated_at timestamptz not null default now()
+);
+
+alter table public.account_profiles enable row level security;
+drop policy if exists "Users can read their own account profile" on public.account_profiles;
+create policy "Users can read their own account profile"
+  on public.account_profiles for select to authenticated
+  using (auth.uid() = user_id);
+revoke all on public.account_profiles from public, anon, authenticated;
+grant select on public.account_profiles to authenticated;
+
+create or replace function public.sync_account_profile(p_user_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  account_provider text;
+  github_username text;
+  account_role text := 'user';
+begin
+  select coalesce(user_row.raw_app_meta_data ->> 'provider', 'google')
+  into account_provider
+  from auth.users as user_row
+  where user_row.id = p_user_id;
+
+  if not found then
+    return;
+  end if;
+
+  select coalesce(
+    identity_row.identity_data ->> 'user_name',
+    identity_row.identity_data ->> 'username',
+    identity_row.identity_data ->> 'preferred_username',
+    identity_row.identity_data ->> 'login'
+  )
+  into github_username
+  from auth.identities as identity_row
+  where identity_row.user_id = p_user_id
+    and identity_row.provider = 'github'
+  order by identity_row.created_at desc
+  limit 1;
+
+  if lower(coalesce(github_username, '')) = 'neveerlabs' then
+    account_role := 'admin';
+  end if;
+
+  insert into public.account_profiles (
+    user_id,
+    role,
+    provider,
+    github_username,
+    updated_at
+  )
+  values (
+    p_user_id,
+    account_role,
+    account_provider,
+    github_username,
+    now()
+  )
+  on conflict (user_id) do update
+  set role = excluded.role,
+      provider = excluded.provider,
+      github_username = excluded.github_username,
+      updated_at = excluded.updated_at;
+end;
+$$;
+
+create or replace function public.handle_auth_user_profile_change()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  perform public.sync_account_profile(new.id);
+  return new;
+end;
+$$;
+
+create or replace function public.handle_auth_identity_profile_change()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if tg_op = 'DELETE' then
+    perform public.sync_account_profile(old.user_id);
+    return old;
+  end if;
+
+  if tg_op = 'UPDATE' and old.user_id <> new.user_id then
+    perform public.sync_account_profile(old.user_id);
+  end if;
+  perform public.sync_account_profile(new.user_id);
+  return new;
+end;
+$$;
+
+revoke all on function public.sync_account_profile(uuid) from public, anon, authenticated;
+revoke all on function public.handle_auth_user_profile_change() from public, anon, authenticated;
+revoke all on function public.handle_auth_identity_profile_change() from public, anon, authenticated;
+
+drop trigger if exists auth_user_sync_account_profile on auth.users;
+create trigger auth_user_sync_account_profile
+  after insert or update of raw_app_meta_data on auth.users
+  for each row execute function public.handle_auth_user_profile_change();
+
+drop trigger if exists auth_identity_sync_account_profile on auth.identities;
+create trigger auth_identity_sync_account_profile
+  after insert or update of user_id, provider, identity_data or delete on auth.identities
+  for each row execute function public.handle_auth_identity_profile_change();
+
+insert into public.account_profiles (user_id, role, provider, github_username)
+select
+  user_row.id,
+  case
+    when lower(coalesce(github_identity.username, '')) = 'neveerlabs'
+      then 'admin'
+    else 'user'
+  end,
+  coalesce(user_row.raw_app_meta_data ->> 'provider', 'google'),
+  github_identity.username
+from auth.users as user_row
+left join lateral (
+  select coalesce(
+    identity_row.identity_data ->> 'user_name',
+    identity_row.identity_data ->> 'username',
+    identity_row.identity_data ->> 'preferred_username',
+    identity_row.identity_data ->> 'login'
+  ) as username
+  from auth.identities as identity_row
+  where identity_row.user_id = user_row.id
+    and identity_row.provider = 'github'
+  order by identity_row.created_at desc
+  limit 1
+) as github_identity on true
+on conflict (user_id) do update
+set role = excluded.role,
+    provider = excluded.provider,
+    github_username = excluded.github_username,
+    updated_at = now();
+
 create table if not exists public.user_settings (
   user_id uuid primary key references auth.users (id) on delete cascade,
   supabase_url text not null default '',

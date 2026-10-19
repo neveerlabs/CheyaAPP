@@ -82,13 +82,13 @@ function PrivacyPolicy() {
     <div>
       <PolicySection title="Information we process">
         <p>
-          When you sign in, Google and Supabase process the account information needed to
+          When you sign in, Google or GitHub and Supabase process the account information needed to
           authenticate you, such as your account identity and email address. CheyaAPP associates
           service data with your Supabase account ID.
         </p>
         <p>
-          Google Sign-In is used for authentication. CheyaAPP does not request access to Gmail,
-          Google Drive, contacts, or other Google content.
+          Google and GitHub sign-in are used for authentication. CheyaAPP does not request access to
+          Gmail, Google Drive, contacts, or other Google content.
         </p>
         <p>
           The service stores content you create or send, including messages, AI replies, message
@@ -116,9 +116,9 @@ function PrivacyPolicy() {
         </p>
         <p>
           CheyaAPP uses Supabase for authentication, database, and file storage; Vercel for
-          application hosting and processing; Google for sign-in and Gemini AI; and Cloudflare
-          Turnstile for sign-in security checks. When web search is used, queries or requested pages
-          may be processed by the third-party search providers used by the service.
+          application hosting and processing; Google and GitHub for sign-in, Google for Gemini AI;
+          and Cloudflare Turnstile for sign-in security checks. When web search is used, queries or
+          requested pages may be processed by the third-party search providers used by the service.
         </p>
         <p>
           Messages, relevant conversation context, and attachments you select may be sent to Google

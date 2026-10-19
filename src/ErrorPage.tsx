@@ -8,6 +8,7 @@ interface ErrorPageProps {
   details?: string;
   onHome?: () => void;
   onRetry?: () => void;
+  showIcon?: boolean;
 }
 
 export function ErrorPage({
@@ -17,6 +18,7 @@ export function ErrorPage({
   details,
   onHome,
   onRetry,
+  showIcon = true,
 }: ErrorPageProps) {
   return (
     <main className="fixed inset-0 flex items-center justify-center overflow-y-auto bg-[radial-gradient(ellipse_at_top_left,_rgba(48,160,235,0.12),_transparent_48%),#f5f6f8] px-5 py-8 text-[#202126]">
@@ -25,14 +27,21 @@ export function ErrorPage({
         className="w-full max-w-lg py-6 sm:py-8"
       >
         <header className="flex items-start gap-4">
-          <div className="flex size-11 shrink-0 items-center justify-center rounded-2xl bg-[#eaf0f6] text-[#596879]">
-            <TriangleAlert aria-hidden="true" className="size-5" />
-          </div>
+          {showIcon && (
+            <div className="flex size-11 shrink-0 items-center justify-center rounded-2xl bg-[#eaf0f6] text-[#596879]">
+              <TriangleAlert aria-hidden="true" className="size-5" />
+            </div>
+          )}
           <div className="min-w-0 pt-0.5">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[#777f8b]">
-              {code}
-            </p>
-            <h1 id="error-page-title" className="mt-1.5 text-2xl font-semibold tracking-tight">
+            {code && (
+              <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[#777f8b]">
+                {code}
+              </p>
+            )}
+            <h1
+              id="error-page-title"
+              className={`${code ? "mt-1.5 " : ""}text-2xl font-semibold tracking-tight`}
+            >
               {title}
             </h1>
             <p className="mt-2 text-sm leading-6 text-[#626873]">{description}</p>

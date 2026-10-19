@@ -109,22 +109,33 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
     error: null,
   });
 
-  const [{ data: keys, error: keysError }, { data: profile, error: profileError }] =
-    await Promise.all([
-      client
-        .from("ai_api_keys")
-        .select("id, model, api_key, status, last_error, created_at")
-        .eq("user_id", job.user_id)
-        .order("created_at", { ascending: true })
-        .order("id", { ascending: true }),
-      client
-        .from("user_settings")
-        .select("display_name, custom_prompt, chat_style")
-        .eq("user_id", job.user_id)
-        .maybeSingle(),
-    ]);
+  const [
+    { data: keys, error: keysError },
+    { data: profile, error: profileError },
+    { data: accountProfile, error: accountProfileError },
+  ] = await Promise.all([
+    client
+      .from("ai_api_keys")
+      .select("id, model, api_key, status, last_error, created_at")
+      .eq("user_id", job.user_id)
+      .order("created_at", { ascending: true })
+      .order("id", { ascending: true }),
+    client
+      .from("user_settings")
+      .select("display_name, custom_prompt, chat_style")
+      .eq("user_id", job.user_id)
+      .maybeSingle(),
+    client
+      .from("account_profiles")
+      .select("role")
+      .eq("user_id", job.user_id)
+      .single(),
+  ]);
   if (keysError) throw new Error(`Could not load Gemini API configuration: ${keysError.message}`);
   if (profileError) throw new Error(`Could not load Personal settings: ${profileError.message}`);
+  if (accountProfileError) {
+    throw new Error(`Could not load account role: ${accountProfileError.message}`);
+  }
   if (keys.length === 0) throw new Error("Add a Gemini API key in Settings before chatting.");
 
   const typedKeys: GeminiApiKey[] = keys;
@@ -348,6 +359,7 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
     0,
     personalization,
     {
+      accountRole: accountProfile.role,
       thinkingMode: job.thinking_mode,
       allowSilence: true,
       currentMessageAt: userMessage.created_at,

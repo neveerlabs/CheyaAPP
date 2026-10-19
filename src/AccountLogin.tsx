@@ -1,8 +1,12 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Turnstile } from "@marsidev/react-turnstile";
-import { CircleAlert, LoaderCircle } from "lucide-react";
+import { CircleAlert, Github, LoaderCircle } from "lucide-react";
 import cheyaLogo from "../assets/circle.png";
-import { signInWithGoogle, type AppSupabaseClient } from "./lib/supabase";
+import {
+  signInWithGithub,
+  signInWithGoogle,
+  type AppSupabaseClient,
+} from "./lib/supabase";
 
 interface GoogleCredentialResponse {
   credential: string;
@@ -198,6 +202,26 @@ export function AccountLogin({ client, error: initialError }: AccountLoginProps)
     }
   }
 
+  async function continueWithGithub() {
+    const verifiedCaptcha = captchaTokenRef.current;
+    if (!client || !verifiedCaptcha || !isCodeVerified || isSigningIn) return;
+    setIsSigningIn(true);
+    setError("");
+    try {
+      await signInWithGithub(client);
+    } catch (signInError) {
+      setError(
+        signInError instanceof Error
+          ? signInError.message
+          : "GitHub sign-in could not be completed.",
+      );
+      captchaTokenRef.current = null;
+      setCaptchaToken(null);
+      setCaptchaRound((round) => round + 1);
+      setIsSigningIn(false);
+    }
+  }
+
   function updateAccessCode(index: number, value: string) {
     const digits = value.replace(/\D/g, "");
     if (!digits) {
@@ -257,10 +281,6 @@ export function AccountLogin({ client, error: initialError }: AccountLoginProps)
           <p role="alert" className="mt-5 rounded-2xl bg-amber-50 px-3.5 py-3 text-sm text-amber-900">
             Human verification is not configured yet. The administrator must add the Turnstile site
             key to the app environment.
-          </p>
-        ) : !googleClientId ? (
-          <p role="alert" className="mt-5 rounded-2xl bg-amber-50 px-3.5 py-3 text-sm text-amber-900">
-            Google sign-in is not configured for this deployment.
           </p>
         ) : (
           <div className="mt-6 flex flex-col items-center gap-4">
@@ -327,8 +347,24 @@ export function AccountLogin({ client, error: initialError }: AccountLoginProps)
               </form>
             )}
             {captchaToken && isCodeVerified && !isSigningIn && (
-              <div aria-label="Sign in with Google" className="min-h-10">
-                <div ref={googleButtonRef} />
+              <div className="flex w-full flex-col items-center gap-3">
+                {googleClientId ? (
+                  <div aria-label="Sign in with Google" className="min-h-10">
+                    <div ref={googleButtonRef} />
+                  </div>
+                ) : (
+                  <p className="text-center text-xs text-[#858890]">
+                    Google sign-in is not configured for this deployment.
+                  </p>
+                )}
+                <button
+                  type="button"
+                  onClick={() => void continueWithGithub()}
+                  className="flex h-10 w-full max-w-[280px] items-center justify-center gap-2 rounded-full border border-[#dfe1e5] bg-white px-4 text-sm font-medium text-[#292a30] transition hover:bg-[#f7f8fa] disabled:cursor-wait disabled:opacity-60"
+                >
+                  <Github aria-hidden="true" className="size-4" />
+                  Continue with GitHub
+                </button>
               </div>
             )}
             {isSigningIn && (
@@ -339,7 +375,7 @@ export function AccountLogin({ client, error: initialError }: AccountLoginProps)
             )}
             {!captchaToken && (
               <p className="text-center text-xs leading-5 text-[#858890]">
-                Complete human verification to enable Google sign-in.
+                Complete human verification to enable sign-in.
               </p>
             )}
           </div>

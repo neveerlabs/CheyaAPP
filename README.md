@@ -26,8 +26,8 @@ Vite prints the local development URL when the server starts.
 
 ## Shared account service setup
 
-CheyaVerse uses one operator-managed Supabase project for Google authentication and application
-data. Users do not create or connect their own Supabase or Google OAuth projects. Row Level
+CheyaVerse uses one operator-managed Supabase project for Google and GitHub authentication and
+application data. Users do not create or connect their own Supabase or OAuth projects. Row Level
 Security isolates each account's chats, Gemini API keys, personalization, memories, feedback, and
 insights.
 
@@ -35,14 +35,19 @@ insights.
 
 1. Run [`supabase/schema.sql`](./supabase/schema.sql) in the shared project's Supabase SQL Editor.
    Rerun the complete script when updating an existing project.
-2. In Supabase **Authentication → Sign In / Providers**, enable Google. Create a Google OAuth web
-   client and configure the Google provider in Supabase with its client ID and secret. In Google
-   Cloud, authorize the app's local and deployed JavaScript origins, and add the Supabase callback
-   URL shown in the provider setup.
-3. In Supabase **Authentication → Bot and Abuse Protection**, enable Cloudflare Turnstile and enter
+2. In Supabase **Authentication → Sign In / Providers**, enable Google and GitHub. Create a Google
+   OAuth web client and configure the Google provider in Supabase with its client ID and secret.
+   Create a GitHub OAuth app and configure its client ID and secret in Supabase. Set the GitHub
+   OAuth app's callback URL to `https://<project-ref>.supabase.co/auth/v1/callback`. In Google
+   Cloud, authorize the app's local and deployed JavaScript origins.
+3. In Supabase **Authentication → URL Configuration**, set the deployed app as the Site URL and add
+   local and deployed app origins to the allowed redirect URLs. GitHub sign-in redirects back to
+   the app origin after Supabase completes OAuth. Browser OAuth uses PKCE, so the final app callback
+   uses a short-lived `?code=` parameter rather than putting session tokens in the URL fragment.
+4. In Supabase **Authentication → Bot and Abuse Protection**, enable Cloudflare Turnstile and enter
    the Turnstile secret key. The Turnstile site key is a frontend value; the secret key stays in
    Supabase.
-4. Add these build-time variables in Vercel Project Settings → Environment Variables for the
+5. Add these build-time variables in Vercel Project Settings → Environment Variables for the
    environments you deploy, then redeploy:
 
    ```env
@@ -60,6 +65,22 @@ insights.
    TAVILY_API_KEY=<tavily-search-api-key>
    BRAVE_SEARCH_API_KEY=<brave-search-api-key>
    ```
+
+The schema creates a protected `account_profiles` row for every existing and new auth user.
+Accounts without a linked GitHub identity named `neveerlabs` receive the `user` role; an account
+with that GitHub identity receives `admin`, including when the account was originally created with
+Google. Chat, insights, memories, and other account data remain linked to that profile through
+their existing `user_id`; no existing content is rewritten. The AI receives this role as account
+context when generating a reply.
+GitHub OAuth requests only the `read:user` scope. CheyaAPP uses the Google email for Google sign-in
+and the GitHub profile username for GitHub sign-in. Supabase automatically links OAuth identities
+that return the same verified email, and this cannot be disabled in the app. Linked identities
+share one Supabase user and therefore the same app data. To keep a GitHub account separate from a
+Google account with the same email, make the GitHub account's public email private and revoke
+CheyaAPP from GitHub **Settings → Applications → Authorized OAuth Apps** so the old `user:email`
+grant is removed. If Supabase has already linked the identities, the project administrator must
+unlink the GitHub identity from that Supabase user before either account can be used separately.
+Do not delete the Supabase user, since its existing chat and account data are attached to it.
 
    Use the same Supabase project and Google client ID across local development and deployments.
    These `VITE_*` values are included in the browser bundle and must be public values. Never expose

@@ -87,7 +87,15 @@ import { subscribeWithReconnect } from "./lib/realtime";
 import {
   prepareAssistantSpeech,
 } from "./lib/tts-playback";
-import type { AppSupabaseClient, ChatMessageJob, ChatMessageVersion } from "./lib/supabase";
+import {
+  clearPendingAuthProvider,
+  getPendingAuthProvider,
+  type AccountProvider,
+  type AccountRole,
+  type AppSupabaseClient,
+  type ChatMessageJob,
+  type ChatMessageVersion,
+} from "./lib/supabase";
 import type { ChatAttachment } from "./lib/chat-attachments";
 
 let assistantMarkdownModulePromise: Promise<typeof import("./components/AssistantMarkdown")> | null =
@@ -103,6 +111,24 @@ const SettingsPage = lazy(() =>
 const AssistantMarkdown = lazy(() =>
   loadAssistantMarkdown().then((module) => ({ default: module.AssistantMarkdown })),
 );
+
+function consumeOAuthCallbackError(): string | null {
+  const url = new URL(window.location.href);
+  const callbackParams = new URLSearchParams(url.hash.slice(1));
+  const error =
+    url.searchParams.get("error_description") ??
+    url.searchParams.get("error") ??
+    callbackParams.get("error_description") ??
+    callbackParams.get("error");
+  if (!error) return null;
+
+  url.searchParams.delete("error");
+  url.searchParams.delete("error_description");
+  url.searchParams.delete("error_code");
+  url.hash = "";
+  window.history.replaceState(window.history.state, "", url);
+  return `GitHub sign-in could not be completed: ${error}`;
+}
 
 function PageLoadingSkeleton({ pathname }: { pathname: string }) {
   const isSettings = pathname.startsWith("/settings");
@@ -168,12 +194,12 @@ function PageLoadingSkeleton({ pathname }: { pathname: string }) {
   }
 
   return (
-    <main className="fixed inset-0 flex justify-center bg-white p-0 sm:px-5 sm:py-0">
+    <main className="fixed inset-0 flex justify-center bg-white p-0">
       <section
         aria-label="Loading chat"
-        className="relative flex h-full w-full flex-col overflow-hidden bg-white"
+        className="relative flex h-full w-full max-w-[480px] flex-col overflow-hidden bg-white"
       >
-        <header className="flex h-[64px] shrink-0 items-center justify-between gap-2 px-2 py-1 sm:gap-3 sm:px-5">
+        <header className="flex h-[64px] shrink-0 items-center justify-between gap-2 px-2 py-1">
           <div className="flex h-12 min-w-0 flex-1 items-center gap-2 rounded-full border border-[#e8e9ec] bg-white py-1 pl-1 pr-2">
             <div className="size-10 rounded-full bg-[#eef0f3]" />
             <div className="space-y-2">
@@ -190,7 +216,7 @@ function PageLoadingSkeleton({ pathname }: { pathname: string }) {
             </div>
           </div>
         </header>
-        <div className="flex min-h-0 flex-1 flex-col justify-end gap-5 px-4 pb-3 pt-2 sm:px-6">
+        <div className="flex min-h-0 flex-1 flex-col justify-end gap-5 px-4 pb-3 pt-2">
           <div className="chat-loading-skeleton ml-auto h-10 w-36 rounded-[18px] rounded-br-md" />
           <div className="space-y-3">
             <div className="chat-loading-skeleton h-3 w-28 rounded-full" />
@@ -200,7 +226,7 @@ function PageLoadingSkeleton({ pathname }: { pathname: string }) {
           </div>
           <div className="chat-loading-skeleton ml-auto h-10 w-48 rounded-[18px] rounded-br-md" />
         </div>
-        <footer className="shrink-0 px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-2.5 sm:px-5">
+        <footer className="shrink-0 px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-2.5">
           <div className="chat-loading-skeleton h-[88px] rounded-[25px] border border-[#e5e6e9] bg-white p-1" />
         </footer>
       </section>
@@ -1106,7 +1132,13 @@ export function App() {
   const [pathname, setPathname] = useState(window.location.pathname);
   const [isLoginOpen, setIsLoginOpen] = useState(false);
   const [authClient, setAuthClient] = useState<AppSupabaseClient | null>(null);
-  const [authUser, setAuthUser] = useState<{ id: string; email: string | null } | null>(null);
+  const [authUser, setAuthUser] = useState<{
+    id: string;
+    email: string | null;
+    provider: AccountProvider;
+    githubUsername: string | null;
+    role: AccountRole;
+  } | null>(null);
   const [isAuthLoading, setIsAuthLoading] = useState(true);
   const [authError, setAuthError] = useState("");
   const [historyLoadError, setHistoryLoadError] = useState("");
@@ -2272,6 +2304,8 @@ export function App() {
   useEffect(() => {
     let isMounted = true;
     let unsubscribe: (() => void) | null = null;
+    const oauthCallbackError = consumeOAuthCallbackError();
+    if (oauthCallbackError) setAuthError(oauthCallbackError);
     void (async () => {
       let client: AppSupabaseClient;
       try {
@@ -2307,11 +2341,55 @@ export function App() {
 
       setIsAuthLoading(true);
       try {
+        const requestedProvider = getPendingAuthProvider();
         const { ensureSupabaseSession } = await import("./lib/supabase");
         await ensureSupabaseSession(client);
+        const provider =
+          requestedProvider ??
+          (session.user.app_metadata.provider === "github" ? "github" : "google");
+        const providerIdentity = session.user.identities?.find(
+          (identity) => identity.provider === provider,
+        );
+        const identityData = providerIdentity?.identity_data;
+        const githubUsername =
+          provider === "github"
+            ? [
+                identityData?.user_name,
+                identityData?.username,
+                identityData?.preferred_username,
+                identityData?.login,
+              ].find((value): value is string => typeof value === "string" && value.length > 0) ??
+              null
+            : null;
+        const googleEmail =
+          provider === "google" &&
+          typeof identityData?.email === "string" &&
+          identityData.email.length > 0
+            ? identityData.email
+            : session.user.email ?? null;
+        const { data: accountProfile, error: profileError } = await client
+          .from("account_profiles")
+          .select("role")
+          .eq("user_id", session.user.id)
+          .single();
+        if (profileError) {
+          throw new Error(
+            `Could not load the account role. Apply the latest supabase/schema.sql. ${profileError.message}`,
+          );
+        }
+        if (accountProfile.role !== "admin" && accountProfile.role !== "user") {
+          throw new Error("The account role stored in the database is invalid.");
+        }
         if (!isMounted) return;
         setAuthError("");
-        setAuthUser({ id: session.user.id, email: session.user.email ?? null });
+        setAuthUser({
+          id: session.user.id,
+          email: googleEmail,
+          provider,
+          githubUsername,
+          role: accountProfile.role,
+        });
+        clearPendingAuthProvider();
       } catch (error) {
         if (!isMounted) return;
         setAuthUser(null);
@@ -2333,6 +2411,9 @@ export function App() {
           setAuthError(`Could not restore your account session: ${error.message}`);
           setIsAuthLoading(false);
           return;
+        }
+        if (!data.session && oauthCallbackError) {
+          setAuthError(oauthCallbackError);
         }
         void activateSession(data.session);
       });
@@ -4471,6 +4552,7 @@ export function App() {
         startIndex,
         profile ?? DEFAULT_PERSONALIZATION,
         {
+          accountRole: authUser?.role ?? "user",
           thinkingMode: showThinking,
           regenerateForVariation: !editedSource,
           currentMessageAt: sourceMessage.createdAt,
@@ -4827,12 +4909,13 @@ export function App() {
   if (authError && !authUser) {
     return (
       <ErrorPage
-        code="ACCOUNT ERROR"
+        code=""
         title="Could not connect your account"
         description="CheyaAPP could not restore the account session. Check the connection and try again."
         details={authError}
         onHome={() => window.location.assign("/")}
         onRetry={() => window.location.reload()}
+        showIcon={false}
       />
     );
   }
@@ -4965,6 +5048,9 @@ export function App() {
           client={authClient}
           accountUserId={authUser.id}
           accountEmail={authUser.email}
+          accountProvider={authUser.provider}
+          githubUsername={authUser.githubUsername}
+          accountRole={authUser.role}
           onGeminiKeyChange={setHasGeminiApiKey}
         />
       </Suspense>
@@ -5075,11 +5161,11 @@ export function App() {
 
   return (
     <main
-      className="fixed inset-0 flex justify-center bg-[#f5f6f8] p-0 sm:px-5 sm:py-0"
+      className="fixed inset-0 flex justify-center bg-[#f5f6f8] p-0"
     >
       <section
         aria-label="CheyaVerse chat"
-        className="relative flex h-full w-full flex-col overflow-hidden bg-[#f5f6f8]"
+        className="relative flex h-full w-full max-w-[480px] flex-col overflow-hidden bg-[#f5f6f8]"
         onDragEnter={(event) => {
           if (!Array.from(event.dataTransfer.types).includes("Files")) return;
           event.preventDefault();
@@ -5126,8 +5212,8 @@ export function App() {
             Drop files or media to attach
           </div>
         )}
-        <header className="absolute inset-x-0 top-0 z-20 flex h-[64px] select-none items-center justify-between gap-2 bg-transparent px-2 py-1 sm:gap-3 sm:px-5">
-          <div className="flex h-12 min-w-0 flex-1 items-center gap-2 rounded-full border border-[#e8e9ec] bg-white py-1 pl-1 pr-2 sm:gap-2.5 sm:pr-2">
+        <header className="absolute inset-x-0 top-0 z-20 flex h-[64px] select-none items-center justify-between gap-2 bg-transparent px-2 py-1">
+          <div className="flex h-12 min-w-0 flex-1 items-center gap-2 rounded-full border border-[#e8e9ec] bg-white py-1 pl-1 pr-2">
             <img
               src={cheyaLogo}
               alt="CheyaVerse logo"
@@ -5181,7 +5267,7 @@ export function App() {
         </header>
 
         {ttsPlayback && (
-          <div className="absolute inset-x-3 top-[68px] z-10 space-y-1.5 sm:inset-x-5">
+          <div className="absolute inset-x-3 top-[68px] z-10 space-y-1.5">
             <section
               aria-label="Text-to-speech player"
               className="flex min-h-12 items-center gap-0 rounded-2xl border border-[#e6e7eb] bg-white px-1.5 py-1.5 shadow-sm"
@@ -5298,7 +5384,7 @@ export function App() {
           aria-label="Conversation"
           aria-live="polite"
           onScroll={handleConversationScroll}
-          className="relative min-h-0 flex-1 overflow-y-auto overscroll-contain bg-[#f5f6f8] px-3 pt-[64px] sm:px-[22px]"
+          className="relative min-h-0 flex-1 overflow-y-auto overscroll-contain bg-[#f5f6f8] px-3 pt-[64px]"
         >
           <div className="space-y-3">
             {messages.map((chatMessage) => {
@@ -5402,7 +5488,7 @@ export function App() {
                         setActiveUserActions(chatMessage.id);
                       }}
                       onDragStart={(event) => event.preventDefault()}
-                      className="max-w-[94%] select-none rounded-[18px] rounded-br-md bg-[#28292e] px-3.5 py-1.5 text-[13px] leading-[1.35] text-white [webkit-touch-callout:none] sm:max-w-[88%]"
+                      className="max-w-[94%] select-none rounded-[18px] rounded-br-md bg-[#28292e] px-3.5 py-1.5 text-[13px] leading-[1.35] text-white [webkit-touch-callout:none]"
                       style={{ WebkitTouchCallout: "none" }}
                     >
                       <Suspense fallback={null}>
@@ -5506,7 +5592,7 @@ export function App() {
                       )}
                     </div>
                   )}
-                  <div className="max-w-full break-words text-[14px] leading-6 sm:text-[15px]">
+                  <div className="max-w-full break-words text-[14px] leading-6">
                     <Suspense fallback={null}>
                       <AssistantMarkdown
                         content={visibleText}
@@ -5673,7 +5759,7 @@ export function App() {
 
         <footer
           ref={observeChatFooter}
-          className="absolute inset-x-0 bottom-0 z-20 bg-transparent px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-2.5 sm:px-5"
+          className="absolute inset-x-0 bottom-0 z-20 bg-transparent px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-2.5"
         >
           {showScrollToLatest && pathname === "/" && (
             <button
@@ -5802,7 +5888,7 @@ export function App() {
                 })}
               </div>
             )}
-            <div className="flex min-h-11 items-start px-3 pb-2 pt-1 sm:min-h-[52px]">
+            <div className="flex min-h-11 items-start px-3 pb-2 pt-1">
               <ChatMessageInput
                 inputRef={messageInputRef}
                 defaultValue={messageDraftRef.current}
