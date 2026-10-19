@@ -46,15 +46,20 @@ import {
   MULTIMODAL_GEMINI_MODELS,
   saveApiStatus,
   type ApiStatus,
+  type AccountInboxItem,
+  type AdminMessage,
+  type AdminMessageRequest,
   type AccountSession,
   type AccountRole,
   type AppSupabaseClient,
+  type AiReminder,
   type GeminiApiKey,
   type GeminiModel,
   type PersonalizationSettings,
   type UserMemory,
 } from "./lib/supabase";
 import { subscribeWithReconnect } from "./lib/realtime";
+import { executeAccountAiActionFromClient } from "./lib/account-ai-actions";
 
 interface SettingsPageProps {
   pathname: string;
@@ -95,6 +100,18 @@ function formatAccountDateTime(value: string): string {
       }).format(date);
 }
 
+function reminderRepeatLabel(unit: NonNullable<AiReminder["repeat_unit"]>): string {
+  const labels: Record<NonNullable<AiReminder["repeat_unit"]>, string> = {
+    minute: "menit",
+    hour: "jam",
+    day: "hari",
+    week: "minggu",
+    month: "bulan",
+    year: "tahun",
+  };
+  return labels[unit];
+}
+
 function formatSessionElapsed(lastSeenAt: string, now: number): string {
   const lastSeen = Date.parse(lastSeenAt);
   if (!Number.isFinite(lastSeen)) return "Last activity time unavailable";
@@ -127,6 +144,7 @@ type SettingsSection =
   | "personal"
   | "configure"
   | "memory"
+  | "messages"
   | "account"
   | "privacy"
   | "terms";
@@ -236,6 +254,20 @@ export function SettingsPage({
   const [isDeleteAccountConfirmationValid, setIsDeleteAccountConfirmationValid] = useState(false);
   const [isDeletingAccount, setIsDeletingAccount] = useState(false);
   const [memories, setMemories] = useState<UserMemory[]>([]);
+  const [accountInbox, setAccountInbox] = useState<AccountInboxItem[]>([]);
+  const [adminMessages] = useState<AdminMessage[]>([]);
+  const [adminMessageRequests] = useState<AdminMessageRequest[]>([]);
+  const [activeReminders] = useState<
+    Array<Pick<AiReminder, "id" | "body" | "next_run_at" | "repeat_every" | "repeat_unit">>
+  >([]);
+  const [isLoadingMessages] = useState(false);
+  const [messageError, setMessageError] = useState("");
+  const [messageNotice, setMessageNotice] = useState("");
+  const [, setMessageRefresh] = useState(0);
+  const [isChangingPushSubscription, setIsChangingPushSubscription] = useState(false);
+  const [openingAttachmentId, setOpeningAttachmentId] = useState<string | null>(null);
+  const [adminAttachmentLinks, setAdminAttachmentLinks] = useState<Record<string, { fileName: string; url: string }>>({});
+  const [pushEnabledForDevice, setPushEnabledForDevice] = useState(false);
   const [memoryContent, setMemoryContent] = useState("");
   const [memoryCategory, setMemoryCategory] = useState("general");
   const [editingMemoryId, setEditingMemoryId] = useState<string | null>(null);
@@ -473,6 +505,7 @@ export function SettingsPage({
           chat_style: data?.chat_style ?? DEFAULT_PERSONALIZATION.chat_style,
         });
       }
+
       if (!ttsDraftDirtyRef.current) {
         const savedTtsKeys = Array.isArray(data?.tts_api_keys)
           ? data.tts_api_keys
@@ -1207,6 +1240,205 @@ export function SettingsPage({
     }
   }
 
+  async function updatePushSubscription(
+    action: "subscribe" | "unsubscribe",
+    subscription: PushSubscription,
+  ): Promise<void> {
+    const {
+      data: { session },
+      error: sessionError,
+    } = await client.auth.getSession();
+    if (sessionError) throw sessionError;
+    if (!session?.access_token) throw new Error("Your account session has expired. Sign in again.");
+    const response = await fetch("/api/push-subscriptions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.access_token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ action, subscription: subscription.toJSON() }),
+    });
+    const payload: unknown = await response.json().catch(() => null);
+    if (!response.ok) {
+      const message =
+        typeof payload === "object" &&
+        payload !== null &&
+        "statusMessage" in payload &&
+        typeof payload.statusMessage === "string"
+          ? payload.statusMessage
+          : `Could not update push notifications (${response.status}).`;
+      throw new Error(message);
+    }
+  }
+
+  async function togglePushNotifications() {
+    if (isChangingPushSubscription) return;
+    setIsChangingPushSubscription(true);
+    setMessageError("");
+    setMessageNotice("");
+    try {
+      if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
+        throw new Error("This browser does not support push notifications.");
+      }
+      const registration = await navigator.serviceWorker.getRegistration();
+      const currentSubscription = await registration?.pushManager.getSubscription();
+      if (pushEnabledForDevice) {
+        if (currentSubscription) {
+          await updatePushSubscription("unsubscribe", currentSubscription);
+          await currentSubscription.unsubscribe();
+        }
+        setPushEnabledForDevice(false);
+        setMessageNotice("Push notifications are turned off for this device.");
+        return;
+      }
+
+      const permission = await Notification.requestPermission();
+      if (permission !== "granted") {
+        throw new Error("Allow notifications in your browser settings to enable reminders.");
+      }
+      const configResponse = await fetch("/api/push-config");
+      const configPayload: unknown = await configResponse.json().catch(() => null);
+      if (!configResponse.ok) {
+        const message =
+          typeof configPayload === "object" &&
+          configPayload !== null &&
+          "statusMessage" in configPayload &&
+          typeof configPayload.statusMessage === "string"
+            ? configPayload.statusMessage
+            : `Could not load push notification configuration (${configResponse.status}).`;
+        throw new Error(message);
+      }
+      if (
+        typeof configPayload !== "object" ||
+        configPayload === null ||
+        !("publicKey" in configPayload) ||
+        typeof configPayload.publicKey !== "string"
+      ) {
+        throw new Error("The push notification service returned an invalid public key.");
+      }
+      const serviceWorker = registration ?? (await navigator.serviceWorker.register("/service-worker.js"));
+      const publicKeyBytes = Uint8Array.from(atob(
+        configPayload.publicKey
+          .replace(/-/g, "+")
+          .replace(/_/g, "/")
+          .padEnd(Math.ceil(configPayload.publicKey.length / 4) * 4, "="),
+      ), (character) => character.charCodeAt(0));
+      const subscription =
+        currentSubscription ??
+        (await serviceWorker.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: publicKeyBytes,
+        }));
+      await updatePushSubscription("subscribe", subscription);
+      setPushEnabledForDevice(true);
+      setMessageNotice("Push notifications are enabled on this device.");
+    } catch (error) {
+      setMessageError(`Could not update push notifications: ${getErrorMessage(error)}`);
+    } finally {
+      setIsChangingPushSubscription(false);
+    }
+  }
+
+  async function markInboxItemRead(item: AccountInboxItem) {
+    if (item.read_at) return;
+    const readAt = new Date().toISOString();
+    const { error } = await client
+      .from("account_inbox")
+      .update({ read_at: readAt })
+      .eq("id", item.id)
+      .eq("recipient_user_id", accountUserId);
+    if (error) {
+      setMessageError(`Could not mark this message as read: ${error.message}`);
+      return;
+    }
+    setAccountInbox((items) =>
+      items.map((current) => (current.id === item.id ? { ...current, read_at: readAt } : current)),
+    );
+  }
+
+  async function resolveAdminMessageRequest(requestId: string, approve: boolean) {
+    setMessageError("");
+    setMessageNotice("");
+    const { data, error } = await client.rpc("finalize_admin_message_request", {
+      p_request_id: requestId,
+      p_approve: approve,
+    });
+    if (error) {
+      setMessageError(`Could not ${approve ? "deliver" : "cancel"} this message: ${error.message}`);
+      return;
+    }
+    setMessageNotice(
+      approve
+        ? `Message delivered to ${data} account${data === 1 ? "" : "s"}.`
+        : "The pending message was cancelled.",
+    );
+    setMessageRefresh((value) => value + 1);
+  }
+
+  async function cancelReminder(reminderId: string) {
+    setMessageError("");
+    setMessageNotice("");
+    try {
+      await executeAccountAiActionFromClient(client, "cancel_reminder", { id: reminderId });
+      setMessageNotice("Reminder cancelled.");
+      setMessageRefresh((value) => value + 1);
+    } catch (error) {
+      setMessageError(`Could not cancel this reminder: ${getErrorMessage(error)}`);
+    }
+  }
+
+  async function loadForwardedAttachmentLink(messageId: string) {
+    setOpeningAttachmentId(messageId);
+    setMessageError("");
+    try {
+      const {
+        data: { session },
+        error: sessionError,
+      } = await client.auth.getSession();
+      if (sessionError) throw sessionError;
+      if (!session?.access_token) throw new Error("Your account session has expired. Sign in again.");
+      const response = await fetch("/api/admin-attachment-link", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${session.access_token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ messageId }),
+      });
+      const payload: unknown = await response.json().catch(() => null);
+      if (!response.ok) {
+        const message =
+          typeof payload === "object" &&
+          payload !== null &&
+          "statusMessage" in payload &&
+          typeof payload.statusMessage === "string"
+            ? payload.statusMessage
+            : `Could not open forwarded file (${response.status}).`;
+        throw new Error(message);
+      }
+      if (
+        typeof payload !== "object" ||
+        payload === null ||
+        !("fileName" in payload) ||
+        typeof payload.fileName !== "string" ||
+        !("url" in payload) ||
+        typeof payload.url !== "string"
+      ) {
+        throw new Error("The file service returned an invalid link.");
+      }
+      const fileName = payload.fileName;
+      const url = payload.url;
+      if (typeof fileName !== "string" || typeof url !== "string") {
+        throw new Error("The file service returned an invalid link.");
+      }
+      setAdminAttachmentLinks((links) => ({ ...links, [messageId]: { fileName, url } }));
+    } catch (error) {
+      setMessageError(`Could not open forwarded file: ${getErrorMessage(error)}`);
+    } finally {
+      setOpeningAttachmentId(null);
+    }
+  }
+
   return (
     <main className="fixed inset-0 flex justify-center bg-[#f5f6f8]">
       <section
@@ -1479,6 +1711,216 @@ export function SettingsPage({
                     Save personal settings
                   </button>
                 </form>
+              )}
+            </section>
+          )}
+
+          {activeSection === "messages" && (
+            <section aria-labelledby="messages-settings-title" className="space-y-6 py-2 sm:py-3">
+              <div>
+                <h2 id="messages-settings-title" className="font-semibold text-[#202126]">
+                  Messages and reminders
+                </h2>
+                <p className="mt-1 text-sm leading-5 text-[#777a81]">
+                  Read messages for this account, manage reminders, and configure this device's notifications.
+                </p>
+              </div>
+
+              {messageError && (
+                <div role="alert" className="rounded-2xl border border-red-100 bg-red-50 px-3.5 py-3 text-sm text-red-800">
+                  {messageError}
+                </div>
+              )}
+              {messageNotice && (
+                <div role="status" className="rounded-2xl border border-emerald-100 bg-emerald-50 px-3.5 py-3 text-sm text-emerald-800">
+                  {messageNotice}
+                </div>
+              )}
+
+              <div className="rounded-2xl border border-[#e2e4e8] bg-white p-4">
+                <h3 className="text-sm font-semibold text-[#292a30]">Push notifications</h3>
+                <p className="mt-1 text-sm leading-5 text-[#777a81]">
+                  Reminders can notify this device even while CheyaVerse is closed. Enable notifications on each device you want to receive them on.
+                </p>
+                <button
+                  type="button"
+                  disabled={!isDatabaseReady || isChangingPushSubscription}
+                  onClick={() => void togglePushNotifications()}
+                  className="mt-3 inline-flex h-10 items-center gap-2 rounded-xl bg-[#26272c] px-4 text-sm font-medium text-white transition hover:bg-[#3a3b41] disabled:opacity-60"
+                >
+                  {isChangingPushSubscription && <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />}
+                  {pushEnabledForDevice ? "Turn off on this device" : "Enable on this device"}
+                </button>
+                {typeof Notification !== "undefined" && Notification.permission === "denied" && (
+                  <p className="mt-2 text-xs leading-5 text-amber-800">
+                    Notifications are blocked by the browser. Allow them in browser settings, then try again.
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <div className="mb-2 flex items-center justify-between gap-3">
+                  <h3 className="text-sm font-semibold text-[#292a30]">Inbox</h3>
+                  <span className="text-xs text-[#858890]">
+                    {accountInbox.filter((item) => !item.read_at).length} unread
+                  </span>
+                </div>
+                {isLoadingMessages ? (
+                  <div className="h-20 animate-pulse rounded-2xl bg-[#eceef1]" />
+                ) : accountInbox.length === 0 ? (
+                  <p className="rounded-2xl border border-dashed border-[#dfe1e5] px-4 py-6 text-center text-sm text-[#858890]">
+                    Your inbox is empty.
+                  </p>
+                ) : (
+                  <div className="space-y-2">
+                    {accountInbox.map((item) => (
+                      <button
+                        key={item.id}
+                        type="button"
+                        onClick={() => void markInboxItemRead(item)}
+                        className={`w-full rounded-2xl border px-4 py-3 text-left transition ${
+                          item.read_at
+                            ? "border-[#e2e4e8] bg-white"
+                            : "border-[#cfd1d6] bg-white shadow-sm"
+                        }`}
+                      >
+                        <span className="flex items-center justify-between gap-2">
+                          <span className="text-sm font-semibold text-[#292a30]">{item.title}</span>
+                          <span className="text-[11px] text-[#858890]">
+                            {formatAccountDateTime(item.created_at)}
+                          </span>
+                        </span>
+                        <span className="mt-1 block whitespace-pre-wrap break-words text-sm leading-5 text-[#55575e]">
+                          {item.body}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <h3 className="mb-2 text-sm font-semibold text-[#292a30]">Active reminders</h3>
+                {activeReminders.length === 0 && !isLoadingMessages ? (
+                  <p className="rounded-2xl border border-dashed border-[#dfe1e5] px-4 py-6 text-center text-sm text-[#858890]">
+                    No active reminders.
+                  </p>
+                ) : (
+                  <div className="space-y-2">
+                    {activeReminders.map((reminder) => (
+                      <article key={reminder.id} className="rounded-2xl border border-[#e2e4e8] bg-white px-4 py-3">
+                        <p className="whitespace-pre-wrap break-words text-sm leading-5 text-[#34363b]">{reminder.body}</p>
+                        <div className="mt-2 flex items-center justify-between gap-2">
+                          <p className="text-xs text-[#777a81]">
+                            {new Intl.DateTimeFormat("id-ID", {
+                              dateStyle: "full",
+                              timeStyle: "short",
+                              timeZone: "Asia/Jakarta",
+                            }).format(new Date(reminder.next_run_at))} WIB
+                            {reminder.repeat_every !== null && reminder.repeat_unit !== null &&
+                              ` · setiap ${reminder.repeat_every} ${reminderRepeatLabel(reminder.repeat_unit)}`}
+                          </p>
+                          <button
+                            type="button"
+                            onClick={() => void cancelReminder(reminder.id)}
+                            className="shrink-0 rounded-lg px-2.5 py-1.5 text-xs font-medium text-red-700 transition hover:bg-red-50"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {accountRole === "admin" && (
+                <>
+                  <div>
+                    <h3 className="mb-2 text-sm font-semibold text-[#292a30]">Messages forwarded by users</h3>
+                    {adminMessages.length === 0 && !isLoadingMessages ? (
+                      <p className="rounded-2xl border border-dashed border-[#dfe1e5] px-4 py-6 text-center text-sm text-[#858890]">
+                        No messages have been forwarded to the administrator.
+                      </p>
+                    ) : (
+                      <div className="space-y-2">
+                        {adminMessages.map((message) => {
+                          const attachmentLink = adminAttachmentLinks[message.id];
+                          return (
+                            <article key={message.id} className="rounded-2xl border border-[#e2e4e8] bg-white px-4 py-3">
+                              <p className="text-[11px] text-[#858890]">
+                                From {message.sender_user_id} · {formatAccountDateTime(message.created_at)}
+                              </p>
+                              <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-5 text-[#34363b]">{message.body}</p>
+                              {message.attachment_id && (
+                                attachmentLink ? (
+                                  <a
+                                    href={attachmentLink.url}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="mt-2 inline-block text-sm font-medium text-[#5c45a4] underline"
+                                  >
+                                    Open {attachmentLink.fileName}
+                                  </a>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    disabled={openingAttachmentId === message.id}
+                                    onClick={() => void loadForwardedAttachmentLink(message.id)}
+                                    className="mt-2 inline-flex items-center gap-1.5 text-sm font-medium text-[#5c45a4] underline disabled:opacity-60"
+                                  >
+                                    {openingAttachmentId === message.id && <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />}
+                                    Get private attachment link
+                                  </button>
+                                )
+                              )}
+                            </article>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  <div>
+                    <h3 className="mb-2 text-sm font-semibold text-[#292a30]">Messages awaiting approval</h3>
+                    {adminMessageRequests.length === 0 && !isLoadingMessages ? (
+                      <p className="rounded-2xl border border-dashed border-[#dfe1e5] px-4 py-6 text-center text-sm text-[#858890]">
+                        No messages are waiting for approval.
+                      </p>
+                    ) : (
+                      <div className="space-y-2">
+                        {adminMessageRequests.map((request) => (
+                          <article key={request.id} className="rounded-2xl border border-[#e2e4e8] bg-white px-4 py-3">
+                            <p className="text-sm font-semibold text-[#292a30]">{request.title}</p>
+                            <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-5 text-[#55575e]">{request.body}</p>
+                            <p className="mt-2 text-xs text-[#858890]">
+                              {request.all_accounts
+                                ? "All accounts except the sender"
+                                : `${request.recipient_user_ids.length} selected account${request.recipient_user_ids.length === 1 ? "" : "s"}`}
+                              {" · "}{formatAccountDateTime(request.created_at)}
+                            </p>
+                            <div className="mt-3 flex justify-end gap-2">
+                              <button
+                                type="button"
+                                onClick={() => void resolveAdminMessageRequest(request.id, false)}
+                                className="h-9 rounded-xl border border-[#e1e3e8] px-3 text-sm font-medium text-[#55575e] hover:bg-[#f7f8fa]"
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => void resolveAdminMessageRequest(request.id, true)}
+                                className="h-9 rounded-xl bg-[#26272c] px-3 text-sm font-medium text-white hover:bg-[#3a3b41]"
+                              >
+                                Approve and send
+                              </button>
+                            </div>
+                          </article>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </>
               )}
             </section>
           )}

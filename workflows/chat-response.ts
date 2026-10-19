@@ -19,6 +19,9 @@ import {
 import { CHAT_ATTACHMENT_BUCKET, MAX_GEMINI_CONTEXT_ATTACHMENTS } from "../src/lib/chat-attachments";
 import type { AiBarcodeReading } from "../src/lib/chat-barcode";
 import { searchWebWithFallback } from "../src/lib/server-web-search";
+import { ACCOUNT_AI_ACTION_NAMES } from "../src/lib/account-ai-actions";
+import { executeAccountAiTool } from "../src/lib/server-ai-tools";
+import { sendAiFailureToInbox, sendPushToAccount } from "../src/lib/server-push";
 import {
   DEFAULT_PERSONALIZATION,
   saveApiStatus,
@@ -46,6 +49,13 @@ function hasExplicitDeleteIntent(message: string, label: string): boolean {
     Boolean(attachmentName && message.toLocaleLowerCase().includes(attachmentName.toLocaleLowerCase())) ||
     /\b(this|that|it|these|those|itu|ini|tersebut|yang tadi)\b/i.test(message)
   );
+}
+
+function assistantNotificationTitle(response: string): string {
+  const firstLine = response.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+  const title = firstLine?.replace(/^#{1,6}\s*/, "").replace(/[*_`]/g, "").trim();
+  if (!title) throw new Error("The AI response did not include text for a notification title.");
+  return title.length > 80 ? `${title.slice(0, 77).trimEnd()}...` : title;
 }
 
 async function updateJob(
@@ -78,6 +88,14 @@ async function markJobFailed(jobId: string, message: string) {
     .eq("id", jobId)
     .neq("status", "completed");
   if (error) throw new Error(`Could not save the chat failure status: ${error.message}`);
+  const { data: job, error: jobError } = await client
+    .from("chat_message_jobs")
+    .select("user_id")
+    .eq("id", jobId)
+    .maybeSingle();
+  if (jobError) throw new Error(`Could not load the failed chat account: ${jobError.message}`);
+  if (!job) throw new Error("Could not find the account for the failed chat job.");
+  await sendAiFailureToInbox(job.user_id, jobId, message);
 }
 
 async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]) {
@@ -390,6 +408,9 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
         await updateJob(jobId, job.user_id, { progress: activity });
       },
       executeTool: (name, input, key) => {
+        if (ACCOUNT_AI_ACTION_NAMES.has(name)) {
+          return executeAccountAiTool(job.user_id, name, input, userMessage.id);
+        }
         if (name === "search_web") {
           const query =
             typeof input === "object" &&
@@ -534,6 +555,23 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
     warnings.push(
       `The response was saved, but conversation history could not be snapshotted: ${
         error instanceof Error ? error.message : "Unknown database error."
+      }`,
+    );
+  }
+
+  try {
+    const push = await sendPushToAccount(
+      job.user_id,
+      assistantNotificationTitle(result.text),
+      result.text.length > 280 ? `${result.text.slice(0, 277)}...` : result.text,
+    );
+    if (push.failed.length > 0) {
+      warnings.push(`The response was saved, but some push notifications failed: ${push.failed.join(" ")}`);
+    }
+  } catch (error) {
+    warnings.push(
+      `The response was saved, but its push notification could not be sent: ${
+        error instanceof Error ? error.message : "Unknown push service error."
       }`,
     );
   }

@@ -9,6 +9,7 @@ import {
   Bug,
   Camera,
   Check,
+  CheckCheck,
   ChevronDown,
   ChevronRight,
   Copy,
@@ -41,7 +42,6 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
-  useMemo,
   useRef,
   useState,
 } from "react";
@@ -85,6 +85,11 @@ import {
 } from "./lib/account-sessions";
 import { subscribeWithReconnect } from "./lib/realtime";
 import {
+  ACCOUNT_AI_ACTION_NAMES,
+  executeAccountAiActionFromClient,
+  reportAiFailureFromClient,
+} from "./lib/account-ai-actions";
+import {
   prepareAssistantSpeech,
 } from "./lib/tts-playback";
 import {
@@ -92,11 +97,17 @@ import {
   getPendingAuthProvider,
   type AccountProvider,
   type AccountRole,
+  type AccountInboxItem,
+  type AdminMessageRequest,
   type AppSupabaseClient,
   type ChatMessageJob,
   type ChatMessageVersion,
 } from "./lib/supabase";
 import type { ChatAttachment } from "./lib/chat-attachments";
+import {
+  enablePushForCurrentDevice,
+  syncCurrentPushSubscription,
+} from "./lib/push-client";
 
 let assistantMarkdownModulePromise: Promise<typeof import("./components/AssistantMarkdown")> | null =
   null;
@@ -929,6 +940,7 @@ interface ChatMessage {
   createdAt: string;
   versionNumber: number;
   thinkingSummary: string | null;
+  isReminder?: boolean;
   attachments?: ChatAttachment[];
 }
 
@@ -976,6 +988,16 @@ function isChatAttachment(value: unknown): value is ChatAttachment {
     "deleted_at" in value &&
     (typeof value.deleted_at === "string" || value.deleted_at === null)
   );
+}
+
+function formatAccountDate(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? value
+    : new Intl.DateTimeFormat(undefined, {
+        dateStyle: "medium",
+        timeStyle: "short",
+      }).format(date);
 }
 
 interface DeleteConfirmation {
@@ -1141,6 +1163,22 @@ export function App() {
   } | null>(null);
   const [isAuthLoading, setIsAuthLoading] = useState(true);
   const [authError, setAuthError] = useState("");
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [inboxItems, setInboxItems] = useState<AccountInboxItem[]>([]);
+  const [expandedInboxIds, setExpandedInboxIds] = useState<Set<string>>(() => new Set());
+  const [pendingAdminRequests, setPendingAdminRequests] = useState<AdminMessageRequest[]>([]);
+  const [isLoadingInbox, setIsLoadingInbox] = useState(false);
+  const [inboxError, setInboxError] = useState("");
+  const [inboxNotice, setInboxNotice] = useState("");
+  const [inboxRefresh, setInboxRefresh] = useState(0);
+  const [isMarkingInboxRead, setIsMarkingInboxRead] = useState(false);
+  const [isClearingInbox, setIsClearingInbox] = useState(false);
+  const [activeApprovalRequestId, setActiveApprovalRequestId] = useState<string | null>(null);
+  const [pushStatus, setPushStatus] = useState<
+    "checking" | "needs-permission" | "denied" | "enabled" | "unsupported" | "error"
+  >("checking");
+  const [pushBannerError, setPushBannerError] = useState("");
+  const [isEnablingPush, setIsEnablingPush] = useState(false);
   const [historyLoadError, setHistoryLoadError] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatJobs, setChatJobs] = useState<ChatMessageJob[]>([]);
@@ -1282,6 +1320,8 @@ export function App() {
   const pendingOptimisticMessageIdsRef = useRef(new Set<string>());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const filesInputRef = useRef<HTMLInputElement>(null);
+  const notificationsPanelRef = useRef<HTMLDivElement>(null);
+  const notificationButtonRef = useRef<HTMLButtonElement>(null);
   const messageInputRef = useRef<HTMLTextAreaElement>(null);
   const nextApiIndexRef = useRef(0);
   const thinkingModeRef = useRef(false);
@@ -1291,16 +1331,12 @@ export function App() {
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const longPressStartRef = useRef<{ x: number; y: number } | null>(null);
   const wasSettingsRef = useRef(window.location.pathname === "/settings");
-  const chatJobsByMessageId = useMemo(() => {
-    const result = new Map<string, ChatMessageJob>();
-    for (const job of chatJobs) {
-      if (!result.has(job.message_id)) result.set(job.message_id, job);
-    }
-    return result;
-  }, [chatJobs]);
   const activeChatJob = chatJobs.find(
     (job) => job.status === "queued" || job.status === "processing",
   );
+  const unreadInboxCount = inboxItems.filter((item) => !item.read_at).length;
+  const showPushBanner =
+    pushStatus === "needs-permission" || pushStatus === "denied" || pushStatus === "error";
 
   useEffect(() => {
     if (!authClient || !authenticatedUserId) return;
@@ -1384,6 +1420,154 @@ export function App() {
       window.removeEventListener("focus", handleWindowFocus);
     };
   }, [authClient, authenticatedUserId, pathname]);
+
+  useEffect(() => {
+    if (!authClient || !authenticatedUserId) {
+      setPushStatus("checking");
+      return;
+    }
+    let isActive = true;
+    if (
+      !("Notification" in window) ||
+      !("serviceWorker" in navigator) ||
+      !("PushManager" in window)
+    ) {
+      setPushStatus("unsupported");
+      return;
+    }
+    if (Notification.permission === "denied") {
+      setPushStatus("denied");
+      return;
+    }
+    if (Notification.permission !== "granted") {
+      setPushStatus("needs-permission");
+      return;
+    }
+    void syncCurrentPushSubscription(authClient)
+      .then((enabled) => {
+        if (isActive) setPushStatus(enabled ? "enabled" : "needs-permission");
+      })
+      .catch((error: unknown) => {
+        console.error("Could not synchronize this device's push subscription.", error);
+        if (isActive) {
+          setPushBannerError(error instanceof Error ? error.message : "Could not check push notification status.");
+          setPushStatus("error");
+        }
+      });
+    return () => {
+      isActive = false;
+    };
+  }, [authClient, authenticatedUserId]);
+
+  useEffect(() => {
+    if ((!notificationsOpen && pathname !== "/") || !authClient || !authenticatedUserId) return;
+    let isActive = true;
+    setIsLoadingInbox(true);
+    setInboxError("");
+    void (async () => {
+      const { data: items, error: inboxLoadError } = await authClient
+        .from("account_inbox")
+        .select("id, recipient_user_id, sender_user_id, source_job_id, kind, title, body, created_at, read_at")
+        .order("created_at", { ascending: false })
+        .limit(100);
+      if (inboxLoadError) throw new Error(`Could not load your notification inbox: ${inboxLoadError.message}`);
+
+      let requests: AdminMessageRequest[] = [];
+      if (authUser?.role === "admin") {
+        const { data, error } = await authClient
+          .from("admin_message_requests")
+          .select("id, admin_user_id, recipient_user_ids, all_accounts, title, body, status, created_at, sent_at")
+          .eq("status", "pending")
+          .order("created_at", { ascending: false })
+          .limit(100);
+        if (error) throw new Error(`Could not load pending message approvals: ${error.message}`);
+        requests = data;
+      }
+      if (!isActive) return;
+      setInboxItems(items);
+      setPendingAdminRequests(requests);
+    })()
+      .catch((error: unknown) => {
+        if (isActive) setInboxError(error instanceof Error ? error.message : "Could not load notifications.");
+      })
+      .finally(() => {
+        if (isActive) setIsLoadingInbox(false);
+      });
+
+    return subscribeWithReconnect(
+      authClient,
+      `chat-inbox-${authenticatedUserId}`,
+      (initialChannel) => {
+        let channel = initialChannel.on(
+          "postgres_changes",
+          {
+            event: "*",
+            schema: "public",
+            table: "account_inbox",
+            filter: `recipient_user_id=eq.${authenticatedUserId}`,
+          },
+          () => setInboxRefresh((value) => value + 1),
+        );
+        if (authUser?.role === "admin") {
+          channel = channel.on(
+            "postgres_changes",
+            {
+              event: "*",
+              schema: "public",
+              table: "admin_message_requests",
+              filter: `admin_user_id=eq.${authenticatedUserId}`,
+            },
+            () => setInboxRefresh((value) => value + 1),
+          );
+        }
+        return channel;
+      },
+      (status, error) => {
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          setInboxError(`Live inbox updates are unavailable: ${error?.message ?? status}.`);
+        }
+      },
+    );
+  }, [authClient, authUser?.role, authenticatedUserId, inboxRefresh, notificationsOpen, pathname]);
+
+  useEffect(() => {
+    if (!notificationsOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setNotificationsOpen(false);
+    };
+    const closeOutsidePanel = (event: PointerEvent) => {
+      if (
+        !notificationsPanelRef.current?.contains(event.target as Node) &&
+        !notificationButtonRef.current?.contains(event.target as Node)
+      ) {
+        setNotificationsOpen(false);
+      }
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    document.addEventListener("pointerdown", closeOutsidePanel);
+    return () => {
+      window.removeEventListener("keydown", closeOnEscape);
+      document.removeEventListener("pointerdown", closeOutsidePanel);
+    };
+  }, [notificationsOpen]);
+
+  useEffect(() => {
+    const openInboxFromPush = (event: MessageEvent<unknown>) => {
+      if (
+        typeof event.data === "object" &&
+        event.data !== null &&
+        "type" in event.data &&
+        event.data.type === "OPEN_NOTIFICATION_INBOX"
+      ) {
+        setNotificationsOpen(true);
+      }
+    };
+    navigator.serviceWorker?.addEventListener("message", openInboxFromPush);
+    if (new URLSearchParams(window.location.search).get("inbox") === "1") {
+      setNotificationsOpen(true);
+    }
+    return () => navigator.serviceWorker?.removeEventListener("message", openInboxFromPush);
+  }, []);
 
   function closeTts() {
     ttsTokenRef.current += 1;
@@ -1863,13 +2047,14 @@ export function App() {
         const currentIds = new Set(current.map((message) => message.id));
         const olderMessages = page.messages
           .filter((message) => !currentIds.has(message.id))
-          .map(({ id, role, content, created_at, version_number, thinking_summary }) => ({
+          .map(({ id, role, content, created_at, version_number, thinking_summary, is_reminder }) => ({
             id,
             role,
             text: content,
             createdAt: created_at,
             versionNumber: version_number,
             thinkingSummary: thinking_summary,
+            isReminder: is_reminder,
             attachments: attachments[id] ?? [],
           }));
         return [...olderMessages, ...current];
@@ -2079,13 +2264,14 @@ export function App() {
         ]);
         if (versionRestoreGenerationRef.current !== restoreGeneration) return;
         setMessages(
-          branch.map(({ id, role, content, created_at, version_number, thinking_summary }) => ({
+          branch.map(({ id, role, content, created_at, version_number, thinking_summary, is_reminder }) => ({
             id,
             role,
             text: content,
             createdAt: created_at,
             versionNumber: version_number,
             thinkingSummary: thinking_summary,
+            isReminder: is_reminder,
             attachments: loadedAttachments[id] ?? [],
           })),
         );
@@ -2481,13 +2667,14 @@ export function App() {
             current.map((message) => [message.id, message.attachments ?? []]),
           );
           return savedMessages.map(
-            ({ id, role, content, created_at, version_number, thinking_summary }) => ({
+            ({ id, role, content, created_at, version_number, thinking_summary, is_reminder }) => ({
               id,
               role,
               text: content,
               createdAt: created_at,
               versionNumber: version_number,
               thinkingSummary: thinking_summary,
+              isReminder: is_reminder,
               attachments: currentAttachments.get(id) ?? [],
             }),
           );
@@ -2805,13 +2992,14 @@ export function App() {
 
         const persistedIds = new Set(messageIds);
         const serverMessages: ChatMessage[] = page.messages.map(
-          ({ id, role, content, created_at, version_number, thinking_summary }) => ({
+          ({ id, role, content, created_at, version_number, thinking_summary, is_reminder }) => ({
             id,
             role,
             text: content,
             createdAt: created_at,
             versionNumber: version_number,
             thinkingSummary: thinking_summary,
+            isReminder: is_reminder,
             attachments: attachments[id] ?? [],
           }),
         );
@@ -3223,6 +3411,208 @@ export function App() {
       setPathname(path);
     } else {
       window.location.replace(path);
+    }
+  }
+
+  async function enablePushNotifications() {
+    if (!authClient || isEnablingPush) return;
+    setIsEnablingPush(true);
+    setPushBannerError("");
+    try {
+      await enablePushForCurrentDevice(authClient);
+      setPushStatus("enabled");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not enable push notifications.";
+      setPushBannerError(message);
+      setPushStatus(
+        "Notification" in window && Notification.permission === "denied"
+          ? "denied"
+          : "error",
+      );
+    } finally {
+      setIsEnablingPush(false);
+    }
+  }
+
+  async function markInboxItemRead(item: AccountInboxItem) {
+    if (!authClient || item.read_at) return;
+    const readAt = new Date().toISOString();
+    const { error } = await authClient
+      .from("account_inbox")
+      .update({ read_at: readAt })
+      .eq("id", item.id)
+      .eq("recipient_user_id", item.recipient_user_id);
+    if (error) {
+      setInboxError(`Could not mark this notification as read: ${error.message}`);
+      return;
+    }
+    setInboxItems((items) =>
+      items.map((current) => (current.id === item.id ? { ...current, read_at: readAt } : current)),
+    );
+  }
+
+  async function markAllInboxItemsRead() {
+    if (!authClient || !authenticatedUserId || isMarkingInboxRead || unreadInboxCount === 0) return;
+    setIsMarkingInboxRead(true);
+    setInboxError("");
+    setInboxNotice("");
+    const readAt = new Date().toISOString();
+    try {
+      const { error } = await authClient
+        .from("account_inbox")
+        .update({ read_at: readAt })
+        .eq("recipient_user_id", authenticatedUserId)
+        .is("read_at", null);
+      if (error) throw new Error(`Could not mark notifications as read: ${error.message}`);
+      setInboxItems((items) => items.map((item) => ({ ...item, read_at: item.read_at ?? readAt })));
+      setInboxNotice("All notifications are marked as read.");
+    } catch (error) {
+      setInboxError(error instanceof Error ? error.message : "Could not mark notifications as read.");
+    } finally {
+      setIsMarkingInboxRead(false);
+    }
+  }
+
+  async function clearNotificationInbox() {
+    if (!authClient || isClearingInbox || inboxItems.length === 0) return;
+    if (
+      !window.confirm(
+        "Clear all notifications from this account's inbox? This does not delete chat messages or pending admin approvals.",
+      )
+    ) {
+      return;
+    }
+    setIsClearingInbox(true);
+    setInboxError("");
+    setInboxNotice("");
+    try {
+      const {
+        data: { session },
+        error: sessionError,
+      } = await authClient.auth.getSession();
+      if (sessionError) throw sessionError;
+      if (!session?.access_token) throw new Error("Your account session has expired. Sign in again.");
+      const response = await fetch("/api/account-inbox-clear", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      });
+      const payload: unknown = await response.json().catch(() => null);
+      if (!response.ok) {
+        const message =
+          typeof payload === "object" &&
+          payload !== null &&
+          "statusMessage" in payload &&
+          typeof payload.statusMessage === "string"
+            ? payload.statusMessage
+            : `Could not clear notifications (${response.status}).`;
+        throw new Error(message);
+      }
+      if (
+        typeof payload !== "object" ||
+        payload === null ||
+        !("deletedCount" in payload) ||
+        typeof payload.deletedCount !== "number"
+      ) {
+        throw new Error("The inbox service returned an invalid response.");
+      }
+      setInboxItems([]);
+      setExpandedInboxIds(new Set());
+      setInboxNotice(
+        `${payload.deletedCount} notification${payload.deletedCount === 1 ? "" : "s"} cleared from this account.`,
+      );
+    } catch (error) {
+      setInboxError(error instanceof Error ? error.message : "Could not clear the notification inbox.");
+    } finally {
+      setIsClearingInbox(false);
+    }
+  }
+
+  async function resolveAdminMessageRequest(requestId: string, approve: boolean) {
+    if (!authClient || activeApprovalRequestId) return;
+    setActiveApprovalRequestId(requestId);
+    setInboxError("");
+    setInboxNotice("");
+    try {
+      const {
+        data: { session },
+        error: sessionError,
+      } = await authClient.auth.getSession();
+      if (sessionError) throw sessionError;
+      if (!session?.access_token) throw new Error("Your account session has expired. Sign in again.");
+      const response = await fetch("/api/admin-message-approval", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${session.access_token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ requestId, approve }),
+      });
+      const payload: unknown = await response.json().catch(() => null);
+      if (!response.ok) {
+        const message =
+          typeof payload === "object" &&
+          payload !== null &&
+          "statusMessage" in payload &&
+          typeof payload.statusMessage === "string"
+            ? payload.statusMessage
+            : `Could not ${approve ? "approve" : "cancel"} this message (${response.status}).`;
+        throw new Error(message);
+      }
+      if (
+        typeof payload !== "object" ||
+        payload === null ||
+        !("deliveredCount" in payload) ||
+        typeof payload.deliveredCount !== "number"
+      ) {
+        throw new Error("The message delivery service returned an invalid response.");
+      }
+      if (!approve) {
+        setInboxNotice("The pending message was cancelled.");
+      } else {
+        const push =
+          "push" in payload &&
+          typeof payload.push === "object" &&
+          payload.push !== null &&
+          "sent" in payload.push &&
+          typeof payload.push.sent === "number" &&
+          "attempted" in payload.push &&
+          typeof payload.push.attempted === "number" &&
+          "failed" in payload.push &&
+          Array.isArray(payload.push.failed)
+            ? {
+                sent: payload.push.sent,
+                attempted: payload.push.attempted,
+                failed: payload.push.failed.filter(
+                  (detail): detail is string => typeof detail === "string",
+                ),
+                skippedActive:
+                  "skippedActive" in payload.push && payload.push.skippedActive === true,
+              }
+            : null;
+        const pushFailure =
+          "pushError" in payload && typeof payload.pushError === "string"
+            ? payload.pushError
+            : null;
+        const deliveryNote = pushFailure
+          ? ` Push notification error: ${pushFailure}`
+          : push
+          ? push.failed.length > 0
+            ? ` Push notifications reached ${push.sent} of ${push.attempted} devices. ${push.failed.join(" ")}`
+            : push.attempted === 0 && push.skippedActive
+              ? " Push notifications were skipped because the recipient accounts are active in chat."
+            : push.attempted === 0
+              ? " No notification-enabled devices are registered for the recipients yet."
+              : ` Push notifications sent to ${push.sent} device${push.sent === 1 ? "" : "s"}.`
+          : " Push delivery status was unavailable.";
+        setInboxNotice(
+          `Message delivered to ${payload.deliveredCount} account${payload.deliveredCount === 1 ? "" : "s"}.${deliveryNote}`,
+        );
+      }
+      setInboxRefresh((value) => value + 1);
+    } catch (error) {
+      setInboxError(error instanceof Error ? error.message : "Could not update the pending message.");
+    } finally {
+      setActiveApprovalRequestId(null);
     }
   }
 
@@ -4592,6 +4982,10 @@ export function App() {
             ]);
           },
           executeTool: (name, input, key) => {
+            if (ACCOUNT_AI_ACTION_NAMES.has(name)) {
+              if (!authClient) throw new Error("Sign in before using account AI actions.");
+              return executeAccountAiActionFromClient(authClient, name, input, sourceMessage.id);
+            }
             if (name === "search_web") {
               const query =
                 typeof input === "object" &&
@@ -4758,7 +5152,19 @@ export function App() {
         setSendError(regenerationWarnings.join("\n"));
       }
     } catch (error) {
-      setSendError(error instanceof Error ? error.message : "Could not regenerate this reply.");
+      try {
+        if (!authClient) throw new Error("Sign in again before saving this AI error.");
+        await reportAiFailureFromClient(
+          authClient,
+          error instanceof Error ? error.message : "Could not regenerate this reply.",
+        );
+      } catch (inboxError) {
+        setSendError(
+          inboxError instanceof Error
+            ? `Cheya could not reply, and the error could not be saved to your inbox: ${inboxError.message}`
+            : "Cheya could not reply, and the error could not be saved to your inbox.",
+        );
+      }
       pendingAssistantAnchorRef.current = null;
       if (!responseSaved) {
         hiddenChatMessageIdsRef.current.delete(messageId);
@@ -4972,6 +5378,7 @@ export function App() {
               Download
             </a>
             <button
+              ref={notificationButtonRef}
               type="button"
               aria-label="Close attachment"
               onClick={closeRemoteAttachmentView}
@@ -5239,9 +5646,20 @@ export function App() {
               type="button"
               aria-label="Notifications"
               title="Notifications"
-              className="ml-auto flex size-9 shrink-0 items-center justify-center rounded-full text-[#303238] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
+              aria-expanded={notificationsOpen}
+              onClick={() => {
+                setInboxError("");
+                setInboxNotice("");
+                setNotificationsOpen((open) => !open);
+              }}
+              className="relative ml-auto flex size-9 shrink-0 items-center justify-center rounded-full text-[#303238] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
             >
               <Bell aria-hidden="true" className="size-5" strokeWidth={1.8} />
+              {unreadInboxCount > 0 && (
+                <span className="absolute right-0 top-0 flex size-[15px] items-center justify-center rounded-full bg-[#d84646] text-[8px] font-semibold leading-none text-white ring-2 ring-white">
+                  {unreadInboxCount > 9 ? "9+" : unreadInboxCount}
+                </span>
+              )}
             </button>
           </div>
 
@@ -5266,8 +5684,217 @@ export function App() {
           </nav>
         </header>
 
+        <div className="pointer-events-none absolute inset-x-3 top-[68px] z-30 flex max-h-[calc(100dvh-84px)] flex-col gap-1.5 overflow-y-auto">
+        {notificationsOpen && (
+          <div
+            ref={notificationsPanelRef}
+            role="dialog"
+            aria-label="Notification inbox"
+            className="pointer-events-auto flex max-h-[min(54vh,420px)] shrink-0 flex-col overflow-hidden rounded-2xl border border-[#e1e3e8] bg-white shadow-xl"
+          >
+            <header className="flex shrink-0 items-center justify-between gap-2 border-b border-[#eceef1] px-3 py-2.5">
+              <div className="flex min-w-0 items-baseline gap-2">
+                <h2 className="text-sm font-semibold text-[#202126]">Inbox</h2>
+                <span className="truncate text-[11px] text-[#858890]">
+                  {unreadInboxCount} unread
+                  {authUser?.role === "admin" && pendingAdminRequests.length > 0
+                    ? ` · ${pendingAdminRequests.length} pending`
+                    : ""}
+                </span>
+              </div>
+              <div className="flex shrink-0 items-center gap-0.5">
+                <button
+                  type="button"
+                  aria-label="Mark all notifications as read"
+                  title={isMarkingInboxRead ? "Marking all as read" : "Mark all as read"}
+                  disabled={isMarkingInboxRead || unreadInboxCount === 0}
+                  onClick={() => void markAllInboxItemsRead()}
+                  className="flex size-8 items-center justify-center rounded-lg text-[#6c727c] transition hover:bg-[#eff8fc] hover:text-[#287ba3] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[#229fe3] disabled:cursor-not-allowed disabled:text-[#c1c3c8]"
+                >
+                  {isMarkingInboxRead ? (
+                    <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                  ) : (
+                    <CheckCheck aria-hidden="true" className="size-[17px]" strokeWidth={1.8} />
+                  )}
+                </button>
+                <button
+                  type="button"
+                  aria-label="Clear notification inbox"
+                  title={isClearingInbox ? "Clearing inbox" : "Clear inbox"}
+                  disabled={isClearingInbox || inboxItems.length === 0}
+                  onClick={() => void clearNotificationInbox()}
+                  className="flex size-8 items-center justify-center rounded-lg text-[#7b7373] transition hover:bg-red-50 hover:text-[#b43b3b] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[#d84646] disabled:cursor-not-allowed disabled:text-[#c8c3c3]"
+                >
+                  {isClearingInbox ? (
+                    <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                  ) : (
+                    <Trash2 aria-hidden="true" className="size-4" strokeWidth={1.8} />
+                  )}
+                </button>
+              </div>
+            </header>
+            <div className="min-h-0 flex-1 space-y-3 overflow-y-auto bg-[#f7f8fa] p-2.5">
+              {inboxError && (
+                <p role="alert" className="rounded-xl bg-red-50 px-3 py-2 text-xs leading-5 text-red-800">
+                  {inboxError}
+                </p>
+              )}
+              {inboxNotice && (
+                <p role="status" className="rounded-xl bg-emerald-50 px-3 py-2 text-xs leading-5 text-emerald-800">
+                  {inboxNotice}
+                </p>
+              )}
+              {authUser?.role === "admin" && pendingAdminRequests.length > 0 && (
+                <section aria-label="Messages awaiting approval" className="space-y-2">
+                  <h3 className="px-1 pt-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-[#858890]">
+                    Awaiting approval
+                  </h3>
+                  {pendingAdminRequests.map((request) => (
+                    <article
+                      key={request.id}
+                      className="rounded-2xl border border-[#e8e9ed] bg-white p-3 shadow-[0_1px_2px_rgba(20,25,35,0.04)]"
+                    >
+                      <p className="text-[13px] font-semibold text-[#292a30]">{request.title}</p>
+                      <p className="mt-1.5 whitespace-pre-wrap break-words text-xs leading-[1.55] text-[#55575e]">
+                        {request.body}
+                      </p>
+                      <p className="mt-2.5 text-[10px] text-[#858890]">
+                        {request.all_accounts
+                          ? "All accounts except the sender"
+                          : `${request.recipient_user_ids.length} selected account${request.recipient_user_ids.length === 1 ? "" : "s"}`}
+                      </p>
+                      <div className="mt-3 flex justify-end gap-2">
+                        <button
+                          type="button"
+                          disabled={activeApprovalRequestId !== null}
+                          onClick={() => void resolveAdminMessageRequest(request.id, false)}
+                          className="h-8 rounded-lg border border-[#e1e3e8] px-2.5 text-xs font-medium text-[#55575e] hover:bg-[#f7f8fa] disabled:opacity-50"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          disabled={activeApprovalRequestId !== null}
+                          onClick={() => void resolveAdminMessageRequest(request.id, true)}
+                          className="h-8 rounded-lg bg-[#26272c] px-2.5 text-xs font-medium text-white hover:bg-[#3a3b41] disabled:opacity-50"
+                        >
+                          {activeApprovalRequestId === request.id ? "Sending…" : "Approve and send"}
+                        </button>
+                      </div>
+                    </article>
+                  ))}
+                </section>
+              )}
+              {isLoadingInbox ? (
+                <div role="status" className="space-y-2">
+                  <div className="h-16 animate-pulse rounded-xl bg-[#eceef1]" />
+                  <div className="h-16 animate-pulse rounded-xl bg-[#eceef1]" />
+                </div>
+              ) : inboxItems.length > 0 ? (
+                <section aria-label="Notifications" className="space-y-2">
+                  {inboxItems.map((item) => (
+                    <article
+                      key={item.id}
+                      className={`w-full overflow-hidden rounded-2xl border shadow-[0_1px_2px_rgba(20,25,35,0.04)] transition ${
+                        item.read_at
+                          ? "border-[#e8e9ed] bg-white"
+                          : "border-[#d8e7ef] bg-[#f3faff]"
+                      }`}
+                    >
+                      <button
+                        type="button"
+                        aria-expanded={expandedInboxIds.has(item.id)}
+                        onClick={() => {
+                          setExpandedInboxIds((ids) => {
+                            const next = new Set(ids);
+                            if (next.has(item.id)) next.delete(item.id);
+                            else next.add(item.id);
+                            return next;
+                          });
+                          void markInboxItemRead(item);
+                        }}
+                        className="w-full px-3 py-3 text-left transition hover:bg-black/[0.015] focus-visible:outline-2 focus-visible:outline-inset focus-visible:outline-[#229fe3]"
+                      >
+                        <span className="flex items-center justify-between gap-2">
+                          <span className="flex min-w-0 items-center gap-1.5">
+                            {!item.read_at && (
+                              <span
+                                aria-label="Unread"
+                                className="size-1.5 shrink-0 rounded-full bg-[#229fe3]"
+                              />
+                            )}
+                            <span className="truncate text-[13px] font-semibold text-[#292a30]">
+                              {item.title}
+                            </span>
+                          </span>
+                          <time className="shrink-0 text-[10px] tabular-nums text-[#92959c]">
+                            {formatAccountDate(item.created_at)}
+                          </time>
+                        </span>
+                        {!expandedInboxIds.has(item.id) && (
+                          <span className="mt-1 block line-clamp-2 break-words text-xs leading-[1.55] text-[#62656d]">
+                            {item.body}
+                          </span>
+                        )}
+                      </button>
+                      {expandedInboxIds.has(item.id) && (
+                        <div className="mx-3 mb-3 max-h-24 max-w-full overflow-auto border-t border-[#e8e9ed] pt-2">
+                          <pre className="w-max min-w-full whitespace-pre font-mono text-[11px] leading-[1.65] text-[#555a63]">
+                            {item.body}
+                          </pre>
+                        </div>
+                      )}
+                    </article>
+                  ))}
+                </section>
+              ) : (
+                !isLoadingInbox && (
+                  <p className="rounded-xl border border-dashed border-[#dfe1e5] px-3 py-5 text-center text-xs text-[#858890]">
+                    Your inbox is empty.
+                  </p>
+                )
+              )}
+            </div>
+          </div>
+        )}
+
+        {showPushBanner && (
+          <section
+            aria-label="Push notification permission"
+            className="pointer-events-auto flex h-12 shrink-0 items-center gap-2 overflow-hidden rounded-2xl border border-[#e6e7eb] bg-white px-2 shadow-sm"
+          >
+            <Bell aria-hidden="true" className="ml-1 size-4 shrink-0 text-[#596879]" />
+            <p
+              title={
+                pushBannerError ||
+                (pushStatus === "denied"
+                  ? "Notifications are blocked. Allow them in your browser or device settings."
+                  : "Enable notifications to receive messages and reminders on this device.")
+              }
+              className={`min-w-0 flex-1 truncate text-xs leading-5 ${
+                pushBannerError ? "text-red-700" : "text-[#55575e]"
+              }`}
+            >
+              {pushBannerError ||
+                (pushStatus === "denied"
+                  ? "Notifications are blocked. Allow them in your browser or device settings."
+                  : "Enable notifications to receive messages and reminders on this device.")}
+            </p>
+            {pushStatus !== "denied" && (
+              <button
+                type="button"
+                disabled={isEnablingPush}
+                onClick={() => void enablePushNotifications()}
+                className="h-8 shrink-0 whitespace-nowrap rounded-lg bg-[#26272c] px-3 text-xs font-medium text-white hover:bg-[#3a3b41] disabled:opacity-60"
+              >
+                {isEnablingPush ? "Enabling…" : "Enable"}
+              </button>
+            )}
+          </section>
+        )}
+
         {ttsPlayback && (
-          <div className="absolute inset-x-3 top-[68px] z-10 space-y-1.5">
+          <div className="pointer-events-auto shrink-0">
             <section
               aria-label="Text-to-speech player"
               className="flex min-h-12 items-center gap-0 rounded-2xl border border-[#e6e7eb] bg-white px-1.5 py-1.5 shadow-sm"
@@ -5368,16 +5995,17 @@ export function App() {
                 <X aria-hidden="true" className="size-4" />
               </button>
             </section>
-            {isTtsErrorExpanded && ttsPlayback.errorDetails && (
-              <div
-                role="alert"
-                className="max-h-40 overflow-y-auto whitespace-pre-wrap break-words rounded-xl border border-[#e6e7eb] bg-white px-3 py-2.5 text-xs leading-5 text-[#55504a] shadow-sm"
-              >
-                {ttsPlayback.errorDetails}
-              </div>
-            )}
           </div>
         )}
+        {ttsPlayback && isTtsErrorExpanded && ttsPlayback.errorDetails && (
+          <div
+            role="alert"
+            className="pointer-events-auto max-h-40 shrink-0 overflow-y-auto whitespace-pre-wrap break-words rounded-2xl border border-[#e6e7eb] bg-white px-3 py-2.5 text-xs leading-5 text-[#55504a] shadow-sm"
+          >
+            {ttsPlayback.errorDetails}
+          </div>
+        )}
+        </div>
 
         <div
           ref={conversationRef}
@@ -5400,7 +6028,6 @@ export function App() {
                   typingAssistant.content === visibleText) ||
                 pendingAssistantResponseId === chatMessage.id;
               const ratingKey = `${chatMessage.id}:${versionNumber}`;
-              const chatJob = chatJobsByMessageId.get(chatMessage.id);
               const versionLabel =
                 chatMessage.role === "user" ? "user message" : "assistant response";
               const versionControls = versions.length > 1 ? (
@@ -5500,14 +6127,6 @@ export function App() {
                         userMessage
                       />
                     </div>
-                    {chatJob && (chatJob.status === "failed" || chatJob.error) && (
-                      <p
-                        role="alert"
-                        className="mt-1 max-w-[88%] text-xs text-red-700"
-                      >
-                        {chatJob.error || "Cheya could not complete this response."}
-                      </p>
-                    )}
                     {versionControls && (
                       <div className="mt-0.5 flex min-h-7 w-full items-center justify-end">
                         {versionControls}
@@ -5642,15 +6261,17 @@ export function App() {
                     >
                       <ThumbsDown aria-hidden="true" className="size-4" />
                     </button>
-                    <button
-                      type="button"
-                      aria-label="Regenerate response"
-                      disabled={isSending}
-                      onClick={() => void regenerateAssistantMessage(chatMessage.id)}
-                      className="flex size-8 items-center justify-center rounded-lg text-[#777a82] transition hover:bg-[#f1f2f4] disabled:opacity-50"
-                    >
-                      <RotateCw aria-hidden="true" className="size-4" />
-                    </button>
+                    {!chatMessage.isReminder && (
+                      <button
+                        type="button"
+                        aria-label="Regenerate response"
+                        disabled={isSending}
+                        onClick={() => void regenerateAssistantMessage(chatMessage.id)}
+                        className="flex size-8 items-center justify-center rounded-lg text-[#777a82] transition hover:bg-[#f1f2f4] disabled:opacity-50"
+                      >
+                        <RotateCw aria-hidden="true" className="size-4" />
+                      </button>
+                    )}
                     <button
                       type="button"
                       aria-label="Report response"

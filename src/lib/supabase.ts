@@ -36,8 +36,57 @@ export type AccountProfile = {
   user_id: string;
   role: AccountRole;
   provider: string;
+  email: string | null;
   github_username: string | null;
   updated_at: string;
+};
+
+export type AccountInboxItem = {
+  id: string;
+  recipient_user_id: string;
+  sender_user_id: string | null;
+  source_job_id: string | null;
+  kind: "admin_message" | "reminder" | "ai_error";
+  title: string;
+  body: string;
+  created_at: string;
+  read_at: string | null;
+};
+
+export type AdminMessageRequest = {
+  id: string;
+  admin_user_id: string;
+  recipient_user_ids: string[];
+  all_accounts: boolean;
+  title: string;
+  body: string;
+  status: "pending" | "sent" | "cancelled";
+  created_at: string;
+  sent_at: string | null;
+};
+
+export type AdminMessage = {
+  id: string;
+  sender_user_id: string;
+  body: string;
+  attachment_id: string | null;
+  created_at: string;
+};
+
+export type AiReminder = {
+  id: string;
+  user_id: string;
+  source_message_id: string | null;
+  title: string;
+  body: string;
+  next_run_at: string;
+  timezone: "Asia/Jakarta";
+  repeat_interval_seconds: number | null;
+  repeat_every: number | null;
+  repeat_unit: "minute" | "hour" | "day" | "week" | "month" | "year" | null;
+  active: boolean;
+  created_at: string;
+  completed_at: string | null;
 };
 
 export interface DatabaseConfig {
@@ -55,7 +104,7 @@ type AccountDataSnapshot = {
   message_feedback: Database["public"]["Tables"]["message_feedback"]["Row"][];
 };
 
-type Json =
+export type Json =
   | string
   | number
   | boolean
@@ -142,6 +191,7 @@ export type StoredChatMessage = {
   created_at: string;
   version_number: number;
   thinking_summary: string | null;
+  is_reminder: boolean;
   is_active: boolean;
   revision_reason: ChatMessageVersion["revision_reason"];
 };
@@ -225,6 +275,93 @@ export type Database = {
         Update: never;
         Relationships: never[];
       };
+      account_inbox: {
+        Row: AccountInboxItem;
+        Insert: {
+          id?: string;
+          recipient_user_id: string;
+          sender_user_id?: string | null;
+          source_job_id?: string | null;
+          kind: AccountInboxItem["kind"];
+          title: string;
+          body: string;
+          created_at?: string;
+          read_at?: string | null;
+        };
+        Update: Partial<Pick<AccountInboxItem, "read_at">>;
+        Relationships: never[];
+      };
+      admin_messages: {
+        Row: AdminMessage;
+        Insert: {
+          id?: string;
+          sender_user_id: string;
+          body: string;
+          attachment_id?: string | null;
+          created_at?: string;
+        };
+        Update: never;
+        Relationships: never[];
+      };
+      admin_message_requests: {
+        Row: AdminMessageRequest;
+        Insert: {
+          id?: string;
+          admin_user_id: string;
+          recipient_user_ids: string[];
+          all_accounts?: boolean;
+          title: string;
+          body: string;
+          status?: AdminMessageRequest["status"];
+          created_at?: string;
+          sent_at?: string | null;
+        };
+        Update: never;
+        Relationships: never[];
+      };
+      ai_reminders: {
+        Row: AiReminder;
+        Insert: {
+          id?: string;
+          user_id: string;
+          source_message_id?: string | null;
+          title: string;
+          body: string;
+          next_run_at: string;
+          timezone?: "Asia/Jakarta";
+          repeat_interval_seconds?: number | null;
+          repeat_every?: number | null;
+          repeat_unit?: AiReminder["repeat_unit"];
+          active?: boolean;
+          created_at?: string;
+          completed_at?: string | null;
+        };
+        Update: Partial<Pick<AiReminder, "active" | "next_run_at" | "completed_at" | "repeat_every" | "repeat_unit">>;
+        Relationships: never[];
+      };
+      push_subscriptions: {
+        Row: {
+          id: string;
+          user_id: string;
+          endpoint: string;
+          subscription: Json;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id?: string;
+          user_id: string;
+          endpoint: string;
+          subscription: Json;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: Partial<{
+          subscription: Json;
+          updated_at: string;
+        }>;
+        Relationships: never[];
+      };
       user_settings: {
         Row: {
           user_id: string;
@@ -274,6 +411,7 @@ export type Database = {
           created_at?: string;
           version_number?: number;
           thinking_summary?: string | null;
+          is_reminder?: boolean;
           is_active?: boolean;
           revision_reason?: ChatMessageVersion["revision_reason"];
         };
@@ -283,6 +421,7 @@ export type Database = {
           embedding: string | null;
           version_number: number;
           thinking_summary: string | null;
+          is_reminder: boolean;
           is_active: boolean;
           revision_reason: ChatMessageVersion["revision_reason"];
         }>;
@@ -473,6 +612,23 @@ export type Database = {
     };
     Views: { [_ in never]: never };
     Functions: {
+      relay_user_message_to_admin: {
+        Args: { p_sender_user_id: string; p_body: string };
+        Returns: string;
+      };
+      finalize_admin_message_request: {
+        Args: { p_request_id: string; p_approve: boolean };
+        Returns: number;
+      };
+      deliver_ai_reminder: {
+        Args: { p_reminder_id: string; p_scheduled_at: string };
+        Returns: Array<{
+          user_id: string;
+          title: string;
+          body: string;
+          next_run_at: string | null;
+        }>;
+      };
       import_account_data: {
         Args: { p_data: Json };
         Returns: {

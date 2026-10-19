@@ -161,7 +161,7 @@ export async function saveChatMessage(
       thinking_summary: thinkingSummary,
       revision_reason: "initial",
     })
-    .select("id, user_id, role, content, embedding, created_at, version_number, thinking_summary, is_active, revision_reason")
+    .select("id, user_id, role, content, embedding, created_at, version_number, thinking_summary, is_reminder, is_active, revision_reason")
     .single();
   if (error) {
     throw new Error(
@@ -229,7 +229,7 @@ export async function loadChatMessagePage(
     try {
       let query = client
         .from("chat_messages")
-        .select("id, user_id, role, content, embedding, created_at, version_number, thinking_summary, is_active, revision_reason")
+        .select("id, user_id, role, content, embedding, created_at, version_number, thinking_summary, is_reminder, is_active, revision_reason")
         .eq("is_active", true)
         .order("created_at", { ascending: false })
         .order("id", { ascending: false })

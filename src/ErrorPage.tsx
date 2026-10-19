@@ -1,5 +1,5 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
-import { ArrowLeft, RotateCw, TriangleAlert } from "lucide-react";
+import { ArrowLeft, RotateCw } from "lucide-react";
 
 interface ErrorPageProps {
   code?: string;
@@ -12,50 +12,28 @@ interface ErrorPageProps {
 }
 
 export function ErrorPage({
-  code = "ERROR",
   title,
   description,
   details,
   onHome,
   onRetry,
-  showIcon = true,
 }: ErrorPageProps) {
   return (
     <main className="fixed inset-0 flex items-center justify-center overflow-y-auto bg-[radial-gradient(ellipse_at_top_left,_rgba(48,160,235,0.12),_transparent_48%),#f5f6f8] px-5 py-8 text-[#202126]">
       <section
-        aria-labelledby="error-page-title"
-        className="w-full max-w-lg py-6 sm:py-8"
+        aria-label={title}
+        className="w-full max-w-lg py-6 text-center sm:py-8"
       >
-        <header className="flex items-start gap-4">
-          {showIcon && (
-            <div className="flex size-11 shrink-0 items-center justify-center rounded-2xl bg-[#eaf0f6] text-[#596879]">
-              <TriangleAlert aria-hidden="true" className="size-5" />
-            </div>
-          )}
-          <div className="min-w-0 pt-0.5">
-            {code && (
-              <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[#777f8b]">
-                {code}
-              </p>
-            )}
-            <h1
-              id="error-page-title"
-              className={`${code ? "mt-1.5 " : ""}text-2xl font-semibold tracking-tight`}
-            >
-              {title}
-            </h1>
-            <p className="mt-2 text-sm leading-6 text-[#626873]">{description}</p>
-          </div>
-        </header>
+        <p className="text-sm leading-6 text-[#626873]">{description}</p>
         {details && (
           <p
             role="alert"
-            className="ml-[60px] mt-5 max-h-40 overflow-auto whitespace-pre-wrap break-words text-xs leading-5 text-[#777f8b]"
+            className="mt-5 max-h-40 overflow-auto whitespace-pre-wrap break-words text-xs leading-5 text-[#777f8b]"
           >
             {details}
           </p>
         )}
-        <div className="ml-[60px] mt-6 flex flex-col-reverse gap-2 sm:flex-row">
+        <div className="mt-6 flex flex-col-reverse gap-2 sm:flex-row">
           {onHome && (
             <button
               type="button"

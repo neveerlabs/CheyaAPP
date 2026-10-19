@@ -47,7 +47,7 @@ insights.
 4. In Supabase **Authentication → Bot and Abuse Protection**, enable Cloudflare Turnstile and enter
    the Turnstile secret key. The Turnstile site key is a frontend value; the secret key stays in
    Supabase.
-5. Add these build-time variables in Vercel Project Settings → Environment Variables for the
+5. Add these environment variables in Vercel Project Settings → Environment Variables for the
    environments you deploy, then redeploy:
 
    ```env
@@ -61,10 +61,19 @@ insights.
    CRON_SECRET=<random-secret-at-least-32-characters>
    APP_ACCESS_CODE=<six-digit-sign-in-code>
    TURNSTILE_SECRET_KEY=<cloudflare-turnstile-secret-key>
+   VAPID_PUBLIC_KEY=<web-push-public-key>
+   VAPID_PRIVATE_KEY=<web-push-private-key>
+   VAPID_SUBJECT=mailto:<operator-contact-email>
    TINYFISH_API_KEY=<tinyfish-api-key>
    TAVILY_API_KEY=<tavily-search-api-key>
    BRAVE_SEARCH_API_KEY=<brave-search-api-key>
    ```
+
+   Generate a matching VAPID key pair with `npx web-push generate-vapid-keys`. Set the public and
+   private keys as server environment variables (never `VITE_` variables); `VAPID_SUBJECT` should be
+   a contact URI such as `mailto:you@example.com`. For local development, put the same three
+   variables in the root `.env` file and restart the dev server. In the deployed environment, set
+   them in the hosting provider's server-side environment-variable settings and redeploy.
 
 The schema creates a protected `account_profiles` row for every existing and new auth user.
 Accounts without a linked GitHub identity named `neveerlabs` receive the `user` role; an account
@@ -86,8 +95,8 @@ Do not delete the Supabase user, since its existing chat and account data are at
    These `VITE_*` values are included in the browser bundle and must be public values. Never expose
    a Supabase service-role/secret key or the Turnstile secret key in Vite, the browser, or Git.
    `SUPABASE_SERVICE_ROLE_KEY` is a server-only Vercel environment variable required by durable chat
-   jobs and the database keepalive; add it to Development, Preview, and Production environments as
-   needed. `APP_ACCESS_CODE` is a server-only, exactly six-digit code required before Google sign-in;
+   jobs, role-checked account AI actions, reminders, and the database keepalive; add it to Development, Preview, and Production environments as
+   needed. `APP_ACCESS_CODE` is a server-only, exactly six-digit code required before OAuth sign-in;
    configure the same value in each Vercel environment where sign-in is enabled. The code endpoint
    verifies Turnstile server-side and limits repeated failures per server instance. `TURNSTILE_SECRET_KEY`
    is the Cloudflare secret key for that same Turnstile widget; it is needed because CAPTCHA tokens
@@ -103,6 +112,9 @@ Do not delete the Supabase user, since its existing chat and account data are at
    a best-effort HTML search fallback; it may rate-limit automated requests. TinyFish is preferred
    when configured, then Google Search grounding, DuckDuckGo, and any configured Tavily/Brave
    providers are tried across refined search passes.
+   `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, and `VAPID_SUBJECT` configure server-sent Web Push.
+   Keep the private key server-only and use the same key pair in local, preview, and production
+   environments that must deliver reminders. The app returns only the public key to the browser.
 
 ### Local development
 
@@ -118,13 +130,13 @@ npm run dev
 
 Restart Vite after changing environment variables. Keep `.env.local` private and never commit it.
 If you do not use the Vercel CLI, create `.env.local` with the four `VITE_*` values, the server-side
-`SUPABASE_*` values, `CRON_SECRET`, `APP_ACCESS_CODE`, `TURNSTILE_SECRET_KEY`, and the optional
-provider keys above. Keep this file private;
+`SUPABASE_*` values, `CRON_SECRET`, `APP_ACCESS_CODE`, `TURNSTILE_SECRET_KEY`, the three VAPID
+values, and any optional provider keys above. Keep this file private;
 `.env.local` is ignored by Git.
 
 ### User setup and data
 
-Every user must enter the operator's six-digit access code and sign in with Google after completing
+Every user must enter the operator's six-digit access code and sign in with Google or GitHub after completing
 Cloudflare Turnstile verification. The app blocks chat and Gemini configuration until the account is signed in; chat also requires at least
 one Gemini API key. Users add their own Gemini key in **Settings → Configure**. The key is stored
 with their Supabase account and sent directly from their browser to Google's Gemini API.
@@ -133,6 +145,31 @@ Existing data configured in an older browser can be imported to the central acco
 After a successful import, the old browser-specific Supabase connection is removed. The Settings
 help button covers only how users create and add a Gemini API key; Google sign-in, CAPTCHA, and
 database infrastructure are managed by the operator.
+
+### AI account access, messages, and reminders
+
+The server verifies the account role for every cross-account AI action. User accounts can use
+personal data tools only within their own account and can explicitly ask Cheya to relay a message
+to the administrator. Relayed content appears only in the administrator's chat as untrusted quoted
+content; it is not added to the notification inbox. Administrators can search account content and
+prepare messages for one or more accounts; every outgoing admin message stays pending until an
+administrator approves it in the chat header's notification inbox. Approved messages are added to each recipient's
+inbox and sent as push notifications. Relayed messages appear in the administrator's chat with a
+clear sender label and quoted-content boundary. API keys, push subscription credentials, and private file
+bytes are never provided to the model. Forwarded attachments are restricted to the original 24-hour
+retention window and are opened through a short-lived, administrator-only link.
+
+Users and administrators can ask Cheya to schedule one-time or recurring reminders. Reminder times
+use WIB (Asia/Jakarta), and recurring intervals support minutes, hours, days, weeks, months, and
+years. Reminders appear as non-regenerable assistant messages in chat and are also sent as Web Push.
+The notification bell in the chat header opens the account inbox. Devices without push permission
+show an enable-notifications banner below the chat header; each device must enable it separately.
+Push notifications are suppressed while any recent account session is active in the chat, and are
+sent to every registered device for that account only when the recipient is away from chat. This
+applies to assistant replies, reminders, account messages, relayed messages, and explicit AI push
+tests. AI reply failures are recorded in the recipient's inbox instead of being rendered as chat
+messages. Push delivery requires the VAPID environment variables above, the updated `supabase/schema.sql`,
+and a deployment that runs durable workflows.
 
 Text chat messages, per-message conversation insights, semantic embeddings, and job status are
 stored in the connected Supabase project and protected by row-level security. A server-side Vercel

@@ -1,6 +1,7 @@
 import { createError, defineEventHandler, getHeader, readBody } from "nitro/h3";
 import { start } from "workflow/api";
 import { createChatResponseWorkflow } from "../workflows/chat-response";
+import { sendAiFailureToInbox } from "../src/lib/server-push";
 import { createAuthenticatedServerClient, createServiceRoleClient } from "../src/lib/server-supabase";
 import type { AiBarcodeReading } from "../src/lib/chat-barcode";
 
@@ -151,6 +152,7 @@ export default defineEventHandler(async (event) => {
         statusMessage: `Could not start chat processing (${message}); saving its failure status also failed: ${updateError.message}`,
       });
     }
-    throw createError({ statusCode: 503, statusMessage: message });
+    await sendAiFailureToInbox(user.id, job.job_id, message);
+    return { jobId: job.job_id, messageId: job.message_id, runId: null };
   }
 });
