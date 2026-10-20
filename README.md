@@ -181,8 +181,8 @@ tests. AI reply failures are recorded in the recipient's inbox instead of being 
 messages. Push delivery requires the VAPID environment variables above, the updated `supabase/schema.sql`,
 and a deployment that runs durable workflows.
 
-API handlers are consolidated through [`api/[...path].ts`](./api/[...path].ts) and live in
-`api-handlers/` to stay within Vercel Hobby's 12-function deployment limit. Register new API
+API handlers are consolidated through [`routes/api/[...path].ts`](./routes/api/[...path].ts) and live
+in `api-handlers/` to stay within Vercel Hobby's 12-function deployment limit. Register new API
 endpoints in the dispatcher rather than adding route files under `api/`.
 
 Text chat messages, per-message conversation insights, semantic embeddings, and job status are

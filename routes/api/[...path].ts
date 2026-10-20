@@ -5,26 +5,26 @@ import {
   getRequestURL,
   type EventHandler,
 } from "nitro/h3";
-import accountAiAction from "../api-handlers/account-ai-action.post";
-import accountAiError from "../api-handlers/account-ai-error.post";
-import accountDelete from "../api-handlers/account-delete.post";
-import accountInboxClear from "../api-handlers/account-inbox-clear.post";
-import accessCode from "../api-handlers/access-code.post";
-import adminAttachmentLink from "../api-handlers/admin-attachment-link.post";
-import adminMessageApproval from "../api-handlers/admin-message-approval.post";
-import adminRelayFeedback from "../api-handlers/admin-relay-feedback.post";
-import chatAttachmentLink from "../api-handlers/chat-attachment-link.post";
-import chatAttachmentsDelete from "../api-handlers/chat-attachments-delete.post";
-import chatAttachments from "../api-handlers/chat-attachments.post";
-import chatJobs from "../api-handlers/chat-jobs.post";
-import chatMessageAttachments from "../api-handlers/chat-message-attachments.post";
-import databaseKeepalive from "../api-handlers/database-keepalive.get";
-import linkPreview from "../api-handlers/link-preview.post";
-import pushConfig from "../api-handlers/push-config.get";
-import pushSubscriptions from "../api-handlers/push-subscriptions.post";
-import ttsAudioCacheGet from "../api-handlers/tts-audio-cache.get";
-import ttsAudioCachePost from "../api-handlers/tts-audio-cache.post";
-import webSearch from "../api-handlers/web-search.post";
+import accountAiAction from "../../api-handlers/account-ai-action.post";
+import accountAiError from "../../api-handlers/account-ai-error.post";
+import accountDelete from "../../api-handlers/account-delete.post";
+import accountInboxClear from "../../api-handlers/account-inbox-clear.post";
+import accessCode from "../../api-handlers/access-code.post";
+import adminAttachmentLink from "../../api-handlers/admin-attachment-link.post";
+import adminMessageApproval from "../../api-handlers/admin-message-approval.post";
+import adminRelayFeedback from "../../api-handlers/admin-relay-feedback.post";
+import chatAttachmentLink from "../../api-handlers/chat-attachment-link.post";
+import chatAttachmentsDelete from "../../api-handlers/chat-attachments-delete.post";
+import chatAttachments from "../../api-handlers/chat-attachments.post";
+import chatJobs from "../../api-handlers/chat-jobs.post";
+import chatMessageAttachments from "../../api-handlers/chat-message-attachments.post";
+import databaseKeepalive from "../../api-handlers/database-keepalive.get";
+import linkPreview from "../../api-handlers/link-preview.post";
+import pushConfig from "../../api-handlers/push-config.get";
+import pushSubscriptions from "../../api-handlers/push-subscriptions.post";
+import ttsAudioCacheGet from "../../api-handlers/tts-audio-cache.get";
+import ttsAudioCachePost from "../../api-handlers/tts-audio-cache.post";
+import webSearch from "../../api-handlers/web-search.post";
 
 const apiHandlers: Record<string, EventHandler> = {
   "POST /api/account-ai-action": accountAiAction,
