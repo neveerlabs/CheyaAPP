@@ -22,6 +22,7 @@ import { searchWebWithFallback } from "../src/lib/server-web-search";
 import { ACCOUNT_AI_ACTION_NAMES } from "../src/lib/account-ai-actions";
 import { executeAccountAiTool } from "../src/lib/server-ai-tools";
 import { sendAiFailureToInbox, sendPushToAccount } from "../src/lib/server-push";
+import { getSharedAttachmentId, linkChatAttachments } from "../src/lib/chat-attachment-sharing";
 import {
   DEFAULT_PERSONALIZATION,
   saveApiStatus,
@@ -140,7 +141,7 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
       .order("id", { ascending: true }),
     client
       .from("user_settings")
-      .select("display_name, custom_prompt, chat_style")
+      .select("display_name, custom_prompt, chat_style, web_search_enabled")
       .eq("user_id", job.user_id)
       .maybeSingle(),
     client
@@ -160,6 +161,7 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
   const personalization: PersonalizationSettings = profile ?? DEFAULT_PERSONALIZATION;
   const attempts: GeminiAttempt[] = [];
   const warnings: string[] = [];
+  const sharedAttachmentIds = new Set<string>();
 
   const [documentEmbeddingResult, queryEmbeddingResult] = await Promise.allSettled([
     createEmbedding(typedKeys[0].api_key, userMessage.content, "RETRIEVAL_DOCUMENT"),
@@ -378,6 +380,7 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
     personalization,
     {
       accountRole: accountProfile.role,
+      webSearchEnabled: profile?.web_search_enabled !== false,
       thinkingMode: job.thinking_mode,
       allowSilence: true,
       currentMessageAt: userMessage.created_at,
@@ -407,11 +410,20 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
             : `Action: Using chat tool "${toolName}"…`;
         await updateJob(jobId, job.user_id, { progress: activity });
       },
-      executeTool: (name, input, key) => {
+      executeTool: async (name, input, key) => {
         if (ACCOUNT_AI_ACTION_NAMES.has(name)) {
-          return executeAccountAiTool(job.user_id, name, input, userMessage.id);
+          const toolResult = await executeAccountAiTool(job.user_id, name, input, userMessage.id);
+          if (name === "share_chat_attachment") {
+            const attachmentId = getSharedAttachmentId(toolResult);
+            if (!attachmentId) throw new Error("The attachment share action returned an invalid reference.");
+            sharedAttachmentIds.add(attachmentId);
+          }
+          return toolResult;
         }
         if (name === "search_web") {
+          if (profile?.web_search_enabled === false) {
+            throw new Error("Web search is disabled in General settings.");
+          }
           const query =
             typeof input === "object" &&
             input !== null &&
@@ -536,6 +548,22 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
   if (completeError) throw new Error(`Could not save Cheya's response: ${completeError.message}`);
   const savedResponse = savedResponses[0] as StoredChatMessage | undefined;
   if (!savedResponse) throw new Error("The database did not return the saved response.");
+
+  try {
+    await linkChatAttachments(
+      client,
+      job.user_id,
+      accountProfile.role,
+      savedResponse.id,
+      [...sharedAttachmentIds],
+    );
+  } catch (error) {
+    warnings.push(
+      `The AI response was saved, but its shared attachments could not be linked: ${
+        error instanceof Error ? error.message : "Unknown database error."
+      }`,
+    );
+  }
 
   for (const attempt of attempts) {
     try {

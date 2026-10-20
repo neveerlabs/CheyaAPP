@@ -30,6 +30,10 @@ CheyaVerse uses one operator-managed Supabase project for Google and GitHub auth
 application data. Users do not create or connect their own Supabase or OAuth projects. Row Level
 Security isolates each account's chats, Gemini API keys, personalization, memories, feedback, and
 insights.
+The Settings **General** page stores desktop/mobile Enter behavior independently, time display,
+chat font size, and web-search availability in that account's `user_settings` row. Defaults preserve
+the existing device-specific Enter behavior, current time format, current chat text sizes, and
+enabled web search. Push subscriptions remain registered per account and device.
 
 ### One-time operator setup
 
@@ -164,6 +168,11 @@ use WIB (Asia/Jakarta), and recurring intervals support minutes, hours, days, we
 years. Reminders appear as non-regenerable assistant messages in chat and are also sent as Web Push.
 The notification bell in the chat header opens the account inbox. Devices without push permission
 show an enable-notifications banner below the chat header; each device must enable it separately.
+When explicitly asked to resend a file or media uploaded within 24 hours, Cheya can reference the
+original upload in an assistant reply. Administrators can similarly reference another account's
+unexpired upload in their own chat. These are database links to the private original object, not
+new uploads or storage copies; expired or deleted files cannot be shared, and previews remain
+short-lived and role-checked.
 Push notifications are suppressed while any recent account session is active in the chat, and are
 sent to every registered device for that account only when the recipient is away from chat. This
 applies to assistant replies, reminders, account messages, relayed messages, and explicit AI push

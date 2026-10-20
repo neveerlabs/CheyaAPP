@@ -21,9 +21,11 @@ import {
   SlidersHorizontal,
   Trash2,
   UserRound,
+  X,
 } from "lucide-react";
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type FormEvent } from "react";
 import { LegalPageContent } from "./LegalPage";
+import { ActionToast } from "./components/ActionToast";
 import {
   clearAccountSessionId,
   getAccountSessionId,
@@ -41,6 +43,7 @@ import {
 } from "./lib/gemini-tts";
 import {
   DEFAULT_PERSONALIZATION,
+  DEFAULT_GENERAL_SETTINGS,
   DEFAULT_GEMINI_TTS_SETTINGS,
   ensureSupabaseSession,
   MULTIMODAL_GEMINI_MODELS,
@@ -56,6 +59,7 @@ import {
   type GeminiApiKey,
   type GeminiModel,
   type PersonalizationSettings,
+  type GeneralSettings,
   type UserMemory,
 } from "./lib/supabase";
 import { subscribeWithReconnect } from "./lib/realtime";
@@ -72,6 +76,7 @@ interface SettingsPageProps {
   githubUsername: string | null;
   accountRole: AccountRole;
   onGeminiKeyChange: (isConfigured: boolean) => void;
+  onGeneralSettingsChange: (settings: GeneralSettings) => void;
 }
 
 function getErrorMessage(error: unknown): string {
@@ -90,14 +95,114 @@ function statusStyle(status: ApiStatus): string {
   return "bg-[#f1f2f4] text-[#686b72]";
 }
 
-function formatAccountDateTime(value: string): string {
+function formatAccountDateTime(
+  value: string,
+  timeFormat: GeneralSettings["time_format"] = DEFAULT_GENERAL_SETTINGS.time_format,
+): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime())
     ? value
     : new Intl.DateTimeFormat(undefined, {
         dateStyle: "medium",
         timeStyle: "short",
+        ...(timeFormat === "12h" ? { hourCycle: "h12" as const } : {}),
+        ...(timeFormat === "24h" ? { hourCycle: "h23" as const } : {}),
       }).format(date);
+}
+
+function SettingsDropdown<T extends string>({
+  label,
+  value,
+  options,
+  onChange,
+  disabled,
+}: {
+  label: string;
+  value: T;
+  options: Array<{ value: T; label: string; description?: string }>;
+  onChange: (value: T) => void;
+  disabled: boolean;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const pickerRef = useRef<HTMLDivElement>(null);
+  const selectedOption = options.find((option) => option.value === value);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (!pickerRef.current?.contains(event.target as Node)) setIsOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setIsOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideClick);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [isOpen]);
+
+  return (
+    <div ref={pickerRef} className="relative w-full">
+      <button
+        type="button"
+        aria-label={label}
+        aria-haspopup="listbox"
+        aria-expanded={isOpen}
+        disabled={disabled}
+        onClick={() => setIsOpen((open) => !open)}
+        className="flex min-h-12 w-full items-center justify-between gap-3 rounded-xl border border-[#e1e3e7] bg-white px-3.5 py-2.5 text-left transition hover:border-[#c9c4dc] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a89bdf] disabled:opacity-60"
+      >
+        <span className="min-w-0">
+          <span className="block text-sm font-medium text-[#292a30]">
+            {selectedOption?.label ?? value}
+          </span>
+          {selectedOption?.description && (
+            <span className="block text-xs text-[#858890]">{selectedOption.description}</span>
+          )}
+        </span>
+        <ChevronDown
+          aria-hidden="true"
+          className={`size-4 shrink-0 text-[#777a81] transition-transform ${isOpen ? "rotate-180" : ""}`}
+        />
+      </button>
+      {isOpen && (
+        <div
+          role="listbox"
+          aria-label={label}
+          className="absolute inset-x-0 top-[calc(100%+0.4rem)] z-30 max-h-64 overflow-y-auto rounded-xl border border-[#e6e7eb] bg-white p-1.5 shadow-[0_12px_32px_rgba(30,25,50,0.14)]"
+        >
+          {options.map((option) => {
+            const isSelected = value === option.value;
+            return (
+              <button
+                key={option.value}
+                type="button"
+                role="option"
+                aria-selected={isSelected}
+                onClick={() => {
+                  onChange(option.value);
+                  setIsOpen(false);
+                }}
+                className={`flex min-h-11 w-full items-center justify-between gap-3 rounded-lg px-2.5 py-2 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a89bdf] ${
+                  isSelected ? "bg-[#f5f3fc]" : "hover:bg-[#f7f8fa]"
+                }`}
+              >
+                <span className="min-w-0">
+                  <span className="block text-sm font-medium text-[#292a30]">{option.label}</span>
+                  {option.description && (
+                    <span className="block text-xs text-[#858890]">{option.description}</span>
+                  )}
+                </span>
+                {isSelected && <Check aria-hidden="true" className="size-4 shrink-0 text-[#7864c6]" />}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function reminderRepeatLabel(unit: NonNullable<AiReminder["repeat_unit"]>): string {
@@ -141,6 +246,7 @@ function formatSessionElapsed(lastSeenAt: string, now: number): string {
 
 type SettingsSection =
   | "home"
+  | "general"
   | "personal"
   | "configure"
   | "memory"
@@ -155,6 +261,12 @@ const settingsSections: Array<{
   description: string;
   icon: typeof UserRound;
 }> = [
+  {
+    id: "general",
+    label: "General",
+    description: "Chat behavior, notifications, appearance, and search",
+    icon: SlidersHorizontal,
+  },
   {
     id: "personal",
     label: "Personal",
@@ -215,6 +327,7 @@ export function SettingsPage({
   githubUsername,
   accountRole,
   onGeminiKeyChange,
+  onGeneralSettingsChange,
 }: SettingsPageProps) {
   const [activeSection, setActiveSection] = useState(() => sectionFromPath(pathname));
   const [isDatabaseReady, setIsDatabaseReady] = useState(false);
@@ -222,6 +335,8 @@ export function SettingsPage({
   const [apiKeys, setApiKeys] = useState<GeminiApiKey[]>([]);
   const [personalization, setPersonalization] =
     useState<PersonalizationSettings>(DEFAULT_PERSONALIZATION);
+  const [generalSettings, setGeneralSettings] = useState<GeneralSettings>(DEFAULT_GENERAL_SETTINGS);
+  const [enterKeyTarget, setEnterKeyTarget] = useState<"desktop" | "mobile" | "both">("both");
   const [ttsApiKeys, setTtsApiKeys] = useState(DEFAULT_GEMINI_TTS_SETTINGS.tts_api_keys);
   const [ttsVoice, setTtsVoice] = useState<GeminiTtsVoice>(DEFAULT_GEMINI_TTS_VOICE);
   const [isTtsVoiceMenuOpen, setIsTtsVoiceMenuOpen] = useState(false);
@@ -232,6 +347,7 @@ export function SettingsPage({
   const [newApiKey, setNewApiKey] = useState("");
   const [isHelpOpen, setIsHelpOpen] = useState(false);
   const [isSavingPersonalization, setIsSavingPersonalization] = useState(false);
+  const [isSavingGeneralSetting, setIsSavingGeneralSetting] = useState(false);
   const [isSavingTtsSettings, setIsSavingTtsSettings] = useState(false);
   const [isTestingTtsApi, setIsTestingTtsApi] = useState(false);
   const [isLoadingKeys, setIsLoadingKeys] = useState(false);
@@ -316,6 +432,7 @@ export function SettingsPage({
     setActiveSection(sectionFromPath(pathname));
     setErrorMessage("");
     setNotice("");
+    setMessageNotice("");
     if (settingsContentRef.current) settingsContentRef.current.scrollTop = 0;
   }, [pathname]);
 
@@ -493,11 +610,32 @@ export function SettingsPage({
     const refreshPersonalization = async () => {
       const { data, error } = await client
         .from("user_settings")
-        .select("display_name, custom_prompt, chat_style, tts_api_key, tts_api_keys, tts_voice")
+        .select("display_name, custom_prompt, chat_style, tts_api_key, tts_api_keys, tts_voice, enter_key_behavior_desktop, enter_key_behavior_mobile, time_format, font_size, web_search_enabled")
         .eq("user_id", accountUserId)
         .maybeSingle();
       if (error) throw error;
       if (!isMounted) return;
+      const savedGeneralSettings: GeneralSettings = {
+        enter_key_behavior_desktop:
+          data?.enter_key_behavior_desktop === "newline" || data?.enter_key_behavior_desktop === "submit"
+            ? data.enter_key_behavior_desktop
+            : "system",
+        enter_key_behavior_mobile:
+          data?.enter_key_behavior_mobile === "newline" || data?.enter_key_behavior_mobile === "submit"
+            ? data.enter_key_behavior_mobile
+            : "system",
+        time_format:
+          data?.time_format === "12h" || data?.time_format === "24h"
+            ? data.time_format
+            : "system",
+        font_size:
+          typeof data?.font_size === "number" && Number.isFinite(data.font_size)
+            ? Math.min(20, Math.max(12, data.font_size))
+            : 14,
+        web_search_enabled: data?.web_search_enabled !== false,
+      };
+      setGeneralSettings(savedGeneralSettings);
+      onGeneralSettingsChange(savedGeneralSettings);
       if (!personalizationDraftDirtyRef.current) {
         setPersonalization({
           display_name: data?.display_name ?? DEFAULT_PERSONALIZATION.display_name,
@@ -594,7 +732,7 @@ export function SettingsPage({
       isMounted = false;
       stopRealtime();
     };
-  }, [accountUserId, client, isDatabaseReady]);
+  }, [accountUserId, client, isDatabaseReady, onGeneralSettingsChange]);
 
   useEffect(() => {
     if (!client || !isDatabaseReady) {
@@ -658,7 +796,7 @@ export function SettingsPage({
 
         const { data, error } = await client
           .from("user_settings")
-          .select("display_name, custom_prompt, chat_style, tts_api_key, tts_api_keys, tts_voice")
+          .select("display_name, custom_prompt, chat_style, tts_api_key, tts_api_keys, tts_voice, enter_key_behavior_desktop, enter_key_behavior_mobile, time_format, font_size, web_search_enabled")
           .eq("user_id", userData.user.id)
           .maybeSingle();
         if (error) {
@@ -667,6 +805,27 @@ export function SettingsPage({
           );
         }
         if (isMounted && data) {
+          const savedGeneralSettings: GeneralSettings = {
+            enter_key_behavior_desktop:
+              data.enter_key_behavior_desktop === "newline" || data.enter_key_behavior_desktop === "submit"
+                ? data.enter_key_behavior_desktop
+                : "system",
+            enter_key_behavior_mobile:
+              data.enter_key_behavior_mobile === "newline" || data.enter_key_behavior_mobile === "submit"
+                ? data.enter_key_behavior_mobile
+                : "system",
+            time_format:
+              data.time_format === "12h" || data.time_format === "24h"
+                ? data.time_format
+                : "system",
+            font_size:
+              typeof data.font_size === "number" && Number.isFinite(data.font_size)
+                ? Math.min(20, Math.max(12, data.font_size))
+                : 14,
+            web_search_enabled: data.web_search_enabled !== false,
+          };
+          setGeneralSettings(savedGeneralSettings);
+          onGeneralSettingsChange(savedGeneralSettings);
           setPersonalization({
             display_name: data.display_name,
             custom_prompt: data.custom_prompt,
@@ -686,6 +845,8 @@ export function SettingsPage({
             isGeminiTtsVoice(data.tts_voice) ? data.tts_voice : DEFAULT_GEMINI_TTS_VOICE,
           );
         } else if (isMounted) {
+          setGeneralSettings(DEFAULT_GENERAL_SETTINGS);
+          onGeneralSettingsChange(DEFAULT_GENERAL_SETTINGS);
           setTtsApiKeys(DEFAULT_GEMINI_TTS_SETTINGS.tts_api_keys);
           setTtsVoice(DEFAULT_GEMINI_TTS_SETTINGS.tts_voice);
         }
@@ -703,7 +864,7 @@ export function SettingsPage({
     return () => {
       isMounted = false;
     };
-  }, [client, isDatabaseReady]);
+  }, [client, isDatabaseReady, onGeneralSettingsChange]);
 
   useEffect(
     () => () => {
@@ -737,9 +898,113 @@ export function SettingsPage({
     if (settingsContentRef.current) settingsContentRef.current.scrollTop = 0;
   }, []);
 
+  useEffect(() => {
+    if (activeSection !== "general" || !isDatabaseReady) return;
+    let isMounted = true;
+    if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
+      setPushEnabledForDevice(false);
+      return;
+    }
+    void navigator.serviceWorker
+      .getRegistration()
+      .then((registration) => registration?.pushManager.getSubscription() ?? null)
+      .then((subscription) => {
+        if (isMounted) setPushEnabledForDevice(subscription !== null);
+      })
+      .catch((error: unknown) => {
+        if (isMounted) {
+          setMessageError(`Could not check this device's notification setting: ${getErrorMessage(error)}`);
+        }
+      });
+    return () => {
+      isMounted = false;
+    };
+  }, [activeSection, isDatabaseReady, pathname]);
+
   function clearMessages() {
     setErrorMessage("");
     setNotice("");
+    setPersonalizationError("");
+    setAccountSessionsError("");
+    setMessageError("");
+    setMessageNotice("");
+  }
+
+  async function saveGeneralSetting<K extends keyof GeneralSettings>(
+    key: K,
+    value: GeneralSettings[K],
+  ) {
+    if (!isDatabaseReady || isSavingGeneralSetting) return;
+    setIsSavingGeneralSetting(true);
+    setErrorMessage("");
+    setNotice("");
+    try {
+      const patch: Partial<GeneralSettings> = { [key]: value };
+      const { data, error } = await client
+        .from("user_settings")
+        .update(patch)
+        .eq("user_id", accountUserId)
+        .select("user_id");
+      if (error) throw error;
+      if (data.length === 0) {
+        const { error: insertError } = await client
+          .from("user_settings")
+          .insert({ user_id: accountUserId, ...patch });
+        if (insertError) throw insertError;
+      }
+      const updatedSettings = { ...generalSettings, [key]: value };
+      setGeneralSettings(updatedSettings);
+      onGeneralSettingsChange(updatedSettings);
+      setNotice("General setting saved to your account.");
+    } catch (error) {
+      setErrorMessage(
+        `Could not save this General setting. Apply the latest supabase/schema.sql. ${getErrorMessage(error)}`,
+      );
+    } finally {
+      setIsSavingGeneralSetting(false);
+    }
+  }
+
+  async function saveEnterKeyBehavior(
+    behavior: GeneralSettings["enter_key_behavior_desktop"],
+  ) {
+    if (!isDatabaseReady || isSavingGeneralSetting) return;
+    const patch: Partial<GeneralSettings> =
+      enterKeyTarget === "both"
+        ? {
+            enter_key_behavior_desktop: behavior,
+            enter_key_behavior_mobile: behavior,
+          }
+        : enterKeyTarget === "desktop"
+          ? { enter_key_behavior_desktop: behavior }
+          : { enter_key_behavior_mobile: behavior };
+    setIsSavingGeneralSetting(true);
+    setErrorMessage("");
+    setNotice("");
+    try {
+      const { data, error } = await client
+        .from("user_settings")
+        .update(patch)
+        .eq("user_id", accountUserId)
+        .select("user_id");
+      if (error) throw error;
+      if (data.length === 0) {
+        const { error: insertError } = await client
+          .from("user_settings")
+          .insert({ user_id: accountUserId, ...patch });
+        if (insertError) throw insertError;
+      }
+      const updatedSettings = { ...generalSettings, ...patch };
+      setGeneralSettings(updatedSettings);
+      onGeneralSettingsChange(updatedSettings);
+      setNotice("Enter key behavior saved to your account.");
+    } catch (error) {
+      setErrorMessage(
+        `Could not save Enter key behavior. Apply the latest supabase/schema.sql. ${getErrorMessage(error)}`,
+      );
+    } finally {
+      setIsSavingGeneralSetting(false);
+    }
   }
 
   async function savePersonalization(event: FormEvent<HTMLFormElement>) {
@@ -1439,6 +1704,51 @@ export function SettingsPage({
     }
   }
 
+  const feedbackPanels = [
+    {
+      id: "saving",
+      message:
+        isSavingPersonalization ||
+        isSavingGeneralSetting ||
+        isSavingTtsSettings ||
+        isSavingMemory
+          ? "Saving your changes…"
+          : "",
+      isError: false,
+      isLoading: true,
+      dismiss: () => {},
+    },
+    {
+      id: "error",
+      message: isDeleteAccountDialogOpen
+        ? ""
+        : personalizationError || errorMessage || databaseSessionError,
+      isError: true,
+      isLoading: false,
+      dismiss: () => {
+        setPersonalizationError("");
+        setErrorMessage("");
+        setDatabaseSessionError("");
+      },
+    },
+    {
+      id: "account-sessions",
+      message: accountSessionsError,
+      isError: true,
+      isLoading: false,
+      dismiss: () => setAccountSessionsError(""),
+    },
+    {
+      id: "messages-error",
+      message: messageError,
+      isError: true,
+      isLoading: false,
+      dismiss: () => setMessageError(""),
+    },
+  ].filter((panel, index, panels) =>
+    panel.message && panels.findIndex((item) => item.message === panel.message) === index,
+  );
+
   return (
     <main className="fixed inset-0 flex justify-center bg-[#f5f6f8]">
       <section
@@ -1501,7 +1811,13 @@ export function SettingsPage({
         </aside>
 
         <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-        <header className="absolute inset-x-0 top-0 z-20 flex h-[68px] shrink-0 items-center gap-2 border-0 bg-transparent px-1 shadow-none sm:px-4 lg:px-7">
+        <header
+          className={`absolute inset-x-0 top-0 z-20 flex h-[68px] shrink-0 items-center gap-2 border-0 bg-transparent shadow-none ${
+            activeSection === "home"
+              ? "px-3 pr-[22px] sm:px-5 sm:pr-[29px]"
+              : "px-3 pr-[22px] sm:px-6 sm:pr-[34px] lg:px-6 lg:pr-[34px]"
+          }`}
+        >
           <button
             type="button"
             aria-label={activeSection === "home" ? "Back to chat" : "Back to settings"}
@@ -1571,6 +1887,43 @@ export function SettingsPage({
               : "px-3 sm:px-6 lg:px-6"
           }`}
         >
+          {feedbackPanels.length > 0 && (
+            <div aria-live="polite" className="sticky top-0 z-10 space-y-2 bg-[#f5f6f8] pb-2">
+              {feedbackPanels.map((panel) => (
+                <section
+                  key={panel.id}
+                  role={panel.isError ? "alert" : "status"}
+                  className={`flex min-h-11 items-center gap-2 rounded-2xl border px-3 py-2 shadow-sm ${
+                    panel.isLoading
+                      ? "border-[#e1e3e8] bg-white text-[#55575e]"
+                      : panel.isError
+                        ? "border-red-100 bg-white text-red-800"
+                        : "border-[#dce9df] bg-white text-emerald-800"
+                  }`}
+                >
+                  {panel.isLoading ? (
+                    <LoaderCircle aria-hidden="true" className="size-4 shrink-0 animate-spin" />
+                  ) : panel.isError ? (
+                    <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
+                  ) : (
+                    <Check aria-hidden="true" className="size-4 shrink-0" />
+                  )}
+                  <p className="min-w-0 flex-1 whitespace-pre-line text-xs leading-5">{panel.message}</p>
+                  {!panel.isLoading && (
+                    <button
+                      type="button"
+                      aria-label="Dismiss notification"
+                      onClick={panel.dismiss}
+                      className="flex size-7 shrink-0 items-center justify-center rounded-lg text-[#858890] transition hover:bg-[#f1f2f4] hover:text-[#34363b]"
+                    >
+                      <X aria-hidden="true" className="size-4" />
+                    </button>
+                  )}
+                </section>
+              ))}
+            </div>
+          )}
+
           {activeSection === "home" && (
             <>
             <nav aria-label="Settings pages" className="flex flex-col gap-3 pt-2">
@@ -1596,6 +1949,232 @@ export function SettingsPage({
             </>
           )}
 
+          {activeSection === "general" && (
+            <section aria-labelledby="general-settings-title" className="space-y-5 py-2 sm:py-3">
+              <div>
+                <h2 id="general-settings-title" className="font-semibold text-[#202126]">General</h2>
+                <p className="mt-1 text-sm leading-5 text-[#777a81]">
+                  Set how CheyaAPP behaves on this account. Changes are saved automatically.
+                </p>
+              </div>
+
+              <div className="divide-y divide-[#eceef1] overflow-hidden rounded-2xl border border-[#e2e4e8] bg-white px-4">
+                <div className="space-y-3 py-4">
+                  <div>
+                    <h3 className="text-sm font-medium text-[#292a30]">Enter key behavior</h3>
+                    <p className="mt-1 text-xs leading-5 text-[#777a81]">
+                      Configure desktop and mobile separately, or apply one behavior to both.
+                    </p>
+                  </div>
+                  <div className="grid grid-cols-3 gap-1 rounded-xl bg-[#f1f2f4] p-1" role="group" aria-label="Devices to configure">
+                    {([
+                      ["desktop", "Desktop"],
+                      ["mobile", "Mobile"],
+                      ["both", "Both"],
+                    ] as const).map(([target, label]) => (
+                      <button
+                        key={target}
+                        type="button"
+                        aria-pressed={enterKeyTarget === target}
+                        onClick={() => setEnterKeyTarget(target)}
+                        className={`h-9 rounded-lg px-2 text-xs font-medium transition ${
+                          enterKeyTarget === target
+                            ? "bg-white text-[#292a30] shadow-sm"
+                            : "text-[#777a81] hover:text-[#292a30]"
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                  {enterKeyTarget === "both" &&
+                    generalSettings.enter_key_behavior_desktop !==
+                      generalSettings.enter_key_behavior_mobile && (
+                      <p className="text-xs text-[#805d1b]">
+                        Desktop and mobile currently differ. Selecting an option applies it to both.
+                      </p>
+                    )}
+                  <SettingsDropdown
+                    label="Enter key action"
+                    value={
+                      enterKeyTarget === "both" &&
+                      generalSettings.enter_key_behavior_desktop !==
+                        generalSettings.enter_key_behavior_mobile
+                        ? "mixed"
+                        : enterKeyTarget === "mobile"
+                          ? generalSettings.enter_key_behavior_mobile
+                          : generalSettings.enter_key_behavior_desktop
+                    }
+                    disabled={!isDatabaseReady || isSavingGeneralSetting}
+                    options={[
+                      ...(enterKeyTarget === "both" &&
+                      generalSettings.enter_key_behavior_desktop !==
+                        generalSettings.enter_key_behavior_mobile
+                        ? [{
+                            value: "mixed",
+                            label: "Different per device",
+                            description: "Choose an action below to apply the same behavior to both.",
+                          }]
+                        : []),
+                      {
+                        value: "system" as const,
+                        label: "Device default",
+                        description: "Enter sends on desktop and adds a line on mobile.",
+                      },
+                      { value: "submit" as const, label: "Enter sends" },
+                      { value: "newline" as const, label: "Enter adds a line" },
+                    ]}
+                    onChange={(value) => {
+                      if (value === "system" || value === "submit" || value === "newline") {
+                        void saveEnterKeyBehavior(value);
+                      }
+                    }}
+                  />
+                </div>
+
+                <div className="flex min-h-[72px] items-center justify-between gap-4 py-3">
+                  <span className="min-w-0">
+                    <span className="block text-sm font-medium text-[#292a30]">Notifications</span>
+                    <span className="mt-1 block text-xs leading-5 text-[#777a81]">
+                      Push notifications are registered per device and delivered to this account.
+                    </span>
+                  </span>
+                  <button
+                    type="button"
+                    disabled={!isDatabaseReady || isChangingPushSubscription}
+                    onClick={() => void togglePushNotifications()}
+                    className={`h-9 shrink-0 rounded-lg px-3 text-xs font-medium transition disabled:opacity-60 ${
+                      pushEnabledForDevice
+                        ? "border border-[#e1e3e7] bg-white text-[#55575e] hover:bg-[#f7f8fa]"
+                        : "bg-[#26272c] text-white hover:bg-[#3a3b41]"
+                    }`}
+                  >
+                    {isChangingPushSubscription
+                      ? "Updating…"
+                      : pushEnabledForDevice
+                        ? "Turn off"
+                        : "Turn on"}
+                  </button>
+                  {typeof Notification !== "undefined" && Notification.permission === "denied" && (
+                    <span className="sr-only">
+                      Notifications are blocked by the browser. Allow them in browser settings, then try again.
+                    </span>
+                  )}
+                </div>
+
+                <div className="space-y-3 py-4">
+                  <div>
+                    <h3 className="text-sm font-medium text-[#292a30]">Time format</h3>
+                    <p className="mt-1 text-xs leading-5 text-[#777a81]">
+                      Choose how times appear in chat and account panels.
+                    </p>
+                  </div>
+                  <SettingsDropdown
+                    label="Time format"
+                    value={generalSettings.time_format}
+                    disabled={!isDatabaseReady || isSavingGeneralSetting}
+                    options={[
+                      { value: "system", label: "Device default" },
+                      { value: "12h", label: "12-hour" },
+                      { value: "24h", label: "24-hour" },
+                    ]}
+                    onChange={(value) => void saveGeneralSetting("time_format", value)}
+                  />
+                </div>
+
+                <div className="space-y-3 py-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <span>
+                      <span className="block text-sm font-medium text-[#292a30]">Chat font size</span>
+                      <span className="mt-1 block text-xs leading-5 text-[#777a81]">
+                        Drag the slider to preview the actual chat text.
+                      </span>
+                    </span>
+                  </div>
+                  <div
+                    aria-label="Chat font preview"
+                    className="space-y-2 rounded-xl border border-[#e8e9ed] bg-[#f7f8fa] p-3"
+                  >
+                    <div
+                      className="ml-auto w-fit max-w-[84%] rounded-[16px] rounded-br-md bg-[#28292e] px-3 py-2 leading-[1.4] text-white"
+                      style={{ fontSize: generalSettings.font_size }}
+                    >
+                      Hey, can you help me plan my day?
+                    </div>
+                    <div
+                      className="max-w-[90%] leading-[1.55] text-[#34363b]"
+                      style={{ fontSize: generalSettings.font_size }}
+                    >
+                      Absolutely. Tell me what you need to get done, and we can organize it together.
+                    </div>
+                  </div>
+                  <div className="relative pb-1 pt-6">
+                    <input
+                      aria-label="Chat font size"
+                      aria-valuetext={`${generalSettings.font_size}px`}
+                      type="range"
+                      min={12}
+                      max={20}
+                      step={1}
+                      value={generalSettings.font_size}
+                      disabled={!isDatabaseReady || isSavingGeneralSetting}
+                      style={{
+                        "--range-progress": `${((generalSettings.font_size - 12) / 8) * 100}%`,
+                      } as CSSProperties}
+                      onChange={(event) => {
+                        const fontSize = Number(event.target.value);
+                        const updatedSettings = { ...generalSettings, font_size: fontSize };
+                        setGeneralSettings(updatedSettings);
+                        onGeneralSettingsChange(updatedSettings);
+                      }}
+                      onPointerUp={(event) => {
+                        void saveGeneralSetting("font_size", Number(event.currentTarget.value));
+                      }}
+                      onKeyUp={(event) =>
+                        void saveGeneralSetting("font_size", Number(event.currentTarget.value))
+                      }
+                      className="font-size-slider h-5 w-full cursor-grab active:cursor-grabbing disabled:cursor-not-allowed"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex min-h-[72px] items-center justify-between gap-4 py-3">
+                  <span className="min-w-0">
+                    <span className="block text-sm font-medium text-[#292a30]">Web search</span>
+                    <span className="mt-1 block text-xs leading-5 text-[#777a81]">
+                      Let Cheya search current information and cite sources when needed.
+                    </span>
+                  </span>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-label="Web search"
+                    aria-checked={generalSettings.web_search_enabled}
+                    disabled={!isDatabaseReady || isSavingGeneralSetting}
+                    onClick={() =>
+                      void saveGeneralSetting(
+                        "web_search_enabled",
+                        !generalSettings.web_search_enabled,
+                      )
+                    }
+                    className={`relative flex h-7 w-12 shrink-0 items-center rounded-full p-1 transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a89bdf] disabled:opacity-60 ${
+                      generalSettings.web_search_enabled ? "bg-[#6554a4]" : "bg-[#c8cbd1]"
+                    }`}
+                  >
+                    <span
+                      className={`size-5 rounded-full bg-white shadow-sm transition-transform ${
+                        generalSettings.web_search_enabled ? "translate-x-5" : "translate-x-0"
+                      }`}
+                    />
+                  </button>
+                </div>
+              </div>
+              {!isDatabaseReady && (
+                <p className="text-xs text-[#858890]">Connecting to your account settings…</p>
+              )}
+            </section>
+          )}
+
           {activeSection === "personal" && (
             <section
               aria-labelledby="personal-settings-title"
@@ -1609,24 +2188,6 @@ export function SettingsPage({
                   Set how CheyaVerse addresses you and responds in chat.
                 </p>
               </div>
-              {(personalizationError || errorMessage) && (
-                <div
-                  role="alert"
-                  className="mb-4 flex items-start gap-2 rounded-2xl border border-red-100 bg-red-50 px-3.5 py-3 text-sm text-red-800"
-                >
-                  <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
-                  <p className="whitespace-pre-line">{personalizationError || errorMessage}</p>
-                </div>
-              )}
-              {notice && (
-                <div
-                  role="status"
-                  className="mb-4 flex items-start gap-2 rounded-2xl border border-emerald-100 bg-emerald-50 px-3.5 py-3 text-sm text-emerald-800"
-                >
-                  <Check aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
-                  <p>{notice}</p>
-                </div>
-              )}
               {isLoadingPersonalization ? (
                 <div
                   role="status"
@@ -1705,9 +2266,6 @@ export function SettingsPage({
                     }
                     className="flex h-10 w-full items-center justify-center gap-2 rounded-xl bg-[#26272c] px-4 text-sm font-medium text-white transition hover:bg-[#3a3b41] disabled:opacity-60"
                   >
-                    {isSavingPersonalization && (
-                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                    )}
                     Save personal settings
                   </button>
                 </form>
@@ -1722,40 +2280,8 @@ export function SettingsPage({
                   Messages and reminders
                 </h2>
                 <p className="mt-1 text-sm leading-5 text-[#777a81]">
-                  Read messages for this account, manage reminders, and configure this device's notifications.
+                  Read messages for this account and manage reminders.
                 </p>
-              </div>
-
-              {messageError && (
-                <div role="alert" className="rounded-2xl border border-red-100 bg-red-50 px-3.5 py-3 text-sm text-red-800">
-                  {messageError}
-                </div>
-              )}
-              {messageNotice && (
-                <div role="status" className="rounded-2xl border border-emerald-100 bg-emerald-50 px-3.5 py-3 text-sm text-emerald-800">
-                  {messageNotice}
-                </div>
-              )}
-
-              <div className="rounded-2xl border border-[#e2e4e8] bg-white p-4">
-                <h3 className="text-sm font-semibold text-[#292a30]">Push notifications</h3>
-                <p className="mt-1 text-sm leading-5 text-[#777a81]">
-                  Reminders can notify this device even while CheyaVerse is closed. Enable notifications on each device you want to receive them on.
-                </p>
-                <button
-                  type="button"
-                  disabled={!isDatabaseReady || isChangingPushSubscription}
-                  onClick={() => void togglePushNotifications()}
-                  className="mt-3 inline-flex h-10 items-center gap-2 rounded-xl bg-[#26272c] px-4 text-sm font-medium text-white transition hover:bg-[#3a3b41] disabled:opacity-60"
-                >
-                  {isChangingPushSubscription && <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />}
-                  {pushEnabledForDevice ? "Turn off on this device" : "Enable on this device"}
-                </button>
-                {typeof Notification !== "undefined" && Notification.permission === "denied" && (
-                  <p className="mt-2 text-xs leading-5 text-amber-800">
-                    Notifications are blocked by the browser. Allow them in browser settings, then try again.
-                  </p>
-                )}
               </div>
 
               <div>
@@ -1787,7 +2313,7 @@ export function SettingsPage({
                         <span className="flex items-center justify-between gap-2">
                           <span className="text-sm font-semibold text-[#292a30]">{item.title}</span>
                           <span className="text-[11px] text-[#858890]">
-                            {formatAccountDateTime(item.created_at)}
+                            {formatAccountDateTime(item.created_at, generalSettings.time_format)}
                           </span>
                         </span>
                         <span className="mt-1 block whitespace-pre-wrap break-words text-sm leading-5 text-[#55575e]">
@@ -1816,6 +2342,8 @@ export function SettingsPage({
                               dateStyle: "full",
                               timeStyle: "short",
                               timeZone: "Asia/Jakarta",
+                              ...(generalSettings.time_format === "12h" ? { hourCycle: "h12" as const } : {}),
+                              ...(generalSettings.time_format === "24h" ? { hourCycle: "h23" as const } : {}),
                             }).format(new Date(reminder.next_run_at))} WIB
                             {reminder.repeat_every !== null && reminder.repeat_unit !== null &&
                               ` · setiap ${reminder.repeat_every} ${reminderRepeatLabel(reminder.repeat_unit)}`}
@@ -1849,7 +2377,7 @@ export function SettingsPage({
                           return (
                             <article key={message.id} className="rounded-2xl border border-[#e2e4e8] bg-white px-4 py-3">
                               <p className="text-[11px] text-[#858890]">
-                                From {message.sender_user_id} · {formatAccountDateTime(message.created_at)}
+                                From {message.sender_user_id} · {formatAccountDateTime(message.created_at, generalSettings.time_format)}
                               </p>
                               <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-5 text-[#34363b]">{message.body}</p>
                               {message.attachment_id && (
@@ -1897,7 +2425,7 @@ export function SettingsPage({
                               {request.all_accounts
                                 ? "All accounts except the sender"
                                 : `${request.recipient_user_ids.length} selected account${request.recipient_user_ids.length === 1 ? "" : "s"}`}
-                              {" · "}{formatAccountDateTime(request.created_at)}
+                              {" · "}{formatAccountDateTime(request.created_at, generalSettings.time_format)}
                             </p>
                             <div className="mt-3 flex justify-end gap-2">
                               <button
@@ -1935,16 +2463,6 @@ export function SettingsPage({
                   Review your account, workspace, and all recorded sessions.
                 </p>
               </div>
-              {errorMessage && (
-                <div role="alert" className="rounded-2xl bg-red-50 px-3.5 py-3 text-sm text-red-800">
-                  {errorMessage}
-                </div>
-              )}
-              {notice && (
-                <div role="status" className="rounded-2xl bg-emerald-50 px-3.5 py-3 text-sm text-emerald-800">
-                  {notice}
-                </div>
-              )}
               <div className="divide-y divide-[#eceef1] rounded-2xl border border-[#e2e4e8] bg-white px-4">
                 <div className="flex min-h-16 items-center justify-between gap-4 py-3">
                   <span className="text-sm text-[#777a81]">
@@ -2015,11 +2533,7 @@ export function SettingsPage({
                     </button>
                   </div>
                 </div>
-                {accountSessionsError ? (
-                  <p role="alert" className="rounded-xl bg-red-50 px-3.5 py-3 text-sm leading-5 text-red-800">
-                    {accountSessionsError}
-                  </p>
-                ) : accountSessions.length === 0 && !isLoadingAccountSessions ? (
+                {accountSessionsError ? null : accountSessions.length === 0 && !isLoadingAccountSessions ? (
                   <p className="rounded-xl bg-[#f7f8fa] px-3.5 py-3 text-sm text-[#777a81]">
                     No account sessions were found.
                   </p>
@@ -2074,9 +2588,9 @@ export function SettingsPage({
                               <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] leading-4 text-[#858890]">
                                 <span className="inline-flex items-center gap-1">
                                   <Clock3 aria-hidden="true" className="size-3" />
-                                  Started {formatAccountDateTime(session.started_at)}
+                                  Started {formatAccountDateTime(session.started_at, generalSettings.time_format)}
                                 </span>
-                                <span>Last seen {formatAccountDateTime(session.last_seen_at)}</span>
+                                <span>Last seen {formatAccountDateTime(session.last_seen_at, generalSettings.time_format)}</span>
                               </div>
                               <details className="mt-2">
                                 <summary className="cursor-pointer text-[11px] font-medium text-[#777a81]">
@@ -2178,25 +2692,6 @@ export function SettingsPage({
 
           {activeSection === "configure" && (
             <>
-          {errorMessage && (
-            <div
-              role="alert"
-              className="flex items-start gap-2 rounded-2xl border border-red-100 bg-red-50 px-3.5 py-3 text-sm text-red-800"
-            >
-              <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
-              <p className="whitespace-pre-line">{errorMessage}</p>
-            </div>
-          )}
-          {notice && (
-            <div
-              role="status"
-              className="flex items-start gap-2 rounded-2xl border border-emerald-100 bg-emerald-50 px-3.5 py-3 text-sm text-emerald-800"
-            >
-              <Check aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
-              <p>{notice}</p>
-            </div>
-          )}
-
           <section
             aria-labelledby="ai-settings-title"
             className="py-2 sm:py-3"
@@ -2547,9 +3042,7 @@ export function SettingsPage({
                     }
                   className="flex h-10 items-center justify-center gap-2 rounded-xl bg-[#26272c] px-4 text-sm font-medium text-white transition hover:bg-[#3a3b41] disabled:opacity-60"
                 >
-                  {isSavingTtsSettings ? (
-                    <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                  ) : (
+                  {!isSavingTtsSettings && (
                     <Check aria-hidden="true" className="size-4" />
                   )}
                   Save TTS settings
@@ -2589,19 +3082,6 @@ export function SettingsPage({
                   moods and sensitive inferences are not saved as memories.
                 </p>
               </div>
-
-              {(errorMessage || notice) && (
-                <div
-                  role={errorMessage ? "alert" : "status"}
-                  className={`mb-4 rounded-2xl px-3.5 py-3 text-sm ${
-                    errorMessage
-                      ? "border border-red-100 bg-red-50 text-red-800"
-                      : "border border-emerald-100 bg-emerald-50 text-emerald-800"
-                  }`}
-                >
-                  {errorMessage || notice}
-                </div>
-              )}
 
               {!isDatabaseReady ? (
                 <div className="space-y-3" aria-label="Loading long-term memories">
@@ -2657,9 +3137,7 @@ export function SettingsPage({
                       disabled={isSavingMemory || apiKeys.length === 0}
                       className="flex h-10 items-center justify-center gap-2 rounded-full bg-[#26272c] px-4 text-sm font-medium text-white transition hover:bg-[#3a3b41] disabled:opacity-60"
                     >
-                      {isSavingMemory ? (
-                        <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                      ) : editingMemoryId ? (
+                      {editingMemoryId ? (
                         <Pencil aria-hidden="true" className="size-4" />
                       ) : (
                         <Plus aria-hidden="true" className="size-4" />
@@ -2934,6 +3412,16 @@ export function SettingsPage({
             </button>
           </section>
         </div>
+      )}
+      {(messageNotice || notice) && (
+        <ActionToast
+          message={messageNotice || notice}
+          placement="page"
+          onDismiss={() => {
+            setMessageNotice("");
+            setNotice("");
+          }}
+        />
       )}
     </main>
   );

@@ -278,21 +278,55 @@ export async function loadMessageAttachments(
   messageIds: string[],
 ): Promise<Record<string, ChatAttachment[]>> {
   if (messageIds.length === 0) return {};
-  const { data, error } = await client
-    .from("chat_message_attachments")
-    .select("id, user_id, message_id, file_name, mime_type, size_bytes, created_at, expires_at, deleted_at")
-    .in("message_id", messageIds)
-    .order("created_at", { ascending: true });
-  if (error) {
+  const [directResult, linkResult] = await Promise.all([
+    client
+      .from("chat_message_attachments")
+      .select("id, user_id, message_id, file_name, mime_type, size_bytes, created_at, expires_at, deleted_at")
+      .in("message_id", messageIds)
+      .order("created_at", { ascending: true }),
+    client
+      .from("chat_message_attachment_links")
+      .select("message_id, attachment_id")
+      .in("message_id", messageIds),
+  ]);
+  if (directResult.error || linkResult.error) {
     throw new Error(
-      `Could not load chat attachments. Confirm the latest supabase/schema.sql has been run. ${error.message}`,
+      `Could not load chat attachments. Confirm the latest supabase/schema.sql has been run. ${
+        directResult.error?.message ?? linkResult.error?.message
+      }`,
     );
   }
-  return data.reduce<Record<string, ChatAttachment[]>>((grouped, attachment) => {
-    if (!attachment.message_id) return grouped;
-    (grouped[attachment.message_id] ??= []).push(attachment);
-    return grouped;
+  const sharedAttachmentIds = [...new Set(linkResult.data.map((link) => link.attachment_id))];
+  const sharedResult =
+    sharedAttachmentIds.length > 0
+      ? await client
+          .from("chat_message_attachments")
+          .select("id, user_id, message_id, file_name, mime_type, size_bytes, created_at, expires_at, deleted_at")
+          .in("id", sharedAttachmentIds)
+      : { data: [], error: null };
+  if (sharedResult.error) {
+    throw new Error(`Could not load shared chat attachments: ${sharedResult.error.message}`);
+  }
+  const attachmentsById = new Map(
+    [...directResult.data, ...sharedResult.data].map((attachment) => [attachment.id, attachment]),
+  );
+  const grouped = directResult.data.reduce<Record<string, ChatAttachment[]>>((items, attachment) => {
+    if (!attachment.message_id) return items;
+    (items[attachment.message_id] ??= []).push(attachment);
+    return items;
   }, {});
+  for (const link of linkResult.data) {
+    const attachment = attachmentsById.get(link.attachment_id);
+    if (!attachment) continue;
+    const messageAttachments = (grouped[link.message_id] ??= []);
+    if (!messageAttachments.some((item) => item.id === attachment.id)) {
+      messageAttachments.push(attachment);
+    }
+  }
+  for (const attachments of Object.values(grouped)) {
+    attachments.sort((first, second) => first.created_at.localeCompare(second.created_at));
+  }
+  return grouped;
 }
 
 export async function loadMessageCreatedAt(

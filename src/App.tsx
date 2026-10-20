@@ -48,6 +48,7 @@ import {
 import cheyaLogo from "../assets/circle.png";
 import { AccountLogin } from "./AccountLogin";
 import { ErrorPage } from "./ErrorPage";
+import { ActionToast } from "./components/ActionToast";
 import { LinkPreviews } from "./components/LinkPreviews";
 import { PublicHome } from "./PublicHome";
 import {
@@ -87,8 +88,10 @@ import { subscribeWithReconnect } from "./lib/realtime";
 import {
   ACCOUNT_AI_ACTION_NAMES,
   executeAccountAiActionFromClient,
+  linkChatAttachmentsFromClient,
   reportAiFailureFromClient,
 } from "./lib/account-ai-actions";
+import { getSharedAttachmentId } from "./lib/chat-attachment-sharing";
 import {
   prepareAssistantSpeech,
 } from "./lib/tts-playback";
@@ -98,6 +101,8 @@ import {
   type AccountProvider,
   type AccountRole,
   type AccountInboxItem,
+  type GeneralSettings,
+  DEFAULT_GENERAL_SETTINGS,
   type AdminMessageRequest,
   type AppSupabaseClient,
   type ChatMessageJob,
@@ -143,7 +148,10 @@ function consumeOAuthCallbackError(): string | null {
 
 function PageLoadingSkeleton({ pathname }: { pathname: string }) {
   const isSettings = pathname.startsWith("/settings");
-  const settingsTitle = pathname.endsWith("/personal")
+  const isSettingsHome = pathname === "/settings" || pathname === "/settings/";
+  const settingsTitle = pathname.endsWith("/general")
+    ? "General"
+    : pathname.endsWith("/personal")
     ? "Personal"
     : pathname.endsWith("/configure")
       ? "Configure"
@@ -156,20 +164,45 @@ function PageLoadingSkeleton({ pathname }: { pathname: string }) {
             : pathname.endsWith("/terms")
               ? "Terms of Service"
         : "Settings";
+  const settingsActionPlaceholders =
+    settingsTitle === "Settings"
+      ? ["", "", ""]
+      : settingsTitle === "Configure"
+        ? ["", "lg:hidden", "lg:hidden", "hidden lg:block"]
+        : ["", "lg:hidden", "lg:hidden"];
 
   if (isSettings) {
     return (
       <main className="fixed inset-0 flex justify-center bg-[#f5f6f8]">
         <section
           aria-label={`Loading ${settingsTitle.toLowerCase()} page`}
-          className="relative h-full w-full max-w-4xl overflow-hidden bg-[#f5f6f8] sm:my-5 sm:h-[calc(100%-40px)]"
+          className={`relative h-full w-full overflow-hidden bg-[#f5f6f8] ${
+            isSettingsHome ? "max-w-[720px]" : ""
+          }`}
         >
-          <header className="absolute inset-x-0 top-0 z-10 flex h-[68px] items-center gap-2 px-1 sm:px-4">
+          <header
+            className={`absolute inset-x-0 top-0 z-10 flex h-[68px] items-center gap-2 ${
+              isSettingsHome
+                ? "px-3 pr-[22px] sm:px-5 sm:pr-[29px]"
+                : "px-3 pr-[22px] sm:px-6 sm:pr-[34px] lg:px-6 lg:pr-[34px]"
+            }`}
+          >
             <div className="chat-loading-skeleton size-11 rounded-full" />
             <div className="chat-loading-skeleton h-11 flex-1 rounded-full" />
-            <div className="chat-loading-skeleton size-11 rounded-full" />
+            <div className="flex h-11 shrink-0 items-center gap-0.5 rounded-full border border-[#e8e9ec] bg-white p-0.5">
+              {settingsActionPlaceholders.map((responsiveClass, item) => (
+                <div
+                  key={item}
+                  className={`chat-loading-skeleton size-9 rounded-full ${responsiveClass}`}
+                />
+              ))}
+            </div>
           </header>
-          <div className="absolute inset-0 overflow-hidden px-5 pb-8 pt-[92px] sm:px-8">
+          <div
+            className={`absolute inset-0 overflow-hidden pb-8 pt-[68px] ${
+              isSettingsHome ? "px-3 sm:px-5" : "px-3 sm:px-6 lg:px-6"
+            }`}
+          >
             <div className="animate-pulse space-y-5">
               {settingsTitle === "Settings" ? (
                 [0, 1, 2].map((item) => (
@@ -219,9 +252,8 @@ function PageLoadingSkeleton({ pathname }: { pathname: string }) {
             </div>
             <div className="ml-auto size-8 rounded-full bg-[#f1f2f4]" />
           </div>
-          <div className="h-12 w-32 rounded-full border border-[#e8e9ec] bg-white p-1">
-            <div className="flex h-full justify-end gap-1">
-              <div className="size-9 rounded-full bg-[#f1f2f4]" />
+          <div className="flex h-12 shrink-0 items-center gap-0.5 rounded-full border border-[#e8e9ec] bg-white p-1">
+            <div className="flex h-full justify-end gap-0.5">
               <div className="size-9 rounded-full bg-[#f1f2f4]" />
               <div className="size-9 rounded-full bg-[#f1f2f4]" />
             </div>
@@ -659,7 +691,7 @@ function MediaPreview({
   );
 }
 
-const UserMessageAttachmentTile = memo(function UserMessageAttachmentTile({
+const ChatMessageAttachmentTile = memo(function ChatMessageAttachmentTile({
   attachment,
   expired,
   onOpen,
@@ -697,7 +729,7 @@ const UserMessageAttachmentTile = memo(function UserMessageAttachmentTile({
       disabled={expired}
       onClick={() => onOpen(attachment)}
       dir="ltr"
-      className="group/attachment relative flex size-[68px] shrink-0 flex-col items-center justify-center overflow-hidden rounded-xl border border-[#e5e6e9] bg-white text-[#3d4148] shadow-sm transition hover:border-[#cdd3da] hover:shadow-md disabled:cursor-not-allowed disabled:opacity-65"
+      className="group/attachment relative flex size-[96px] shrink-0 flex-col items-center justify-center overflow-hidden rounded-xl border border-[#e5e6e9] bg-white text-[#3d4148] shadow-sm transition hover:border-[#cdd3da] hover:shadow-md disabled:cursor-not-allowed disabled:opacity-65"
       aria-label={
         expired
           ? `${attachment.file_name}, expired`
@@ -763,6 +795,8 @@ const ChatMessageInput = memo(function ChatMessageInput({
   defaultValue,
   disabled,
   placeholder,
+  enterKeyBehavior,
+  fontSize,
   onDraftInput,
   onSubmitMessage,
 }: {
@@ -770,6 +804,8 @@ const ChatMessageInput = memo(function ChatMessageInput({
   defaultValue: string;
   disabled: boolean;
   placeholder: string;
+  enterKeyBehavior: GeneralSettings["enter_key_behavior_desktop"];
+  fontSize: number;
   onDraftInput: (value: string, input: HTMLTextAreaElement) => void;
   onSubmitMessage: () => void;
 }) {
@@ -790,7 +826,12 @@ const ChatMessageInput = memo(function ChatMessageInput({
       rows={1}
       disabled={disabled}
       inputMode="text"
-      enterKeyHint="enter"
+      enterKeyHint={
+        enterKeyBehavior === "submit" ||
+        (enterKeyBehavior === "system" && !window.matchMedia("(pointer: coarse)").matches)
+          ? "send"
+          : "enter"
+      }
       autoCapitalize="sentences"
       autoCorrect="on"
       spellCheck
@@ -800,13 +841,17 @@ const ChatMessageInput = memo(function ChatMessageInput({
           event.key !== "Enter" ||
           event.shiftKey ||
           event.nativeEvent.isComposing ||
-          window.matchMedia("(pointer: coarse)").matches
+          !(
+            enterKeyBehavior === "submit" ||
+            (enterKeyBehavior === "system" && !window.matchMedia("(pointer: coarse)").matches)
+          )
         ) {
           return;
         }
         event.preventDefault();
         onSubmitMessage();
       }}
+      style={{ fontSize }}
       className="h-11 min-h-11 max-h-[88px] min-w-0 flex-1 resize-none overflow-y-auto bg-transparent py-2 text-base leading-6 text-[#25262a] caret-[#229fe3] outline-none placeholder:text-[#a2a3a7] selection:bg-[#bfe6f7] selection:text-[#25262a] [-webkit-user-select:text]"
     />
   );
@@ -990,13 +1035,18 @@ function isChatAttachment(value: unknown): value is ChatAttachment {
   );
 }
 
-function formatAccountDate(value: string): string {
+function formatAccountDate(
+  value: string,
+  timeFormat: GeneralSettings["time_format"] = DEFAULT_GENERAL_SETTINGS.time_format,
+): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime())
     ? value
     : new Intl.DateTimeFormat(undefined, {
         dateStyle: "medium",
         timeStyle: "short",
+        ...(timeFormat === "12h" ? { hourCycle: "h12" as const } : {}),
+        ...(timeFormat === "24h" ? { hourCycle: "h23" as const } : {}),
       }).format(date);
 }
 
@@ -1150,6 +1200,42 @@ function isTextAttachment(mimeType: string, fileName: string): boolean {
   );
 }
 
+function isPreparedAdminMessageResult(
+  value: unknown,
+): value is {
+  pendingApproval: true;
+  request: Pick<
+    AdminMessageRequest,
+    "id" | "recipient_user_ids" | "all_accounts" | "title" | "body"
+  >;
+} {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !("pendingApproval" in value) ||
+    value.pendingApproval !== true ||
+    !("request" in value) ||
+    typeof value.request !== "object" ||
+    value.request === null
+  ) {
+    return false;
+  }
+  const request = value.request;
+  return (
+    "id" in request &&
+    typeof request.id === "string" &&
+    "recipient_user_ids" in request &&
+    Array.isArray(request.recipient_user_ids) &&
+    request.recipient_user_ids.every((id) => typeof id === "string") &&
+    "all_accounts" in request &&
+    typeof request.all_accounts === "boolean" &&
+    "title" in request &&
+    typeof request.title === "string" &&
+    "body" in request &&
+    typeof request.body === "string"
+  );
+}
+
 export function App() {
   const [pathname, setPathname] = useState(window.location.pathname);
   const [isLoginOpen, setIsLoginOpen] = useState(false);
@@ -1164,12 +1250,17 @@ export function App() {
   const [isAuthLoading, setIsAuthLoading] = useState(true);
   const [authError, setAuthError] = useState("");
   const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [isPushPanelDismissed, setIsPushPanelDismissed] = useState(false);
+  const [generalSettings, setGeneralSettings] = useState<GeneralSettings>(DEFAULT_GENERAL_SETTINGS);
   const [inboxItems, setInboxItems] = useState<AccountInboxItem[]>([]);
   const [expandedInboxIds, setExpandedInboxIds] = useState<Set<string>>(() => new Set());
   const [pendingAdminRequests, setPendingAdminRequests] = useState<AdminMessageRequest[]>([]);
+  const [adminApprovalToast, setAdminApprovalToast] = useState<Pick<
+    AdminMessageRequest,
+    "id" | "title" | "body"
+  > | null>(null);
   const [isLoadingInbox, setIsLoadingInbox] = useState(false);
   const [inboxError, setInboxError] = useState("");
-  const [inboxNotice, setInboxNotice] = useState("");
   const [inboxRefresh, setInboxRefresh] = useState(0);
   const [isMarkingInboxRead, setIsMarkingInboxRead] = useState(false);
   const [isClearingInbox, setIsClearingInbox] = useState(false);
@@ -1211,7 +1302,12 @@ export function App() {
   const [deleteChatTarget, setDeleteChatTarget] = useState<DeleteChatTarget | null>(null);
   const [isDeletingChatBranch, setIsDeletingChatBranch] = useState(false);
   const [sendError, setSendError] = useState("");
-  const [attachmentToast, setAttachmentToast] = useState("");
+  const [toast, setToast] = useState<{
+    id: number;
+    message: string;
+    tone: "success" | "error";
+  } | null>(null);
+  const toastIdRef = useRef(0);
   const [isDraggingAttachments, setIsDraggingAttachments] = useState(false);
   const [attachedMedia, setAttachedMedia] = useState<PendingChatAttachment[]>([]);
   const [mediaPreviews, setMediaPreviews] = useState<Map<File, string>>(() => new Map());
@@ -1276,7 +1372,6 @@ export function App() {
   const cameraStreamRef = useRef<MediaStream | null>(null);
   const preparingAttachmentsRef = useRef(false);
   const cameraHistoryEntryRef = useRef(false);
-  const attachmentToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const messageDraftRef = useRef("");
   const messageDraftSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const messageDraftUserIdRef = useRef<string | null>(null);
@@ -1320,8 +1415,7 @@ export function App() {
   const pendingOptimisticMessageIdsRef = useRef(new Set<string>());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const filesInputRef = useRef<HTMLInputElement>(null);
-  const notificationsPanelRef = useRef<HTMLDivElement>(null);
-  const notificationButtonRef = useRef<HTMLButtonElement>(null);
+  const knownAdminRequestIdsRef = useRef<Set<string> | null>(null);
   const messageInputRef = useRef<HTMLTextAreaElement>(null);
   const nextApiIndexRef = useRef(0);
   const thinkingModeRef = useRef(false);
@@ -1334,9 +1428,16 @@ export function App() {
   const activeChatJob = chatJobs.find(
     (job) => job.status === "queued" || job.status === "processing",
   );
-  const unreadInboxCount = inboxItems.filter((item) => !item.read_at).length;
+  const unreadInboxMessageCount = inboxItems.filter((item) => !item.read_at).length;
+  const unreadInboxCount =
+    unreadInboxMessageCount +
+    (authUser?.role === "admin" ? pendingAdminRequests.length : 0);
   const showPushBanner =
-    pushStatus === "needs-permission" || pushStatus === "denied" || pushStatus === "error";
+    pathname === "/" &&
+    !isPushPanelDismissed &&
+    (pushStatus === "needs-permission" || pushStatus === "denied" || pushStatus === "error");
+  const chatFontScale =
+    generalSettings.font_size / DEFAULT_GENERAL_SETTINGS.font_size;
 
   useEffect(() => {
     if (!authClient || !authenticatedUserId) return;
@@ -1422,6 +1523,60 @@ export function App() {
   }, [authClient, authenticatedUserId, pathname]);
 
   useEffect(() => {
+    setIsPushPanelDismissed(false);
+  }, [pathname]);
+
+  useEffect(() => {
+    if (!authClient || !authenticatedUserId) {
+      setGeneralSettings(DEFAULT_GENERAL_SETTINGS);
+      return;
+    }
+    let isActive = true;
+    setGeneralSettings(DEFAULT_GENERAL_SETTINGS);
+    void (async () => {
+      try {
+        const { data, error } = await authClient
+          .from("user_settings")
+          .select("enter_key_behavior_desktop, enter_key_behavior_mobile, time_format, font_size, web_search_enabled")
+          .eq("user_id", authenticatedUserId)
+          .maybeSingle();
+        if (error) throw error;
+        if (!isActive || !data) return;
+        setGeneralSettings({
+          enter_key_behavior_desktop:
+            data.enter_key_behavior_desktop === "newline" || data.enter_key_behavior_desktop === "submit"
+              ? data.enter_key_behavior_desktop
+              : "system",
+          enter_key_behavior_mobile:
+            data.enter_key_behavior_mobile === "newline" || data.enter_key_behavior_mobile === "submit"
+              ? data.enter_key_behavior_mobile
+              : "system",
+          time_format:
+            data.time_format === "12h" || data.time_format === "24h"
+              ? data.time_format
+              : "system",
+          font_size:
+            typeof data.font_size === "number" && Number.isFinite(data.font_size)
+              ? Math.min(20, Math.max(12, data.font_size))
+              : 14,
+          web_search_enabled: data.web_search_enabled !== false,
+        });
+      } catch (error) {
+        if (isActive) {
+          setSendError(
+            `Could not load General settings. Apply the latest supabase/schema.sql. ${
+              error instanceof Error ? error.message : "Unknown database error."
+            }`,
+          );
+        }
+      }
+    })();
+    return () => {
+      isActive = false;
+    };
+  }, [authClient, authenticatedUserId]);
+
+  useEffect(() => {
     if (!authClient || !authenticatedUserId) {
       setPushStatus("checking");
       return;
@@ -1460,6 +1615,11 @@ export function App() {
   }, [authClient, authenticatedUserId]);
 
   useEffect(() => {
+    knownAdminRequestIdsRef.current = null;
+    setAdminApprovalToast(null);
+  }, [authenticatedUserId]);
+
+  useEffect(() => {
     if ((!notificationsOpen && pathname !== "/") || !authClient || !authenticatedUserId) return;
     let isActive = true;
     setIsLoadingInbox(true);
@@ -1484,6 +1644,22 @@ export function App() {
         requests = data;
       }
       if (!isActive) return;
+      if (authUser?.role === "admin") {
+        const knownRequestIds = knownAdminRequestIdsRef.current;
+        if (knownRequestIds) {
+          const newRequest = requests.find((request) => !knownRequestIds.has(request.id));
+          if (newRequest) {
+            setAdminApprovalToast({
+              id: newRequest.id,
+              title: newRequest.title,
+              body: newRequest.body,
+            });
+          }
+        }
+        knownAdminRequestIdsRef.current = new Set(requests.map((request) => request.id));
+      } else {
+        knownAdminRequestIdsRef.current = null;
+      }
       setInboxItems(items);
       setPendingAdminRequests(requests);
     })()
@@ -1535,19 +1711,9 @@ export function App() {
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") setNotificationsOpen(false);
     };
-    const closeOutsidePanel = (event: PointerEvent) => {
-      if (
-        !notificationsPanelRef.current?.contains(event.target as Node) &&
-        !notificationButtonRef.current?.contains(event.target as Node)
-      ) {
-        setNotificationsOpen(false);
-      }
-    };
     window.addEventListener("keydown", closeOnEscape);
-    document.addEventListener("pointerdown", closeOutsidePanel);
     return () => {
       window.removeEventListener("keydown", closeOnEscape);
-      document.removeEventListener("pointerdown", closeOutsidePanel);
     };
   }, [notificationsOpen]);
 
@@ -2071,20 +2237,12 @@ export function App() {
   }
 
   function showAttachmentToast(message: string) {
-    setAttachmentToast(message);
-    if (attachmentToastTimerRef.current) clearTimeout(attachmentToastTimerRef.current);
-    attachmentToastTimerRef.current = setTimeout(() => {
-      attachmentToastTimerRef.current = null;
-      setAttachmentToast("");
-    }, 5000);
+    setToast({ id: ++toastIdRef.current, message, tone: "error" });
   }
 
-  useEffect(
-    () => () => {
-      if (attachmentToastTimerRef.current) clearTimeout(attachmentToastTimerRef.current);
-    },
-    [],
-  );
+  function showActionToast(message: string) {
+    setToast({ id: ++toastIdRef.current, message, tone: "success" });
+  }
 
   function handleConversationScroll() {
     const conversation = conversationRef.current;
@@ -2322,12 +2480,23 @@ export function App() {
   useEffect(() => {
     if (!activeUserActions) return;
     const closeMenu = (event: PointerEvent) => {
-      if (!(event.target instanceof Element) || !event.target.closest("[data-user-actions]")) {
+      if (
+        !(event.target instanceof Element) ||
+        (!event.target.closest("[data-user-actions]") &&
+          !event.target.closest("[data-user-selection-overlay]"))
+      ) {
         setActiveUserActions(null);
       }
     };
+    const closeMenuOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setActiveUserActions(null);
+    };
     document.addEventListener("pointerdown", closeMenu);
-    return () => document.removeEventListener("pointerdown", closeMenu);
+    document.addEventListener("keydown", closeMenuOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeMenu);
+      document.removeEventListener("keydown", closeMenuOnEscape);
+    };
   }, [activeUserActions]);
 
   useEffect(() => () => clearLongPressTimer(), []);
@@ -2938,6 +3107,7 @@ export function App() {
       "chat_message_versions",
       "chat_conversation_branches",
       "chat_message_attachments",
+      "chat_message_attachment_links",
       "message_feedback",
       "ai_api_keys",
     ] as const;
@@ -3449,13 +3619,13 @@ export function App() {
     setInboxItems((items) =>
       items.map((current) => (current.id === item.id ? { ...current, read_at: readAt } : current)),
     );
+    showActionToast("Notification marked as read.");
   }
 
   async function markAllInboxItemsRead() {
     if (!authClient || !authenticatedUserId || isMarkingInboxRead || unreadInboxCount === 0) return;
     setIsMarkingInboxRead(true);
     setInboxError("");
-    setInboxNotice("");
     const readAt = new Date().toISOString();
     try {
       const { error } = await authClient
@@ -3465,7 +3635,7 @@ export function App() {
         .is("read_at", null);
       if (error) throw new Error(`Could not mark notifications as read: ${error.message}`);
       setInboxItems((items) => items.map((item) => ({ ...item, read_at: item.read_at ?? readAt })));
-      setInboxNotice("All notifications are marked as read.");
+      showActionToast("All notifications marked as read.");
     } catch (error) {
       setInboxError(error instanceof Error ? error.message : "Could not mark notifications as read.");
     } finally {
@@ -3484,7 +3654,6 @@ export function App() {
     }
     setIsClearingInbox(true);
     setInboxError("");
-    setInboxNotice("");
     try {
       const {
         data: { session },
@@ -3517,8 +3686,8 @@ export function App() {
       }
       setInboxItems([]);
       setExpandedInboxIds(new Set());
-      setInboxNotice(
-        `${payload.deletedCount} notification${payload.deletedCount === 1 ? "" : "s"} cleared from this account.`,
+      showActionToast(
+        `${payload.deletedCount} notification${payload.deletedCount === 1 ? "" : "s"} cleared.`,
       );
     } catch (error) {
       setInboxError(error instanceof Error ? error.message : "Could not clear the notification inbox.");
@@ -3531,7 +3700,6 @@ export function App() {
     if (!authClient || activeApprovalRequestId) return;
     setActiveApprovalRequestId(requestId);
     setInboxError("");
-    setInboxNotice("");
     try {
       const {
         data: { session },
@@ -3567,7 +3735,7 @@ export function App() {
         throw new Error("The message delivery service returned an invalid response.");
       }
       if (!approve) {
-        setInboxNotice("The pending message was cancelled.");
+        showActionToast("Pending message cancelled.");
       } else {
         const push =
           "push" in payload &&
@@ -3604,10 +3772,12 @@ export function App() {
               ? " No notification-enabled devices are registered for the recipients yet."
               : ` Push notifications sent to ${push.sent} device${push.sent === 1 ? "" : "s"}.`
           : " Push delivery status was unavailable.";
-        setInboxNotice(
+        showActionToast(
           `Message delivered to ${payload.deliveredCount} account${payload.deliveredCount === 1 ? "" : "s"}.${deliveryNote}`,
         );
       }
+      setPendingAdminRequests((current) => current.filter((request) => request.id !== requestId));
+      setAdminApprovalToast((current) => (current?.id === requestId ? null : current));
       setInboxRefresh((value) => value + 1);
     } catch (error) {
       setInboxError(error instanceof Error ? error.message : "Could not update the pending message.");
@@ -4582,6 +4752,7 @@ export function App() {
         else delete updated[ratingKey];
         return updated;
       });
+      showActionToast(nextRating ? "Feedback saved." : "Feedback removed.");
     } catch (error) {
       setSendError(error instanceof Error ? error.message : "Could not save feedback.");
     }
@@ -4614,6 +4785,7 @@ export function App() {
       setReportTarget(null);
       reportDetailsRef.current = "";
       setReportError("");
+      showActionToast("Report submitted.");
     } catch (error) {
       setReportError(error instanceof Error ? error.message : "Could not save this report.");
     } finally {
@@ -4625,14 +4797,13 @@ export function App() {
     try {
       await navigator.clipboard.writeText(text);
       setCopiedMessageId(messageId);
+      showActionToast("Message copied.");
       window.setTimeout(() => {
         setCopiedMessageId((current) => (current === messageId ? null : current));
       }, 1800);
     } catch (error) {
-      setSendError(
-        error instanceof Error
-          ? `Could not copy this reply: ${error.message}`
-          : "Could not copy this reply.",
+      showAttachmentToast(
+        error instanceof Error ? `Could not copy this message: ${error.message}` : "Could not copy this message.",
       );
     }
   }
@@ -4690,8 +4861,11 @@ export function App() {
       );
       setActiveUserActions(null);
       setDeleteChatTarget(null);
+      showActionToast("Message and following conversation deleted.");
     } catch (error) {
-      setSendError(error instanceof Error ? error.message : "Could not delete this message branch.");
+      const message = error instanceof Error ? error.message : "Could not delete this message branch.";
+      setSendError(message);
+      showAttachmentToast(message);
     } finally {
       setIsDeletingChatBranch(false);
     }
@@ -4753,6 +4927,7 @@ export function App() {
           createEmbedding,
           executeChatDataTool,
           findRelevantContext,
+          loadMessageAttachments,
           loadMessageCreatedAt,
           loadMessageFeedback,
           loadMessageVersions,
@@ -4775,7 +4950,7 @@ export function App() {
             .order("id", { ascending: true }),
           client
             .from("user_settings")
-            .select("display_name, custom_prompt, chat_style")
+            .select("display_name, custom_prompt, chat_style, web_search_enabled")
             .maybeSingle(),
         ]);
       if (keysError) throw keysError;
@@ -4935,6 +5110,7 @@ export function App() {
         )
       ).filter((reading): reading is NonNullable<typeof reading> => reading !== null);
       setThinkingSteps(["Preparing Cheya's response…"]);
+      const sharedAttachmentIds = new Set<string>();
 
       const result = await generateGeminiConversation(
         keys,
@@ -4943,6 +5119,7 @@ export function App() {
         profile ?? DEFAULT_PERSONALIZATION,
         {
           accountRole: authUser?.role ?? "user",
+          webSearchEnabled: profile?.web_search_enabled !== false,
           thinkingMode: showThinking,
           regenerateForVariation: !editedSource,
           currentMessageAt: sourceMessage.createdAt,
@@ -4981,12 +5158,56 @@ export function App() {
                 : `Using chat data tool: ${toolName}`,
             ]);
           },
-          executeTool: (name, input, key) => {
+          executeTool: async (name, input, key) => {
             if (ACCOUNT_AI_ACTION_NAMES.has(name)) {
               if (!authClient) throw new Error("Sign in before using account AI actions.");
-              return executeAccountAiActionFromClient(authClient, name, input, sourceMessage.id);
+              const result = await executeAccountAiActionFromClient(
+                authClient,
+                name,
+                input,
+                sourceMessage.id,
+              );
+              if (name === "share_chat_attachment") {
+                const attachmentId = getSharedAttachmentId(result);
+                if (!attachmentId) {
+                  throw new Error("The attachment share action returned an invalid reference.");
+                }
+                sharedAttachmentIds.add(attachmentId);
+              }
+              if (name === "prepare_admin_message" && isPreparedAdminMessageResult(result)) {
+                const request = result.request;
+                const requestToast = {
+                  id: request.id,
+                  title: request.title,
+                  body: request.body,
+                };
+                setAdminApprovalToast(requestToast);
+                setPendingAdminRequests((current) =>
+                  current.some((request) => request.id === requestToast.id)
+                    ? current
+                    : [
+                        {
+                          id: requestToast.id,
+                          admin_user_id: authUser?.id ?? "",
+                          recipient_user_ids: request.recipient_user_ids,
+                          all_accounts: request.all_accounts,
+                          title: requestToast.title,
+                          body: requestToast.body,
+                          status: "pending",
+                          created_at: new Date().toISOString(),
+                          sent_at: null,
+                        },
+                        ...current,
+                      ],
+                );
+                setInboxRefresh((current) => current + 1);
+              }
+              return result;
             }
             if (name === "search_web") {
+              if (!generalSettings.web_search_enabled) {
+                throw new Error("Web search is disabled in General settings.");
+              }
               const query =
                 typeof input === "object" &&
                 input !== null &&
@@ -5105,6 +5326,20 @@ export function App() {
       if (!updatedMessage) throw new Error("This reply could not be found in the database.");
       responseSaved = true;
       hiddenChatMessageIdsRef.current.delete(messageId);
+      let linkedAttachments = previousAssistant.attachments ?? [];
+      if (sharedAttachmentIds.size > 0) {
+        try {
+          await linkChatAttachmentsFromClient(client, updatedMessage.id, [...sharedAttachmentIds]);
+          const loadedAttachments = await loadMessageAttachments(client, [updatedMessage.id]);
+          linkedAttachments = loadedAttachments[updatedMessage.id] ?? linkedAttachments;
+        } catch (error) {
+          regenerationWarnings.push(
+            `Reply was regenerated, but its shared files could not be attached: ${
+              error instanceof Error ? error.message : "Unknown database error."
+            }`,
+          );
+        }
+      }
 
       try {
         await saveChatBranch(client, updatedMessage.id, updatedMessage.version_number);
@@ -5127,6 +5362,7 @@ export function App() {
             createdAt: updatedMessage.created_at,
             versionNumber: updatedMessage.version_number,
             thinkingSummary: updatedMessage.thinking_summary,
+            attachments: linkedAttachments,
           },
         ];
       });
@@ -5148,6 +5384,7 @@ export function App() {
           }),
         ),
       );
+      showActionToast("Response regenerated.");
       if (regenerationWarnings.length > 0) {
         setSendError(regenerationWarnings.join("\n"));
       }
@@ -5265,6 +5502,7 @@ export function App() {
       closeUserMessageEditor();
       userEditTextRef.current = "";
       setActiveUserActions(null);
+      showActionToast("Message updated.");
       const nextAssistant = messages[messageIndex + 1];
       if (nextAssistant?.role === "assistant") {
         await regenerateAssistantMessage(nextAssistant.id, {
@@ -5273,7 +5511,9 @@ export function App() {
         });
       }
     } catch (error) {
-      setSendError(error instanceof Error ? error.message : "Could not edit this message.");
+      const message = error instanceof Error ? error.message : "Could not edit this message.";
+      setSendError(message);
+      showAttachmentToast(message);
     } finally {
       directReplyProcessingRef.current = false;
       setIsSending(false);
@@ -5282,7 +5522,7 @@ export function App() {
 
   if (
     pathname !== "/" &&
-    !/^\/settings(?:\/(?:personal|configure|memory|account|privacy|terms))?\/?$/.test(pathname)
+    !/^\/settings(?:\/(?:general|personal|configure|memory|account|privacy|terms))?\/?$/.test(pathname)
   ) {
     return (
       <ErrorPage
@@ -5378,7 +5618,6 @@ export function App() {
               Download
             </a>
             <button
-              ref={notificationButtonRef}
               type="button"
               aria-label="Close attachment"
               onClick={closeRemoteAttachmentView}
@@ -5459,6 +5698,7 @@ export function App() {
           githubUsername={authUser.githubUsername}
           accountRole={authUser.role}
           onGeminiKeyChange={setHasGeminiApiKey}
+          onGeneralSettingsChange={setGeneralSettings}
         />
       </Suspense>
     );
@@ -5472,6 +5712,12 @@ export function App() {
   const viewedFile = viewedAttachment?.file;
   const editorLines = editorContent.split(/\r\n|\r|\n/);
   const longestEditorLine = editorLines.reduce((longest, line) => Math.max(longest, line.length), 0);
+  const selectedUserMessage = activeUserActions
+    ? messages.find((message) => message.id === activeUserActions && message.role === "user")
+    : undefined;
+  const selectedUserMessageText = selectedUserMessage
+    ? displayedMessageText(selectedUserMessage)
+    : "";
 
   if (attachmentView && viewedFile && viewedAttachment) {
     const previewUrl = mediaPreviews.get(viewedFile);
@@ -5649,7 +5895,6 @@ export function App() {
               aria-expanded={notificationsOpen}
               onClick={() => {
                 setInboxError("");
-                setInboxNotice("");
                 setNotificationsOpen((open) => !open);
               }}
               className="relative ml-auto flex size-9 shrink-0 items-center justify-center rounded-full text-[#303238] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
@@ -5684,54 +5929,115 @@ export function App() {
           </nav>
         </header>
 
-        <div className="pointer-events-none absolute inset-x-3 top-[68px] z-30 flex max-h-[calc(100dvh-84px)] flex-col gap-1.5 overflow-y-auto">
         {notificationsOpen && (
           <div
-            ref={notificationsPanelRef}
+            aria-hidden="true"
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              setNotificationsOpen(false);
+            }}
+            className="absolute inset-0 z-40 bg-transparent"
+          />
+        )}
+        <div
+          onClickCapture={(event) => {
+            if (
+              notificationsOpen &&
+              event.target instanceof Element &&
+              event.target.closest("[data-header-panel-interactive]")
+            ) {
+              setNotificationsOpen(false);
+            }
+          }}
+          className="pointer-events-none absolute inset-x-3 top-[64px] z-50 flex max-h-[calc(100dvh-80px)] flex-col gap-1.5 overflow-y-auto"
+        >
+        {authUser?.role === "admin" && adminApprovalToast && (
+          <section
+            role="status"
+            aria-label="AI message awaiting approval"
+            data-header-panel-interactive
+            className="pointer-events-auto flex items-center gap-2 rounded-2xl border border-[#e8d7b1] bg-[#fffaf0] px-3 py-2.5 shadow-lg"
+          >
+            <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-[#f5e8ca] text-[#8d6418]">
+              <BadgeCheck aria-hidden="true" className="size-[17px]" />
+            </span>
+            <div className="min-w-0 flex-1">
+              <p className="text-xs font-semibold text-[#503d1b]">AI draft needs your approval</p>
+              <p className="truncate text-[11px] text-[#746446]">{adminApprovalToast.title}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setAdminApprovalToast(null);
+                setNotificationsOpen(true);
+              }}
+              className="h-8 shrink-0 rounded-lg bg-[#302b22] px-2.5 text-xs font-medium text-white hover:bg-[#494132]"
+            >
+              Review
+            </button>
+            <button
+              type="button"
+              aria-label="Dismiss approval notification"
+              onClick={() => setAdminApprovalToast(null)}
+              className="flex size-7 shrink-0 items-center justify-center rounded-full text-[#746446] hover:bg-[#f5e8ca]"
+            >
+              <X aria-hidden="true" className="size-4" />
+            </button>
+          </section>
+        )}
+        {notificationsOpen && (
+          <div
             role="dialog"
             aria-label="Notification inbox"
             className="pointer-events-auto flex max-h-[min(54vh,420px)] shrink-0 flex-col overflow-hidden rounded-2xl border border-[#e1e3e8] bg-white shadow-xl"
           >
-            <header className="flex shrink-0 items-center justify-between gap-2 border-b border-[#eceef1] px-3 py-2.5">
+            <header className="flex shrink-0 items-center justify-between gap-2 border-b border-[#eceef1] px-3 py-1">
               <div className="flex min-w-0 items-baseline gap-2">
                 <h2 className="text-sm font-semibold text-[#202126]">Inbox</h2>
-                <span className="truncate text-[11px] text-[#858890]">
-                  {unreadInboxCount} unread
-                  {authUser?.role === "admin" && pendingAdminRequests.length > 0
-                    ? ` · ${pendingAdminRequests.length} pending`
-                    : ""}
-                </span>
+                {(authUser?.role !== "admin" || unreadInboxMessageCount > 0 || pendingAdminRequests.length > 0) && (
+                  <span className="truncate text-[11px] text-[#858890]">
+                    {unreadInboxMessageCount > 0 || authUser?.role !== "admin"
+                      ? `${unreadInboxMessageCount} unread`
+                      : ""}
+                    {authUser?.role === "admin" && pendingAdminRequests.length > 0
+                      ? `${unreadInboxMessageCount > 0 ? " · " : ""}${pendingAdminRequests.length} approval${pendingAdminRequests.length === 1 ? "" : "s"}`
+                      : ""}
+                  </span>
+                )}
               </div>
-              <div className="flex shrink-0 items-center gap-0.5">
-                <button
-                  type="button"
-                  aria-label="Mark all notifications as read"
-                  title={isMarkingInboxRead ? "Marking all as read" : "Mark all as read"}
-                  disabled={isMarkingInboxRead || unreadInboxCount === 0}
-                  onClick={() => void markAllInboxItemsRead()}
-                  className="flex size-8 items-center justify-center rounded-lg text-[#6c727c] transition hover:bg-[#eff8fc] hover:text-[#287ba3] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[#229fe3] disabled:cursor-not-allowed disabled:text-[#c1c3c8]"
-                >
-                  {isMarkingInboxRead ? (
-                    <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                  ) : (
-                    <CheckCheck aria-hidden="true" className="size-[17px]" strokeWidth={1.8} />
-                  )}
-                </button>
-                <button
-                  type="button"
-                  aria-label="Clear notification inbox"
-                  title={isClearingInbox ? "Clearing inbox" : "Clear inbox"}
-                  disabled={isClearingInbox || inboxItems.length === 0}
-                  onClick={() => void clearNotificationInbox()}
-                  className="flex size-8 items-center justify-center rounded-lg text-[#7b7373] transition hover:bg-red-50 hover:text-[#b43b3b] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[#d84646] disabled:cursor-not-allowed disabled:text-[#c8c3c3]"
-                >
-                  {isClearingInbox ? (
-                    <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                  ) : (
-                    <Trash2 aria-hidden="true" className="size-4" strokeWidth={1.8} />
-                  )}
-                </button>
-              </div>
+              {authUser?.role !== "admin" && (
+                <div className="flex shrink-0 items-center gap-0.5">
+                  <button
+                    type="button"
+                    aria-label="Mark all notifications as read"
+                    title={isMarkingInboxRead ? "Marking all as read" : "Mark all as read"}
+                    disabled={isMarkingInboxRead || unreadInboxMessageCount === 0}
+                    onClick={() => void markAllInboxItemsRead()}
+                    className="flex size-7 items-center justify-center rounded-lg text-[#6c727c] transition hover:bg-[#eff8fc] hover:text-[#287ba3] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[#229fe3] disabled:cursor-not-allowed disabled:text-[#c1c3c8]"
+                  >
+                    {isMarkingInboxRead ? (
+                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                    ) : (
+                      <CheckCheck aria-hidden="true" className="size-[17px]" strokeWidth={1.8} />
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="Clear notification inbox"
+                    title={isClearingInbox ? "Clearing inbox" : "Clear inbox"}
+                    disabled={isClearingInbox || inboxItems.length === 0}
+                    onClick={() => void clearNotificationInbox()}
+                    className="flex size-7 items-center justify-center rounded-lg text-[#7b7373] transition hover:bg-red-50 hover:text-[#b43b3b] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[#d84646] disabled:cursor-not-allowed disabled:text-[#c8c3c3]"
+                  >
+                    {isClearingInbox ? (
+                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                    ) : (
+                      <Trash2 aria-hidden="true" className="size-4" strokeWidth={1.8} />
+                    )}
+                  </button>
+                </div>
+              )}
             </header>
             <div className="min-h-0 flex-1 space-y-3 overflow-y-auto bg-[#f7f8fa] p-2.5">
               {inboxError && (
@@ -5739,31 +6045,41 @@ export function App() {
                   {inboxError}
                 </p>
               )}
-              {inboxNotice && (
-                <p role="status" className="rounded-xl bg-emerald-50 px-3 py-2 text-xs leading-5 text-emerald-800">
-                  {inboxNotice}
-                </p>
-              )}
               {authUser?.role === "admin" && pendingAdminRequests.length > 0 && (
-                <section aria-label="Messages awaiting approval" className="space-y-2">
-                  <h3 className="px-1 pt-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-[#858890]">
-                    Awaiting approval
-                  </h3>
+                <section aria-label="AI message approvals" className="space-y-2">
+                  <div className="flex items-center justify-between px-1 pt-1">
+                    <h3 className="text-[10px] font-semibold uppercase tracking-[0.1em] text-[#805d1b]">
+                      AI message approvals
+                    </h3>
+                    <span className="rounded-full bg-[#f5e8ca] px-2 py-0.5 text-[10px] font-semibold text-[#805d1b]">
+                      {pendingAdminRequests.length} pending
+                    </span>
+                  </div>
                   {pendingAdminRequests.map((request) => (
                     <article
                       key={request.id}
-                      className="rounded-2xl border border-[#e8e9ed] bg-white p-3 shadow-[0_1px_2px_rgba(20,25,35,0.04)]"
+                      className="rounded-2xl border border-[#eadbbd] bg-[#fffdf8] p-3 shadow-[0_1px_2px_rgba(75,55,20,0.05)]"
                     >
-                      <p className="text-[13px] font-semibold text-[#292a30]">{request.title}</p>
-                      <p className="mt-1.5 whitespace-pre-wrap break-words text-xs leading-[1.55] text-[#55575e]">
+                      <div className="mb-2 flex items-center gap-1.5">
+                        <BadgeCheck aria-hidden="true" className="size-3.5 shrink-0 text-[#9a7125]" />
+                        <span className="text-[9px] font-semibold uppercase tracking-[0.08em] text-[#896926]">
+                          Requires your approval
+                        </span>
+                      </div>
+                      <p className="text-[13px] font-semibold text-[#30291e]">{request.title}</p>
+                      <p className="mt-1.5 whitespace-pre-wrap break-words text-xs leading-[1.55] text-[#625a4c]">
                         {request.body}
                       </p>
-                      <p className="mt-2.5 text-[10px] text-[#858890]">
+                      <p className="mt-2.5 text-[10px] text-[#85785f]">
                         {request.all_accounts
-                          ? "All accounts except the sender"
-                          : `${request.recipient_user_ids.length} selected account${request.recipient_user_ids.length === 1 ? "" : "s"}`}
+                          ? "Broadcast · all accounts except you"
+                          : `Selected audience · ${request.recipient_user_ids.length} account${request.recipient_user_ids.length === 1 ? "" : "s"}`}
                       </p>
-                      <div className="mt-3 flex justify-end gap-2">
+                      <div className="mt-3 flex items-center justify-between gap-2 border-t border-[#f0e6d2] pt-2.5">
+                        <time className="text-[10px] tabular-nums text-[#94876e]">
+                          {formatAccountDate(request.created_at, generalSettings.time_format)}
+                        </time>
+                        <div className="flex gap-2">
                         <button
                           type="button"
                           disabled={activeApprovalRequestId !== null}
@@ -5780,6 +6096,7 @@ export function App() {
                         >
                           {activeApprovalRequestId === request.id ? "Sending…" : "Approve and send"}
                         </button>
+                        </div>
                       </div>
                     </article>
                   ))}
@@ -5828,7 +6145,7 @@ export function App() {
                             </span>
                           </span>
                           <time className="shrink-0 text-[10px] tabular-nums text-[#92959c]">
-                            {formatAccountDate(item.created_at)}
+                            {formatAccountDate(item.created_at, generalSettings.time_format)}
                           </time>
                         </span>
                         {!expandedInboxIds.has(item.id) && (
@@ -5861,6 +6178,7 @@ export function App() {
         {showPushBanner && (
           <section
             aria-label="Push notification permission"
+            data-header-panel-interactive
             className="pointer-events-auto flex h-12 shrink-0 items-center gap-2 overflow-hidden rounded-2xl border border-[#e6e7eb] bg-white px-2 shadow-sm"
           >
             <Bell aria-hidden="true" className="ml-1 size-4 shrink-0 text-[#596879]" />
@@ -5890,6 +6208,14 @@ export function App() {
                 {isEnablingPush ? "Enabling…" : "Enable"}
               </button>
             )}
+            <button
+              type="button"
+              aria-label="Dismiss notification panel"
+              onClick={() => setIsPushPanelDismissed(true)}
+              className="flex size-8 shrink-0 items-center justify-center rounded-lg text-[#858890] transition hover:bg-[#f1f2f4] hover:text-[#34363b]"
+            >
+              <X aria-hidden="true" className="size-4" />
+            </button>
           </section>
         )}
 
@@ -5897,6 +6223,7 @@ export function App() {
           <div className="pointer-events-auto shrink-0">
             <section
               aria-label="Text-to-speech player"
+              data-header-panel-interactive
               className="flex min-h-12 items-center gap-0 rounded-2xl border border-[#e6e7eb] bg-white px-1.5 py-1.5 shadow-sm"
             >
               {ttsPlayback.status === "loading" ? (
@@ -6060,15 +6387,15 @@ export function App() {
 
               if (chatMessage.role === "user") {
                 return (
-                  <article key={chatMessage.id} className="group relative flex w-full flex-col items-end">
+                  <article key={chatMessage.id} className="relative flex w-full flex-col items-end">
                     {chatMessage.attachments && chatMessage.attachments.length > 0 && (
                       <div
                         aria-label="Message attachments"
                         dir="rtl"
-                        className="mb-1.5 flex w-fit max-w-[min(94%,290px)] flex-wrap justify-start gap-1.5"
+                        className="mb-2 grid w-fit max-w-[min(94%,320px)] grid-cols-3 gap-2"
                       >
                         {chatMessage.attachments.map((attachment) => (
-                          <UserMessageAttachmentTile
+                          <ChatMessageAttachmentTile
                             key={attachment.id}
                             attachment={attachment}
                             expired={isChatAttachmentExpired(attachment)}
@@ -6088,7 +6415,7 @@ export function App() {
                             setActiveUserActions(chatMessage.id);
                             longPressTimerRef.current = null;
                           },
-                          300,
+                          450,
                         );
                       }}
                       onPointerMove={(event) => {
@@ -6115,8 +6442,12 @@ export function App() {
                         setActiveUserActions(chatMessage.id);
                       }}
                       onDragStart={(event) => event.preventDefault()}
-                      className="max-w-[94%] select-none rounded-[18px] rounded-br-md bg-[#28292e] px-3.5 py-1.5 text-[13px] leading-[1.35] text-white [webkit-touch-callout:none]"
-                      style={{ WebkitTouchCallout: "none" }}
+                      className="user-message-bubble max-w-[94%] select-none rounded-[18px] rounded-br-md bg-[#28292e] px-3.5 py-1.5 text-[13px] leading-[1.35] text-white [webkit-touch-callout:none]"
+                      style={{
+                        WebkitTouchCallout: "none",
+                        fontSize: Math.round(13 * chatFontScale),
+                        lineHeight: 1.35,
+                      }}
                     >
                       <Suspense fallback={null}>
                         <AssistantMarkdown content={visibleText} userMessage />
@@ -6127,41 +6458,30 @@ export function App() {
                         userMessage
                       />
                     </div>
-                    {versionControls && (
-                      <div className="mt-0.5 flex min-h-7 w-full items-center justify-end">
-                        {versionControls}
-                      </div>
-                    )}
                     <div
                       data-user-actions
                       aria-label="User message actions"
-                      className={`absolute right-1 top-[calc(100%+2px)] z-30 items-center gap-0.5 rounded-xl border border-[#e5e6e9] bg-white p-1 shadow-lg ${
-                        activeUserActions === chatMessage.id
-                          ? "flex"
-                          : "hidden sm:group-hover:flex sm:group-focus-within:flex"
-                      }`}
+                      className="user-message-actions mt-0 hidden h-0 w-full items-center justify-end gap-0.5 overflow-hidden sm:flex"
                     >
                       <button
                         type="button"
                         aria-label="Copy user message"
                         onClick={() => void copyMessageText(chatMessage.id, visibleText)}
-                        className="flex size-7 items-center justify-center rounded-md text-[#777a82] hover:bg-[#f1f2f4]"
+                        className="flex size-5 items-center justify-center rounded-full text-[#777a82] opacity-0 pointer-events-none transition-[opacity,color,background-color] hover:bg-[#f1f2f4] hover:text-[#34363b]"
                       >
                         {copiedMessageId === chatMessage.id ? (
-                          <Check aria-hidden="true" className="size-3.5 text-[#398650]" />
+                          <Check aria-hidden="true" className="size-3 text-[#398650]" />
                         ) : (
-                          <Copy aria-hidden="true" className="size-3.5" />
+                          <Copy aria-hidden="true" className="size-3" />
                         )}
                       </button>
                       <button
                         type="button"
                         aria-label="Edit user message"
-                        onClick={() => {
-                          openUserMessageEditor(chatMessage.id, visibleText);
-                        }}
-                        className="flex size-7 items-center justify-center rounded-md text-[#777a82] hover:bg-[#f1f2f4]"
+                        onClick={() => openUserMessageEditor(chatMessage.id, visibleText)}
+                        className="flex size-5 items-center justify-center rounded-full text-[#777a82] opacity-0 pointer-events-none transition-[opacity,color,background-color] hover:bg-[#f1f2f4] hover:text-[#34363b]"
                       >
-                        <Pencil aria-hidden="true" className="size-3.5" />
+                        <Pencil aria-hidden="true" className="size-3" />
                       </button>
                       <button
                         type="button"
@@ -6171,11 +6491,16 @@ export function App() {
                           setDeleteChatTarget({ id: chatMessage.id, text: visibleText });
                           setActiveUserActions(null);
                         }}
-                        className="flex size-7 items-center justify-center rounded-md text-[#b43b3b] hover:bg-red-50 disabled:opacity-40"
+                        className="flex size-5 items-center justify-center rounded-full text-[#b43b3b] opacity-0 pointer-events-none transition-[opacity,color,background-color] hover:bg-red-50 disabled:opacity-40"
                       >
-                        <Trash2 aria-hidden="true" className="size-3.5" />
+                        <Trash2 aria-hidden="true" className="size-3" />
                       </button>
                     </div>
+                    {versionControls && (
+                      <div className="mt-0.5 flex min-h-7 w-full items-center justify-end">
+                        {versionControls}
+                      </div>
+                    )}
                   </article>
                 );
               }
@@ -6211,7 +6536,10 @@ export function App() {
                       )}
                     </div>
                   )}
-                  <div className="max-w-full break-words text-[14px] leading-6">
+                  <div
+                    className="max-w-full break-words leading-6"
+                    style={{ fontSize: Math.round(14 * chatFontScale) }}
+                  >
                     <Suspense fallback={null}>
                       <AssistantMarkdown
                         content={visibleText}
@@ -6230,6 +6558,22 @@ export function App() {
                       <LinkPreviews content={visibleText} client={authClient} />
                     )}
                   </div>
+                  {chatMessage.attachments && chatMessage.attachments.length > 0 && (
+                    <div
+                      aria-label="AI-shared attachments"
+                      className="mt-2 grid w-fit max-w-[min(100%,320px)] grid-cols-3 gap-2"
+                    >
+                      {chatMessage.attachments.map((attachment) => (
+                        <ChatMessageAttachmentTile
+                          key={attachment.id}
+                          attachment={attachment}
+                          expired={isChatAttachmentExpired(attachment)}
+                          getPreviewUrl={getAttachmentPreviewUrl}
+                          onOpen={(item) => void openStoredAttachment(item)}
+                        />
+                      ))}
+                    </div>
+                  )}
                   <div
                     aria-label="Assistant message actions"
                     className="mt-1 flex flex-wrap items-center gap-1"
@@ -6261,17 +6605,18 @@ export function App() {
                     >
                       <ThumbsDown aria-hidden="true" className="size-4" />
                     </button>
-                    {!chatMessage.isReminder && (
-                      <button
-                        type="button"
-                        aria-label="Regenerate response"
-                        disabled={isSending}
-                        onClick={() => void regenerateAssistantMessage(chatMessage.id)}
-                        className="flex size-8 items-center justify-center rounded-lg text-[#777a82] transition hover:bg-[#f1f2f4] disabled:opacity-50"
-                      >
-                        <RotateCw aria-hidden="true" className="size-4" />
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      aria-label={copiedMessageId === chatMessage.id ? "Copied response" : "Copy response"}
+                      onClick={() => void copyAssistantMessage(chatMessage)}
+                      className="flex size-8 items-center justify-center rounded-lg text-[#777a82] transition hover:bg-[#f1f2f4]"
+                    >
+                      {copiedMessageId === chatMessage.id ? (
+                        <Check aria-hidden="true" className="size-4 text-[#398650]" />
+                      ) : (
+                        <Copy aria-hidden="true" className="size-4" />
+                      )}
+                    </button>
                     <button
                       type="button"
                       aria-label="Report response"
@@ -6316,18 +6661,17 @@ export function App() {
                     >
                       <Volume2 aria-hidden="true" className="size-4" />
                     </button>
-                    <button
-                      type="button"
-                      aria-label={copiedMessageId === chatMessage.id ? "Copied response" : "Copy response"}
-                      onClick={() => void copyAssistantMessage(chatMessage)}
-                      className="ml-auto flex size-8 items-center justify-center rounded-lg text-[#777a82] transition hover:bg-[#f1f2f4]"
-                    >
-                      {copiedMessageId === chatMessage.id ? (
-                        <Check aria-hidden="true" className="size-4 text-[#398650]" />
-                      ) : (
-                        <Copy aria-hidden="true" className="size-4" />
-                      )}
-                    </button>
+                    {!chatMessage.isReminder && (
+                      <button
+                        type="button"
+                        aria-label="Regenerate response"
+                        disabled={isSending}
+                        onClick={() => void regenerateAssistantMessage(chatMessage.id)}
+                        className="ml-auto flex size-8 items-center justify-center rounded-lg text-[#777a82] transition hover:bg-[#f1f2f4] disabled:opacity-50"
+                      >
+                        <RotateCw aria-hidden="true" className="size-4" />
+                      </button>
+                    )}
                   </div>
                 </article>
               );
@@ -6389,7 +6733,7 @@ export function App() {
               title="Scroll to latest message"
               onClick={() => scrollConversationToLatest()}
               className="absolute right-4 z-30 flex size-9 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] shadow-[0_3px_14px_rgba(20,24,32,0.16)] transition hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] sm:size-10"
-              style={{ bottom: "calc(100% + 12px)" }}
+              style={{ bottom: "calc(100% + 6px)" }}
             >
               <ArrowDown aria-hidden="true" className="size-4" />
             </button>
@@ -6514,6 +6858,12 @@ export function App() {
                 inputRef={messageInputRef}
                 defaultValue={messageDraftRef.current}
                 disabled={!hasGeminiApiKey}
+                enterKeyBehavior={
+                  window.matchMedia("(pointer: coarse)").matches
+                    ? generalSettings.enter_key_behavior_mobile
+                    : generalSettings.enter_key_behavior_desktop
+                }
+                fontSize={Math.round(generalSettings.font_size * 16 / 14)}
                 onDraftInput={handleMessageDraftInput}
                 onSubmitMessage={() => void sendMessage()}
                 placeholder={
@@ -6610,6 +6960,85 @@ export function App() {
           </form>
         </footer>
       </section>
+
+      {selectedUserMessage && (
+        <div
+          data-user-selection-overlay
+          className="fixed inset-0 z-[70] hidden flex-col items-center justify-center gap-3 bg-black/45 px-5 py-8 backdrop-blur-md [touch-action:none] max-sm:flex"
+          onPointerDown={(event) => {
+            event.stopPropagation();
+          }}
+          onClick={(event) => {
+            event.stopPropagation();
+            if (event.target === event.currentTarget) setActiveUserActions(null);
+          }}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <section
+            data-user-actions
+            role="dialog"
+            aria-modal="true"
+            aria-label="Selected user message"
+            className="w-full max-w-sm"
+          >
+            <div
+              className="max-h-40 overflow-hidden rounded-2xl bg-[#28292e] px-4 py-3 text-sm leading-5 text-white line-clamp-6 shadow-2xl"
+              style={{ fontSize: Math.round(13 * chatFontScale), lineHeight: 1.4 }}
+            >
+              {selectedUserMessageText}
+            </div>
+          </section>
+          <div
+            data-user-actions
+            aria-label="Message options"
+            className="w-full max-w-sm overflow-hidden rounded-[28px] bg-white py-2 shadow-2xl"
+          >
+            <button
+              type="button"
+              onClick={() => {
+                void copyMessageText(selectedUserMessage.id, selectedUserMessageText);
+                setActiveUserActions(null);
+              }}
+              className="flex min-h-14 w-full items-center gap-4 px-5 text-left text-[15px] font-medium text-[#292a30] active:bg-[#f2f3f5]"
+            >
+              {copiedMessageId === selectedUserMessage.id ? (
+                <Check aria-hidden="true" className="size-5 text-[#398650]" />
+              ) : (
+                <Copy aria-hidden="true" className="size-5" />
+              )}
+              Copy message
+            </button>
+            <div className="mx-5 h-px bg-[#eceef1]" />
+            <button
+              type="button"
+              onClick={() => {
+                openUserMessageEditor(selectedUserMessage.id, selectedUserMessageText);
+                setActiveUserActions(null);
+              }}
+              className="flex min-h-14 w-full items-center gap-4 px-5 text-left text-[15px] font-medium text-[#292a30] active:bg-[#f2f3f5]"
+            >
+              <Pencil aria-hidden="true" className="size-5" />
+              Edit message
+            </button>
+            <div className="mx-5 h-px bg-[#eceef1]" />
+            <button
+              type="button"
+              disabled={isSending || isDeletingChatBranch}
+              onClick={() => {
+                setDeleteChatTarget({
+                  id: selectedUserMessage.id,
+                  text: selectedUserMessageText,
+                });
+                setActiveUserActions(null);
+              }}
+              className="flex min-h-14 w-full items-center gap-4 px-5 text-left text-[15px] font-medium text-[#b43b3b] active:bg-red-50 disabled:opacity-40"
+            >
+              <Trash2 aria-hidden="true" className="size-5" />
+              Delete message
+            </button>
+          </div>
+        </div>
+      )}
 
       {deleteChatTarget && (
         <div
@@ -6833,31 +7262,13 @@ export function App() {
         </div>
       )}
 
-      {attachmentToast && (
-        <div className="pointer-events-none fixed inset-x-0 bottom-[calc(84px+env(safe-area-inset-bottom))] z-[80] flex justify-center px-4 sm:bottom-6">
-          <div
-            role="alert"
-            aria-live="assertive"
-            className="pointer-events-auto flex max-w-lg items-start gap-2.5 rounded-2xl border border-red-200 bg-[#fff8f7] px-3.5 py-3 text-sm text-red-900 shadow-[0_8px_28px_rgba(30,20,20,0.22)]"
-          >
-            <TriangleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-red-700" />
-            <p className="min-w-0 flex-1 whitespace-pre-line leading-5">{attachmentToast}</p>
-            <button
-              type="button"
-              aria-label="Dismiss attachment notification"
-              onClick={() => {
-                if (attachmentToastTimerRef.current) {
-                  clearTimeout(attachmentToastTimerRef.current);
-                  attachmentToastTimerRef.current = null;
-                }
-                setAttachmentToast("");
-              }}
-              className="flex size-6 shrink-0 items-center justify-center rounded-full text-red-800 transition hover:bg-red-100"
-            >
-              <X aria-hidden="true" className="size-4" />
-            </button>
-          </div>
-        </div>
+      {toast && (
+        <ActionToast
+          key={toast.id}
+          message={toast.message}
+          tone={toast.tone}
+          onDismiss={() => setToast(null)}
+        />
       )}
 
       {isCameraOpen && (

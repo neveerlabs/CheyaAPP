@@ -138,6 +138,22 @@ body {
   touch-action: pan-x;
 }
 
+.user-message-bubble:hover + .user-message-actions,
+.user-message-actions:hover,
+.user-message-bubble:focus-within + .user-message-actions,
+.user-message-actions:focus-within {
+  height: 20px;
+  margin-top: 2px;
+}
+
+.user-message-bubble:hover + .user-message-actions button,
+.user-message-actions:hover button,
+.user-message-bubble:focus-within + .user-message-actions button,
+.user-message-actions:focus-within button {
+  pointer-events: auto;
+  opacity: 1;
+}
+
 .public-home-background {
   background:
     radial-gradient(ellipse at 0% 0%, rgb(48 160 235 / 68%), transparent 54%),
@@ -169,6 +185,73 @@ select,
 [role="textbox"] {
   animation: none !important;
   transition: none !important;
+}
+
+.font-size-slider {
+  appearance: none;
+  background: transparent;
+  outline: none;
+  touch-action: none;
+  -webkit-appearance: none;
+}
+
+.font-size-slider::-webkit-slider-runnable-track {
+  height: 10px;
+  border-radius: 999px;
+  background: linear-gradient(
+    to right,
+    #6554a4 0%,
+    #6554a4 var(--range-progress),
+    #e2e3e8 var(--range-progress),
+    #e2e3e8 100%
+  );
+}
+
+.font-size-slider::-moz-range-track {
+  height: 10px;
+  border-radius: 999px;
+  background: linear-gradient(
+    to right,
+    #6554a4 0%,
+    #6554a4 var(--range-progress),
+    #e2e3e8 var(--range-progress),
+    #e2e3e8 100%
+  );
+}
+
+.font-size-slider::-webkit-slider-thumb {
+  width: 42px;
+  height: 30px;
+  margin-top: -10px;
+  appearance: none;
+  border: 2px solid white;
+  border-radius: 999px;
+  background: linear-gradient(145deg, #7666b5, #58468f);
+  box-shadow: 0 2px 7px rgb(36 30 60 / 30%), 0 0 0 1px rgb(101 84 164 / 18%);
+  transition: transform 160ms cubic-bezier(0.2, 0.8, 0.2, 1), box-shadow 160ms ease;
+  -webkit-appearance: none;
+}
+
+.font-size-slider::-moz-range-thumb {
+  width: 42px;
+  height: 30px;
+  border: 2px solid white;
+  border-radius: 999px;
+  background: linear-gradient(145deg, #7666b5, #58468f);
+  box-shadow: 0 2px 7px rgb(36 30 60 / 30%), 0 0 0 1px rgb(101 84 164 / 18%);
+  transition: transform 160ms cubic-bezier(0.2, 0.8, 0.2, 1), box-shadow 160ms ease;
+}
+
+.font-size-slider:hover::-webkit-slider-thumb,
+.font-size-slider:active::-webkit-slider-thumb {
+  transform: scale(1.06, 1.12);
+  box-shadow: 0 3px 9px rgb(36 30 60 / 36%), 0 0 0 5px rgb(101 84 164 / 14%);
+}
+
+.font-size-slider:hover::-moz-range-thumb,
+.font-size-slider:active::-moz-range-thumb {
+  transform: scale(1.06, 1.12);
+  box-shadow: 0 3px 9px rgb(36 30 60 / 36%), 0 0 0 5px rgb(101 84 164 / 14%);
 }
 
 .chat-composer:has(textarea:not(:placeholder-shown)) .chat-composer-idle-control {

@@ -134,6 +134,22 @@ export interface PersonalizationSettings {
   chat_style: string;
 }
 
+export interface GeneralSettings {
+  enter_key_behavior_desktop: "system" | "submit" | "newline";
+  enter_key_behavior_mobile: "system" | "submit" | "newline";
+  time_format: "system" | "12h" | "24h";
+  font_size: number;
+  web_search_enabled: boolean;
+}
+
+export const DEFAULT_GENERAL_SETTINGS: GeneralSettings = {
+  enter_key_behavior_desktop: "system",
+  enter_key_behavior_mobile: "system",
+  time_format: "system",
+  font_size: 14,
+  web_search_enabled: true,
+};
+
 export interface GeminiTtsSettings {
   tts_api_keys: string[];
   tts_voice: GeminiTtsVoice;
@@ -373,6 +389,12 @@ export type Database = {
           tts_api_key: string;
           tts_api_keys: string[];
           tts_voice: string;
+          enter_key_behavior: "system" | "submit" | "newline";
+          enter_key_behavior_desktop: GeneralSettings["enter_key_behavior_desktop"];
+          enter_key_behavior_mobile: GeneralSettings["enter_key_behavior_mobile"];
+          time_format: GeneralSettings["time_format"];
+          font_size: number;
+          web_search_enabled: boolean;
           updated_at: string;
         };
         Insert: {
@@ -385,6 +407,12 @@ export type Database = {
           tts_api_key?: string;
           tts_api_keys?: string[];
           tts_voice?: string;
+          enter_key_behavior?: "system" | "submit" | "newline";
+          enter_key_behavior_desktop?: GeneralSettings["enter_key_behavior_desktop"];
+          enter_key_behavior_mobile?: GeneralSettings["enter_key_behavior_mobile"];
+          time_format?: GeneralSettings["time_format"];
+          font_size?: number;
+          web_search_enabled?: boolean;
           updated_at?: string;
         };
         Update: Partial<{
@@ -396,6 +424,12 @@ export type Database = {
           tts_api_key: string;
           tts_api_keys: string[];
           tts_voice: string;
+          enter_key_behavior: "system" | "submit" | "newline";
+          enter_key_behavior_desktop: GeneralSettings["enter_key_behavior_desktop"];
+          enter_key_behavior_mobile: GeneralSettings["enter_key_behavior_mobile"];
+          time_format: GeneralSettings["time_format"];
+          font_size: number;
+          web_search_enabled: boolean;
           updated_at: string;
         }>;
         Relationships: never[];
@@ -513,6 +547,35 @@ export type Database = {
           deleted_at: string | null;
         }>;
         Relationships: never[];
+      };
+      chat_message_attachment_links: {
+        Row: {
+          message_id: string;
+          attachment_id: string;
+          created_at: string;
+        };
+        Insert: {
+          message_id: string;
+          attachment_id: string;
+          created_at?: string;
+        };
+        Update: never;
+        Relationships: [
+          {
+            foreignKeyName: "chat_message_attachment_links_attachment_id_fkey";
+            columns: ["attachment_id"];
+            isOneToOne: false;
+            referencedRelation: "chat_message_attachments";
+            referencedColumns: ["id"];
+          },
+          {
+            foreignKeyName: "chat_message_attachment_links_message_id_fkey";
+            columns: ["message_id"];
+            isOneToOne: false;
+            referencedRelation: "chat_messages";
+            referencedColumns: ["id"];
+          },
+        ];
       };
       chat_tts_audio_cache: {
         Row: GeminiTtsAudioCache;
