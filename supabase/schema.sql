@@ -199,13 +199,25 @@ grant update (read_at) on public.account_inbox to authenticated;
 create table if not exists public.admin_messages (
   id uuid primary key default gen_random_uuid(),
   sender_user_id uuid not null references auth.users (id) on delete cascade,
+  source_message_id uuid references public.chat_messages (id) on delete set null,
   body text not null check (length(trim(body)) between 1 and 10000),
   attachment_id uuid,
   created_at timestamptz not null default now()
 );
 
+alter table public.admin_messages
+  add column if not exists source_message_id uuid references public.chat_messages (id) on delete set null;
+
+alter table public.chat_messages
+  add column if not exists admin_message_id uuid references public.admin_messages (id) on delete set null;
+
 create index if not exists admin_messages_created_idx
   on public.admin_messages (created_at desc);
+create index if not exists admin_messages_source_message_idx
+  on public.admin_messages (source_message_id);
+create index if not exists chat_messages_admin_message_idx
+  on public.chat_messages (admin_message_id)
+  where admin_message_id is not null;
 alter table public.admin_messages enable row level security;
 drop policy if exists "Admins can read messages sent to admins" on public.admin_messages;
 create policy "Admins can read messages sent to admins"
@@ -218,6 +230,28 @@ create policy "Admins can read messages sent to admins"
   );
 revoke all on public.admin_messages from public, anon, authenticated;
 grant select on public.admin_messages to authenticated;
+
+create table if not exists public.admin_message_feedback (
+  admin_message_id uuid not null references public.admin_messages (id) on delete cascade,
+  user_id uuid not null references auth.users (id) on delete cascade,
+  kind text not null check (kind in ('like', 'dislike', 'report')),
+  details text,
+  updated_at timestamptz not null default now(),
+  primary key (admin_message_id, user_id, kind),
+  constraint admin_message_feedback_details_check check (
+    (kind = 'report' and length(trim(coalesce(details, ''))) between 1 and 2000)
+    or (kind <> 'report' and details is null)
+  )
+);
+
+alter table public.admin_message_feedback enable row level security;
+drop policy if exists "Users can read their own admin message feedback" on public.admin_message_feedback;
+create policy "Users can read their own admin message feedback"
+  on public.admin_message_feedback for select to authenticated
+  using (auth.uid() = user_id);
+revoke all on public.admin_message_feedback from public, anon, authenticated;
+grant select on public.admin_message_feedback to authenticated;
+grant all on public.admin_message_feedback to service_role;
 
 create table if not exists public.admin_message_requests (
   id uuid primary key default gen_random_uuid(),
@@ -1283,9 +1317,11 @@ create trigger chat_messages_store_version
   after insert or update on public.chat_messages
   for each row execute function public.store_chat_message_version();
 
+drop function if exists public.relay_user_message_to_admin(uuid, text);
 create or replace function public.relay_user_message_to_admin(
   p_sender_user_id uuid,
-  p_body text
+  p_body text,
+  p_source_message_id uuid
 )
 returns uuid
 language plpgsql
@@ -1305,22 +1341,32 @@ begin
     raise exception 'Only user accounts can relay messages to administrators.';
   end if;
   if not exists (
+    select 1 from public.chat_messages as source_message
+    where source_message.id = p_source_message_id
+      and source_message.user_id = p_sender_user_id
+      and source_message.role = 'user'
+      and source_message.is_active
+  ) then
+    raise exception 'The source user message could not be verified.';
+  end if;
+  if not exists (
     select 1 from public.account_profiles as profile
     where profile.role = 'admin'
   ) then
     raise exception 'No administrator account is available to receive this message.';
   end if;
 
-  insert into public.admin_messages (sender_user_id, body)
-  values (p_sender_user_id, p_body)
+  insert into public.admin_messages (sender_user_id, source_message_id, body)
+  values (p_sender_user_id, p_source_message_id, p_body)
   returning id into admin_message_id;
 
-  insert into public.chat_messages (user_id, role, content, revision_reason)
+  insert into public.chat_messages (user_id, role, content, revision_reason, admin_message_id)
   select
     profile.user_id,
     'assistant',
     p_body,
-    'initial'
+    'initial',
+    admin_message_id
   from public.account_profiles as profile
   where profile.role = 'admin';
 
@@ -1328,8 +1374,46 @@ begin
 end;
 $$;
 
-revoke all on function public.relay_user_message_to_admin(uuid, text) from public, anon, authenticated;
-grant execute on function public.relay_user_message_to_admin(uuid, text) to service_role;
+revoke all on function public.relay_user_message_to_admin(uuid, text, uuid) from public, anon, authenticated;
+grant execute on function public.relay_user_message_to_admin(uuid, text, uuid) to service_role;
+
+create or replace function public.update_admin_message_relay(
+  p_admin_message_id uuid,
+  p_body text
+)
+returns integer
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  updated_count integer := 0;
+begin
+  if auth.role() is distinct from 'service_role' then
+    raise exception 'Only the account service can revise an administrator relay.';
+  end if;
+  if length(trim(p_body)) not between 1 and 10000 then
+    raise exception 'The revised administrator message must contain 1 to 10000 characters.';
+  end if;
+
+  update public.admin_messages
+  set body = p_body
+  where id = p_admin_message_id;
+  if not found then
+    raise exception 'The administrator relay could not be found.';
+  end if;
+
+  update public.chat_messages
+  set content = p_body,
+      revision_reason = 'ai_update'
+  where admin_message_id = p_admin_message_id;
+  get diagnostics updated_count = row_count;
+  return updated_count;
+end;
+$$;
+
+revoke all on function public.update_admin_message_relay(uuid, text) from public, anon, authenticated;
+grant execute on function public.update_admin_message_relay(uuid, text) to service_role;
 
 update public.chat_messages as message
 set role = 'assistant',
@@ -1708,11 +1792,13 @@ begin
 end;
 $$;
 
+drop function if exists public.complete_chat_job(uuid, text, extensions.vector, text);
 create or replace function public.complete_chat_job(
   p_job_id uuid,
   p_content text,
   p_embedding extensions.vector(768),
-  p_thinking_summary text
+  p_thinking_summary text,
+  p_admin_message_id uuid default null
 )
 returns setof public.chat_messages
 language plpgsql
@@ -1737,6 +1823,14 @@ begin
   if not found then
     raise exception 'Chat job not found.';
   end if;
+  if p_admin_message_id is not null and not exists (
+    select 1 from public.admin_messages as relay
+    where relay.id = p_admin_message_id
+      and relay.sender_user_id = job.user_id
+      and relay.source_message_id = job.message_id
+  ) then
+    raise exception 'The administrator relay does not belong to this chat job.';
+  end if;
 
   if job.status = 'completed' and job.assistant_message_id is not null then
     return query
@@ -1753,7 +1847,8 @@ begin
     content,
     embedding,
     thinking_summary,
-    revision_reason
+    revision_reason,
+    admin_message_id
   )
   values (
     job.user_id,
@@ -1761,7 +1856,8 @@ begin
     p_content,
     p_embedding,
     p_thinking_summary,
-    'initial'
+    'initial',
+    p_admin_message_id
   )
   returning * into result;
 
@@ -1900,9 +1996,9 @@ revoke all on function public.create_chat_job_with_attachments(text, boolean, uu
   from public, anon;
 grant execute on function public.create_chat_job_with_attachments(text, boolean, uuid[])
   to authenticated;
-revoke all on function public.complete_chat_job(uuid, text, extensions.vector, text)
+revoke all on function public.complete_chat_job(uuid, text, extensions.vector, text, uuid)
   from public, anon, authenticated;
-grant execute on function public.complete_chat_job(uuid, text, extensions.vector, text)
+grant execute on function public.complete_chat_job(uuid, text, extensions.vector, text, uuid)
   to service_role;
 revoke all on function public.match_chat_messages_for_user(uuid, extensions.vector, integer, uuid)
   from public, anon, authenticated;

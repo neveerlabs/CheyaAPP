@@ -154,12 +154,13 @@ database infrastructure are managed by the operator.
 
 The server verifies the account role for every cross-account AI action. User accounts can use
 personal data tools only within their own account and can explicitly ask Cheya to relay a message
-to the administrator. Relayed content appears only in the administrator's chat as untrusted quoted
-content; it is not added to the notification inbox. Administrators can search account content and
+to the administrator. The relay is attributed with the sender's verified account identity and
+appears only in the administrator's chat; it is not added to the notification inbox. Relay feedback
+is stored separately from ordinary chat-response feedback, and regenerating a relay updates the
+forwarded message rather than rerunning the chat response. Administrators can search account content and
 prepare messages for one or more accounts; every outgoing admin message stays pending until an
 administrator approves it in the chat header's notification inbox. Approved messages are added to each recipient's
-inbox and sent as push notifications. Relayed messages appear in the administrator's chat with a
-clear sender label and quoted-content boundary. API keys, push subscription credentials, and private file
+inbox and sent as push notifications. API keys, push subscription credentials, and private file
 bytes are never provided to the model. Forwarded attachments are restricted to the original 24-hour
 retention window and are opened through a short-lived, administrator-only link.
 

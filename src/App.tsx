@@ -985,6 +985,7 @@ interface ChatMessage {
   createdAt: string;
   versionNumber: number;
   thinkingSummary: string | null;
+  adminMessageId?: string | null;
   isReminder?: boolean;
   attachments?: ChatAttachment[];
 }
@@ -1063,6 +1064,7 @@ interface DeleteChatTarget {
 interface ReportTarget {
   id: string;
   versionNumber: number;
+  adminMessageId?: string;
 }
 
 interface TtsPlayback {
@@ -1286,6 +1288,8 @@ export function App() {
   const [thinkingSteps, setThinkingSteps] = useState<string[]>([]);
   const [expandedThinkingIds, setExpandedThinkingIds] = useState<Set<string>>(() => new Set());
   const [ratings, setRatings] = useState<Record<string, AssistantRating>>({});
+  const [adminRelayRatings, setAdminRelayRatings] = useState<Record<string, AssistantRating>>({});
+  const [regeneratingAdminRelayId, setRegeneratingAdminRelayId] = useState<string | null>(null);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [ttsPlayback, setTtsPlayback] = useState<TtsPlayback | null>(null);
   const [isTtsErrorExpanded, setIsTtsErrorExpanded] = useState(false);
@@ -2187,6 +2191,26 @@ export function App() {
           ),
         );
       }
+      const adminRelayMessageIds = [
+        ...new Set(page.messages.flatMap((message) => message.admin_message_id ?? [])),
+      ];
+      let loadedAdminRelayRatings: Record<string, AssistantRating> = {};
+      if (adminRelayMessageIds.length > 0) {
+        const { data, error } = await client
+          .from("admin_message_feedback")
+          .select("admin_message_id, kind")
+          .in("admin_message_id", adminRelayMessageIds);
+        if (error) {
+          throw new Error(`Could not load saved relay feedback: ${error.message}`);
+        }
+        loadedAdminRelayRatings = Object.fromEntries(
+          data.flatMap((item) =>
+            item.kind === "like" || item.kind === "dislike"
+              ? [[item.admin_message_id, item.kind]]
+              : [],
+          ),
+        );
+      }
 
       if (historyGenerationRef.current !== generation) return;
       const conversation = conversationRef.current;
@@ -2209,17 +2233,19 @@ export function App() {
         ),
       }));
       setRatings((current) => ({ ...current, ...loadedRatings }));
+      setAdminRelayRatings((current) => ({ ...current, ...loadedAdminRelayRatings }));
       setMessages((current) => {
         const currentIds = new Set(current.map((message) => message.id));
         const olderMessages = page.messages
           .filter((message) => !currentIds.has(message.id))
-          .map(({ id, role, content, created_at, version_number, thinking_summary, is_reminder }) => ({
+          .map(({ id, role, content, created_at, version_number, thinking_summary, is_reminder, admin_message_id }) => ({
             id,
             role,
             text: content,
             createdAt: created_at,
             versionNumber: version_number,
             thinkingSummary: thinking_summary,
+            adminMessageId: admin_message_id,
             isReminder: is_reminder,
             attachments: attachments[id] ?? [],
           }));
@@ -2422,13 +2448,14 @@ export function App() {
         ]);
         if (versionRestoreGenerationRef.current !== restoreGeneration) return;
         setMessages(
-          branch.map(({ id, role, content, created_at, version_number, thinking_summary, is_reminder }) => ({
+          branch.map(({ id, role, content, created_at, version_number, thinking_summary, is_reminder, admin_message_id }) => ({
             id,
             role,
             text: content,
             createdAt: created_at,
             versionNumber: version_number,
             thinkingSummary: thinking_summary,
+            adminMessageId: admin_message_id,
             isReminder: is_reminder,
             attachments: loadedAttachments[id] ?? [],
           })),
@@ -2836,13 +2863,14 @@ export function App() {
             current.map((message) => [message.id, message.attachments ?? []]),
           );
           return savedMessages.map(
-            ({ id, role, content, created_at, version_number, thinking_summary, is_reminder }) => ({
+            ({ id, role, content, created_at, version_number, thinking_summary, is_reminder, admin_message_id }) => ({
               id,
               role,
               text: content,
               createdAt: created_at,
               versionNumber: version_number,
               thinkingSummary: thinking_summary,
+              adminMessageId: admin_message_id,
               isReminder: is_reminder,
               attachments: currentAttachments.get(id) ?? [],
             }),
@@ -2852,7 +2880,17 @@ export function App() {
         if (savedMessages.length === 0) setIsLoadingHistory(false);
 
         const assistantMessages = savedMessages.filter((item) => item.role === "assistant");
-        const [keyResult, jobsResult, loadedVersions, loadedAttachments, loadedRatings] =
+        const adminRelayMessageIds = [
+          ...new Set(savedMessages.flatMap((item) => item.admin_message_id ?? [])),
+        ];
+        const [
+          keyResult,
+          jobsResult,
+          loadedVersions,
+          loadedAttachments,
+          loadedRatings,
+          loadedAdminRelayRatings,
+        ] =
           await Promise.all([
           authClient
             .from("ai_api_keys")
@@ -2893,6 +2931,23 @@ export function App() {
             });
             return ratings;
           })(),
+          (async () => {
+            if (adminRelayMessageIds.length === 0) return {};
+            const { data: feedback, error } = await authClient
+              .from("admin_message_feedback")
+              .select("admin_message_id, kind")
+              .in("admin_message_id", adminRelayMessageIds);
+            if (error) {
+              throw new Error(`Could not load saved relay feedback. Run the latest server schema. ${error.message}`);
+            }
+            return Object.fromEntries(
+              feedback.flatMap((item) =>
+                item.kind === "like" || item.kind === "dislike"
+                  ? [[item.admin_message_id, item.kind]]
+                  : [],
+              ),
+            ) as Record<string, AssistantRating>;
+          })(),
           ]);
         if (keyResult.error) throw keyResult.error;
         if (jobsResult.error) throw jobsResult.error;
@@ -2917,6 +2972,7 @@ export function App() {
             Boolean(pendingJob) || directReplyProcessingRef.current,
           );
           setRatings(loadedRatings);
+          setAdminRelayRatings(loadedAdminRelayRatings);
           setMessageVersions(loadedVersions);
           setSelectedMessageVersions(
             Object.fromEntries(savedMessages.map((item) => [item.id, item.version_number])),
@@ -3109,6 +3165,8 @@ export function App() {
       "chat_message_attachments",
       "chat_message_attachment_links",
       "message_feedback",
+      "admin_messages",
+      "admin_message_feedback",
       "ai_api_keys",
     ] as const;
     let hasConnected = false;
@@ -3131,10 +3189,14 @@ export function App() {
         const assistantMessageIds = page.messages
           .filter((message) => message.role === "assistant")
           .map((message) => message.id);
+        const adminRelayMessageIds = [
+          ...new Set(page.messages.flatMap((message) => message.admin_message_id ?? [])),
+        ];
         const [
           attachments,
           versions,
           feedbackResult,
+          adminRelayFeedbackResult,
           keysResult,
           jobsResult,
         ] = await Promise.all([
@@ -3147,6 +3209,12 @@ export function App() {
                 .in("message_id", assistantMessageIds)
                 .in("kind", ["like", "dislike"])
             : Promise.resolve({ data: [], error: null }),
+          adminRelayMessageIds.length > 0
+            ? authClient
+                .from("admin_message_feedback")
+                .select("admin_message_id, kind")
+                .in("admin_message_id", adminRelayMessageIds)
+            : Promise.resolve({ data: [], error: null }),
           authClient.from("ai_api_keys").select("id").limit(1),
           authClient
             .from("chat_message_jobs")
@@ -3156,19 +3224,21 @@ export function App() {
             .limit(50),
         ]);
         if (feedbackResult.error) throw feedbackResult.error;
+        if (adminRelayFeedbackResult.error) throw adminRelayFeedbackResult.error;
         if (keysResult.error) throw keysResult.error;
         if (jobsResult.error) throw jobsResult.error;
         if (!isMounted) return;
 
         const persistedIds = new Set(messageIds);
         const serverMessages: ChatMessage[] = page.messages.map(
-          ({ id, role, content, created_at, version_number, thinking_summary, is_reminder }) => ({
+          ({ id, role, content, created_at, version_number, thinking_summary, is_reminder, admin_message_id }) => ({
             id,
             role,
             text: content,
             createdAt: created_at,
             versionNumber: version_number,
             thinkingSummary: thinking_summary,
+            adminMessageId: admin_message_id,
             isReminder: is_reminder,
             attachments: attachments[id] ?? [],
           }),
@@ -3177,6 +3247,13 @@ export function App() {
           feedbackResult.data.flatMap((item) =>
             item.kind === "like" || item.kind === "dislike"
               ? [[`${item.message_id}:${item.version_number}`, item.kind]]
+              : [],
+          ),
+        ) as Record<string, AssistantRating>;
+        const loadedAdminRelayRatings = Object.fromEntries(
+          adminRelayFeedbackResult.data.flatMap((item) =>
+            item.kind === "like" || item.kind === "dislike"
+              ? [[item.admin_message_id, item.kind]]
               : [],
           ),
         ) as Record<string, AssistantRating>;
@@ -3208,6 +3285,12 @@ export function App() {
           }
           return { ...next, ...loadedRatings };
         });
+        setAdminRelayRatings((current) => ({
+          ...Object.fromEntries(
+            Object.entries(current).filter(([adminMessageId]) => !adminRelayMessageIds.includes(adminMessageId)),
+          ),
+          ...loadedAdminRelayRatings,
+        }));
         setHasGeminiApiKey(keysResult.data.length > 0);
         setChatJobs(jobsResult.data);
         setIsSending(
@@ -4758,6 +4841,123 @@ export function App() {
     }
   }
 
+  async function postAdminRelayAction(input: Record<string, unknown>): Promise<unknown> {
+    if (!authClient) throw new Error("The CheyaVerse account service is not configured.");
+    const {
+      data: { session },
+      error: sessionError,
+    } = await authClient.auth.getSession();
+    if (sessionError) throw new Error(`Could not verify your account session: ${sessionError.message}`);
+    if (!session?.access_token) throw new Error("Sign in again before updating relay feedback.");
+    const response = await fetch("/api/admin-relay-feedback", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.access_token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(input),
+    });
+    const payload: unknown = await response.json().catch(() => null);
+    if (!response.ok) {
+      const message =
+        typeof payload === "object" &&
+        payload !== null &&
+        "statusMessage" in payload &&
+        typeof payload.statusMessage === "string"
+          ? payload.statusMessage
+          : `Could not update relay feedback (${response.status}).`;
+      throw new Error(message);
+    }
+    if (typeof payload !== "object" || payload === null) {
+      throw new Error("The relay feedback service returned an invalid response.");
+    }
+    return payload;
+  }
+
+  async function handleAdminRelayRating(
+    adminMessageId: string,
+    rating: AssistantRating,
+  ) {
+    const nextRating = adminRelayRatings[adminMessageId] === rating ? null : rating;
+    try {
+      await postAdminRelayAction({ action: "rate", adminMessageId, rating: nextRating });
+      setAdminRelayRatings((current) => {
+        const next = { ...current };
+        if (nextRating) next[adminMessageId] = nextRating;
+        else delete next[adminMessageId];
+        return next;
+      });
+      showActionToast(nextRating ? "Relay feedback saved" : "Relay feedback removed");
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : "Could not save relay feedback.");
+    }
+  }
+
+  async function regenerateAdminRelayMessage(adminMessageId: string) {
+    if (regeneratingAdminRelayId) return;
+    const client = authClient;
+    if (!client) {
+      setSendError("The CheyaVerse account service is not configured.");
+      return;
+    }
+    setRegeneratingAdminRelayId(adminMessageId);
+    setSendError("");
+    try {
+      const payload = await postAdminRelayAction({ action: "regenerate", adminMessageId });
+      if (
+        typeof payload !== "object" ||
+        payload === null ||
+        !("regenerated" in payload) ||
+        payload.regenerated !== true ||
+        !("updatedCount" in payload) ||
+        typeof payload.updatedCount !== "number" ||
+        !("body" in payload) ||
+        typeof payload.body !== "string"
+      ) {
+        throw new Error("The relay regeneration service returned an invalid response.");
+      }
+      const revisedBody = payload.body;
+      const linkedMessageIds = messages
+        .filter((message) => message.adminMessageId === adminMessageId)
+        .map((message) => message.id);
+      setMessages((current) =>
+        current.map((message) =>
+          message.adminMessageId === adminMessageId
+            ? { ...message, text: revisedBody, versionNumber: message.versionNumber + 1 }
+            : message,
+        ),
+      );
+      try {
+        const { loadMessageVersions } = await import("./lib/chat-data");
+        const versions = await loadMessageVersions(client, linkedMessageIds);
+        setMessageVersions((current) => ({ ...current, ...versions }));
+        setSelectedMessageVersions((current) => ({
+          ...current,
+          ...Object.fromEntries(
+            linkedMessageIds.map((messageId) => [
+              messageId,
+              Math.max(
+                1,
+                ...(versions[messageId] ?? []).map((version) => version.version_number),
+              ),
+            ]),
+          ),
+        }));
+      } catch (refreshError) {
+        setSendError(
+          `The relay was updated, but its version history could not be refreshed: ${
+            refreshError instanceof Error ? refreshError.message : "Unknown database error."
+          }`,
+        );
+      }
+      showActionToast("Admin relay regenerated");
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : "Could not regenerate this admin relay.");
+    } finally {
+      setRegeneratingAdminRelayId(null);
+    }
+  }
+
   async function submitAssistantReport() {
     if (!reportTarget) return;
     const details = reportDetailsRef.current.trim();
@@ -4768,6 +4968,18 @@ export function App() {
     setIsSavingReport(true);
     setReportError("");
     try {
+      if (reportTarget.adminMessageId) {
+        await postAdminRelayAction({
+          action: "report",
+          adminMessageId: reportTarget.adminMessageId,
+          details,
+        });
+        setReportTarget(null);
+        reportDetailsRef.current = "";
+        setReportError("");
+        showActionToast("Relay feedback report saved");
+        return;
+      }
       const [
         { createSupabaseClient, ensureSupabaseSession, loadDatabaseConfig },
         { saveAssistantReport },
@@ -6581,26 +6793,46 @@ export function App() {
                     {versionControls}
                     <button
                       type="button"
-                      aria-label="Like response"
-                      aria-pressed={ratings[ratingKey] === "like"}
+                      aria-label={chatMessage.adminMessageId ? "Like admin relay" : "Like response"}
+                      aria-pressed={
+                        chatMessage.adminMessageId
+                          ? adminRelayRatings[chatMessage.adminMessageId] === "like"
+                          : ratings[ratingKey] === "like"
+                      }
                       onClick={() =>
-                        void handleAssistantRating(chatMessage.id, versionNumber, "like")
+                        chatMessage.adminMessageId
+                          ? void handleAdminRelayRating(chatMessage.adminMessageId, "like")
+                          : void handleAssistantRating(chatMessage.id, versionNumber, "like")
                       }
                       className={`flex size-8 items-center justify-center rounded-lg transition hover:bg-[#f1f2f4] ${
-                        ratings[ratingKey] === "like" ? "text-[#2088bf]" : "text-[#777a82]"
+                        (chatMessage.adminMessageId
+                          ? adminRelayRatings[chatMessage.adminMessageId]
+                          : ratings[ratingKey]) === "like"
+                          ? "text-[#2088bf]"
+                          : "text-[#777a82]"
                       }`}
                     >
                       <ThumbsUp aria-hidden="true" className="size-4" />
                     </button>
                     <button
                       type="button"
-                      aria-label="Dislike response"
-                      aria-pressed={ratings[ratingKey] === "dislike"}
+                      aria-label={chatMessage.adminMessageId ? "Dislike admin relay" : "Dislike response"}
+                      aria-pressed={
+                        chatMessage.adminMessageId
+                          ? adminRelayRatings[chatMessage.adminMessageId] === "dislike"
+                          : ratings[ratingKey] === "dislike"
+                      }
                       onClick={() =>
-                        void handleAssistantRating(chatMessage.id, versionNumber, "dislike")
+                        chatMessage.adminMessageId
+                          ? void handleAdminRelayRating(chatMessage.adminMessageId, "dislike")
+                          : void handleAssistantRating(chatMessage.id, versionNumber, "dislike")
                       }
                       className={`flex size-8 items-center justify-center rounded-lg transition hover:bg-[#f1f2f4] ${
-                        ratings[ratingKey] === "dislike" ? "text-[#bd4a4a]" : "text-[#777a82]"
+                        (chatMessage.adminMessageId
+                          ? adminRelayRatings[chatMessage.adminMessageId]
+                          : ratings[ratingKey]) === "dislike"
+                          ? "text-[#bd4a4a]"
+                          : "text-[#777a82]"
                       }`}
                     >
                       <ThumbsDown aria-hidden="true" className="size-4" />
@@ -6619,11 +6851,14 @@ export function App() {
                     </button>
                     <button
                       type="button"
-                      aria-label="Report response"
+                      aria-label={chatMessage.adminMessageId ? "Report admin relay" : "Report response"}
                       onClick={() => {
                         setReportTarget({
                           id: chatMessage.id,
                           versionNumber,
+                          ...(chatMessage.adminMessageId
+                            ? { adminMessageId: chatMessage.adminMessageId }
+                            : {}),
                         });
                         reportDetailsRef.current = "";
                         setReportError("");
@@ -6661,12 +6896,19 @@ export function App() {
                     >
                       <Volume2 aria-hidden="true" className="size-4" />
                     </button>
-                    {!chatMessage.isReminder && (
+                    {!chatMessage.isReminder &&
+                      (!chatMessage.adminMessageId || authUser?.role !== "admin") && (
                       <button
                         type="button"
-                        aria-label="Regenerate response"
-                        disabled={isSending}
-                        onClick={() => void regenerateAssistantMessage(chatMessage.id)}
+                        aria-label={
+                          chatMessage.adminMessageId ? "Regenerate admin relay" : "Regenerate response"
+                        }
+                        disabled={isSending || regeneratingAdminRelayId !== null}
+                        onClick={() =>
+                          chatMessage.adminMessageId
+                            ? void regenerateAdminRelayMessage(chatMessage.adminMessageId)
+                            : void regenerateAssistantMessage(chatMessage.id)
+                        }
                         className="ml-auto flex size-8 items-center justify-center rounded-lg text-[#777a82] transition hover:bg-[#f1f2f4] disabled:opacity-50"
                       >
                         <RotateCw aria-hidden="true" className="size-4" />

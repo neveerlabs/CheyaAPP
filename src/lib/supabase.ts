@@ -40,7 +40,6 @@ export type AccountProfile = {
   github_username: string | null;
   updated_at: string;
 };
-
 export type AccountInboxItem = {
   id: string;
   recipient_user_id: string;
@@ -68,9 +67,18 @@ export type AdminMessageRequest = {
 export type AdminMessage = {
   id: string;
   sender_user_id: string;
+  source_message_id: string | null;
   body: string;
   attachment_id: string | null;
   created_at: string;
+};
+
+export type AdminMessageFeedback = {
+  admin_message_id: string;
+  user_id: string;
+  kind: "like" | "dislike" | "report";
+  details: string | null;
+  updated_at: string;
 };
 
 export type AiReminder = {
@@ -201,6 +209,7 @@ export type AccountSession = {
 export type StoredChatMessage = {
   id: string;
   user_id: string;
+  admin_message_id: string | null;
   role: "user" | "assistant";
   content: string;
   embedding: string | null;
@@ -269,6 +278,7 @@ export type Database = {
         Insert: {
           id?: string;
           user_id?: string;
+          admin_message_id?: string | null;
           provider?: "gemini";
           model: GeminiModel;
           api_key: string;
@@ -312,11 +322,28 @@ export type Database = {
         Insert: {
           id?: string;
           sender_user_id: string;
+          source_message_id?: string | null;
           body: string;
           attachment_id?: string | null;
           created_at?: string;
         };
         Update: never;
+        Relationships: never[];
+      };
+      admin_message_feedback: {
+        Row: AdminMessageFeedback;
+        Insert: {
+          admin_message_id: string;
+          user_id?: string;
+          kind: AdminMessageFeedback["kind"];
+          details?: string | null;
+          updated_at?: string;
+        };
+        Update: Partial<{
+          kind: AdminMessageFeedback["kind"];
+          details: string | null;
+          updated_at: string;
+        }>;
         Relationships: never[];
       };
       admin_message_requests: {
@@ -440,6 +467,7 @@ export type Database = {
           id?: string;
           user_id?: string;
           role: StoredChatMessage["role"];
+          admin_message_id?: string | null;
           content: string;
           embedding?: string | null;
           created_at?: string;
@@ -676,8 +704,12 @@ export type Database = {
     Views: { [_ in never]: never };
     Functions: {
       relay_user_message_to_admin: {
-        Args: { p_sender_user_id: string; p_body: string };
+        Args: { p_sender_user_id: string; p_body: string; p_source_message_id: string };
         Returns: string;
+      };
+      update_admin_message_relay: {
+        Args: { p_admin_message_id: string; p_body: string };
+        Returns: number;
       };
       finalize_admin_message_request: {
         Args: { p_request_id: string; p_approve: boolean };
@@ -786,6 +818,7 @@ export type Database = {
           p_content: string;
           p_embedding: string | null;
           p_thinking_summary: string | null;
+          p_admin_message_id?: string | null;
         };
         Returns: StoredChatMessage[];
       };

@@ -162,6 +162,7 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
   const attempts: GeminiAttempt[] = [];
   const warnings: string[] = [];
   const sharedAttachmentIds = new Set<string>();
+  let adminMessageId: string | null = null;
 
   const [documentEmbeddingResult, queryEmbeddingResult] = await Promise.allSettled([
     createEmbedding(typedKeys[0].api_key, userMessage.content, "RETRIEVAL_DOCUMENT"),
@@ -413,6 +414,15 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
       executeTool: async (name, input, key) => {
         if (ACCOUNT_AI_ACTION_NAMES.has(name)) {
           const toolResult = await executeAccountAiTool(job.user_id, name, input, userMessage.id);
+          if (
+            name === "send_message_to_admin" &&
+            typeof toolResult === "object" &&
+            toolResult !== null &&
+            "messageId" in toolResult &&
+            typeof toolResult.messageId === "string"
+          ) {
+            adminMessageId = toolResult.messageId;
+          }
           if (name === "share_chat_attachment") {
             const attachmentId = getSharedAttachmentId(toolResult);
             if (!attachmentId) throw new Error("The attachment share action returned an invalid reference.");
@@ -544,6 +554,7 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
         : result.text,
     p_embedding: assistantEmbedding ? `[${assistantEmbedding.join(",")}]` : null,
     p_thinking_summary: thinkingSummary,
+    p_admin_message_id: adminMessageId,
   });
   if (completeError) throw new Error(`Could not save Cheya's response: ${completeError.message}`);
   const savedResponse = savedResponses[0] as StoredChatMessage | undefined;
