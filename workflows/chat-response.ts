@@ -6,9 +6,12 @@ import {
   loadRecentAssistantFeedback,
   loadChatMessagePage,
   loadInsightsForMessages,
+  loadRecentInsights,
   saveChatBranch,
+  saveMessageInsight,
 } from "../src/lib/chat-data";
 import {
+  analyzeGeminiMessage,
   generateGeminiConversation,
   generateThinkingSummary,
   GeminiFailoverError,
@@ -216,10 +219,72 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
   const history = (await loadChatMessagePage(client, { limit: 20, userId: job.user_id })).messages
     .filter((item) => item.id !== userMessage.id)
     .slice(-12);
+  const priorInsightsPromise = loadRecentInsights(
+    client,
+    12,
+    userMessage.id,
+    userMessage.created_at,
+    job.user_id,
+  ).then(
+    (insights) => ({ insights, error: null }),
+    (error: unknown) => ({ insights: [], error }),
+  );
+  const insightAnalysisPromise = userMessage.content === "Please review the attached files."
+    ? Promise.resolve({ ok: true as const, result: null })
+    : priorInsightsPromise
+        .then(({ insights }) =>
+          analyzeGeminiMessage(
+            typedKeys,
+            userMessage.content,
+            0,
+            history.map(({ role, content, created_at }) => ({ role, content, created_at })),
+            userMessage.created_at,
+            insights,
+          ),
+        )
+        .then(
+          (result) => ({ ok: true as const, result }),
+          (error: unknown) => ({ ok: false as const, error }),
+        );
+  const saveInsightAnalysis = async () => {
+    const priorInsights = await priorInsightsPromise;
+    if (priorInsights.error) {
+      console.error("Could not load prior insights for conversation analysis.", priorInsights.error);
+    }
+    const analysis = await insightAnalysisPromise;
+    if (!analysis.ok) {
+      console.error("Conversation insight analysis could not be completed.", analysis.error);
+      return;
+    }
+    if (!analysis.result) return;
+    const insight = analysis.result.insight;
+    if (
+      !insight.summary.trim() &&
+      !insight.mood.trim() &&
+      !insight.communication_style.trim() &&
+      !insight.situation.trim() &&
+      insight.topics.length === 0 &&
+      !insight.support_needs.trim()
+    ) {
+      return;
+    }
+    try {
+      await saveMessageInsight(client, userMessage.id, insight, job.user_id);
+    } catch (error) {
+      console.error(`Conversation insight could not be saved for message ${userMessage.id}.`, error);
+    }
+  };
   const contextResult: PromiseSettledResult<Awaited<ReturnType<typeof findRelevantContext>>> =
     queryEmbedding
       ? await Promise.allSettled([
-          findRelevantContext(client, queryEmbedding, userMessage.id, undefined, job.user_id),
+          findRelevantContext(
+            client,
+            queryEmbedding,
+            userMessage.id,
+            undefined,
+            job.user_id,
+            userMessage.content,
+          ),
         ]).then(([result]) => result)
       : {
           status: "rejected",
@@ -317,7 +382,7 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
   ];
   const [feedbackResult, insightsResult] = await Promise.allSettled([
     loadRecentAssistantFeedback(client, [...new Set(assistantIds)], 32, job.user_id),
-    loadInsightsForMessages(client, [...new Set(candidateMessageIds)], job.user_id, 20),
+    loadInsightsForMessages(client, [...new Set(candidateMessageIds)], job.user_id, 20, true),
   ]);
 
   let feedback: Awaited<ReturnType<typeof loadRecentAssistantFeedback>> = [];
@@ -355,6 +420,7 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
           ratedRequestIds,
           job.user_id,
           8,
+          true,
         );
         insights = [...ratedInsights, ...insights];
       } catch (error) {
@@ -459,6 +525,7 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
   warnings.push(...result.toolErrors.map((detail) => `A tool reported an error: ${detail}`));
 
   if (result.silent) {
+    await saveInsightAnalysis();
     for (const attempt of attempts) {
       try {
         await saveApiStatus(client, attempt, job.user_id);
@@ -545,6 +612,7 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
     );
   }
 
+  await saveInsightAnalysis();
   await updateJob(jobId, job.user_id, { progress: "Saving Cheya's response…" });
   const { data: savedResponses, error: completeError } = await client.rpc("complete_chat_job", {
     p_job_id: jobId,

@@ -37,6 +37,8 @@ export default defineEventHandler(async (event) => {
     ? Number(query.versionNumber)
     : Number.NaN;
   const voice = typeof query.voice === "string" ? query.voice : undefined;
+  const sourceHeader = getHeader(event, "x-tts-source") ?? getHeader(event, "x-gemini-tts-source");
+  const source = "gemini";
   if (!getUuid(messageId)) {
     throw createError({ statusCode: 400, statusMessage: "The cached speech message ID is invalid." });
   }
@@ -47,8 +49,16 @@ export default defineEventHandler(async (event) => {
     throw createError({ statusCode: 400, statusMessage: "The cached speech voice is invalid." });
   }
 
-  if (getHeader(event, "x-gemini-tts-source") !== "gemini") {
-    throw createError({ statusCode: 400, statusMessage: "Only Gemini TTS audio can be cached." });
+  if (sourceHeader !== source) {
+    throw createError({ statusCode: 400, statusMessage: "Only Gemini speech can be cached." });
+  }
+  const contentType = getHeader(event, "content-type")?.split(";")[0].trim().toLowerCase();
+  const expectedContentType = "audio/wav";
+  if (contentType !== expectedContentType) {
+    throw createError({
+      statusCode: 415,
+      statusMessage: `The ${source} audio must use ${expectedContentType}.`,
+    });
   }
   const audioBytes = await readRawBody(event, false);
   if (!audioBytes?.byteLength || audioBytes.byteLength > MAX_TTS_AUDIO_BYTES) {
@@ -95,6 +105,7 @@ export default defineEventHandler(async (event) => {
     .eq("message_id", messageId)
     .eq("version_number", versionNumber)
     .eq("voice", voice)
+    .eq("source", source)
     .lte("expires_at", new Date().toISOString());
   if (expiredError) {
     throw createError({
@@ -137,6 +148,7 @@ export default defineEventHandler(async (event) => {
     .eq("message_id", messageId)
     .eq("version_number", versionNumber)
     .eq("voice", voice)
+    .eq("source", source)
     .gt("expires_at", new Date().toISOString())
     .maybeSingle();
   if (existingError) {
@@ -150,15 +162,15 @@ export default defineEventHandler(async (event) => {
       cached: true,
       expiresAt: existing.expires_at,
       cleanupScheduled: true,
-      source: "gemini",
+      source,
     };
   }
 
   const cacheId = crypto.randomUUID();
-  const storagePath = `${user.id}/${messageId}/${versionNumber}/${voice}/${cacheId}.wav`;
+  const storagePath = `${user.id}/${messageId}/${versionNumber}/${source}/${voice}/${cacheId}.wav`;
   const { error: uploadError } = await serviceClient.storage
     .from(GEMINI_TTS_CACHE_BUCKET)
-    .upload(storagePath, audioBytes, { contentType: "audio/wav", upsert: false });
+    .upload(storagePath, audioBytes, { contentType, upsert: false });
   if (uploadError) {
     throw createError({
       statusCode: 502,
@@ -174,7 +186,7 @@ export default defineEventHandler(async (event) => {
     version_number: versionNumber,
     voice,
     storage_path: storagePath,
-    source: "gemini",
+    source,
     expires_at: expiresAt,
   });
   if (insertError) {
@@ -188,6 +200,7 @@ export default defineEventHandler(async (event) => {
       .eq("message_id", messageId)
       .eq("version_number", versionNumber)
       .eq("voice", voice)
+      .eq("source", source)
       .gt("expires_at", new Date().toISOString())
       .maybeSingle();
     if (!racedCacheError && racedCache) {
@@ -195,7 +208,7 @@ export default defineEventHandler(async (event) => {
         cached: true,
         expiresAt: racedCache.expires_at,
         cleanupScheduled: true,
-        source: "gemini",
+        source,
       };
     }
     throw createError({
@@ -217,7 +230,7 @@ export default defineEventHandler(async (event) => {
       `Could not schedule automatic cleanup for TTS cache ${cacheId}; the cache remains available until it expires.`,
       error,
     );
-    return { cached: true, expiresAt, cleanupScheduled: false, source: "gemini" };
+    return { cached: true, expiresAt, cleanupScheduled: false, source };
   }
-  return { cached: true, expiresAt, cleanupScheduled: true, source: "gemini" };
+  return { cached: true, expiresAt, cleanupScheduled: true, source };
 });

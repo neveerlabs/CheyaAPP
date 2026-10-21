@@ -110,7 +110,7 @@ export default defineEventHandler(async (event) => {
 
   const { data: existingId, error: existingIdError } = await serviceClient
     .from("chat_message_attachments")
-    .select("id")
+    .select("id, user_id, message_id, file_name, mime_type, size_bytes, sha256, created_at, expires_at, deleted_at")
     .eq("id", body.id)
     .eq("user_id", user.id)
     .maybeSingle();
@@ -121,7 +121,31 @@ export default defineEventHandler(async (event) => {
     });
   }
   if (existingId) {
-    throw createError({ statusCode: 409, statusMessage: "This attachment draft was already registered." });
+    if (
+      existingId.sha256 !== body.sha256 ||
+      existingId.file_name !== body.fileName.trim() ||
+      existingId.mime_type !== mimeType ||
+      existingId.size_bytes !== body.sizeBytes ||
+      existingId.deleted_at ||
+      existingId.expires_at <= new Date().toISOString()
+    ) {
+      throw createError({ statusCode: 409, statusMessage: "This attachment draft conflicts with an existing upload." });
+    }
+    return {
+      uploadRequired: false,
+      reused: false,
+      attachment: {
+        id: existingId.id,
+        user_id: existingId.user_id,
+        message_id: existingId.message_id,
+        file_name: existingId.file_name,
+        mime_type: existingId.mime_type,
+        size_bytes: existingId.size_bytes,
+        created_at: existingId.created_at,
+        expires_at: existingId.expires_at,
+        deleted_at: existingId.deleted_at,
+      },
+    };
   }
 
   if (body.action === "prepare") {

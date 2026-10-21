@@ -19,9 +19,11 @@ import chatAttachments from "../../api-handlers/chat-attachments.post";
 import chatJobs from "../../api-handlers/chat-jobs.post";
 import chatMessageAttachments from "../../api-handlers/chat-message-attachments.post";
 import databaseKeepalive from "../../api-handlers/database-keepalive.get";
+import githubChangelogs from "../../api-handlers/github-changelogs.get";
 import linkPreview from "../../api-handlers/link-preview.post";
 import pushConfig from "../../api-handlers/push-config.get";
 import pushSubscriptions from "../../api-handlers/push-subscriptions.post";
+import soundOfTextSpeech from "../../api-handlers/sound-of-text-speech.post";
 import ttsAudioCacheGet from "../../api-handlers/tts-audio-cache.get";
 import ttsAudioCachePost from "../../api-handlers/tts-audio-cache.post";
 import webSearch from "../../api-handlers/web-search.post";
@@ -41,9 +43,11 @@ const apiHandlers: Record<string, EventHandler> = {
   "POST /api/chat-jobs": chatJobs,
   "POST /api/chat-message-attachments": chatMessageAttachments,
   "GET /api/database-keepalive": databaseKeepalive,
+  "GET /api/github-changelogs": githubChangelogs,
   "POST /api/link-preview": linkPreview,
   "GET /api/push-config": pushConfig,
   "POST /api/push-subscriptions": pushSubscriptions,
+  "POST /api/sound-of-text-speech": soundOfTextSpeech,
   "GET /api/tts-audio-cache": ttsAudioCacheGet,
   "POST /api/tts-audio-cache": ttsAudioCachePost,
   "POST /api/web-search": webSearch,

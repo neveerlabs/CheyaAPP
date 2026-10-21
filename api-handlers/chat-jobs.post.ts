@@ -10,6 +10,7 @@ type ChatJobRequest = {
   thinkingMode?: unknown;
   attachmentIds?: unknown;
   barcodeReadings?: unknown;
+  clientRequestId?: unknown;
 };
 
 export default defineEventHandler(async (event) => {
@@ -40,6 +41,14 @@ export default defineEventHandler(async (event) => {
   }
   if (body.thinkingMode !== undefined && typeof body.thinkingMode !== "boolean") {
     throw createError({ statusCode: 400, statusMessage: "Thinking mode must be a boolean." });
+  }
+  if (
+    typeof body.clientRequestId !== "string" ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      body.clientRequestId,
+    )
+  ) {
+    throw createError({ statusCode: 400, statusMessage: "A valid client request ID is required." });
   }
   if (
     body.attachmentIds !== undefined &&
@@ -123,12 +132,55 @@ export default defineEventHandler(async (event) => {
     p_content: content || "Please review the attached files.",
     p_thinking_mode: body.thinkingMode === true,
     p_attachment_ids: attachmentIds,
+    p_client_request_id: body.clientRequestId,
   });
   if (jobError) {
     throw createError({ statusCode: 500, statusMessage: `Could not save your message: ${jobError.message}` });
   }
   const job = jobs[0];
   if (!job) throw createError({ statusCode: 500, statusMessage: "The database did not return a chat job." });
+
+  if (!job.created) {
+    const { data: existingJob, error: existingJobError } = await requestClient
+      .from("chat_message_jobs")
+      .select("status")
+      .eq("id", job.job_id)
+      .eq("user_id", user.id)
+      .maybeSingle();
+    if (existingJobError || !existingJob) {
+      throw createError({
+        statusCode: 500,
+        statusMessage: `Could not check the existing chat request: ${
+          existingJobError?.message ?? "The job was not found."
+        }`,
+      });
+    }
+    if (existingJob.status !== "failed") {
+      return { jobId: job.job_id, messageId: job.message_id, runId: null };
+    }
+    const { data: retryClaim, error: retryError } = await createServiceRoleClient()
+      .from("chat_message_jobs")
+      .update({
+        status: "queued",
+        error: null,
+        progress: "Retrying your chat request…",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", job.job_id)
+      .eq("user_id", user.id)
+      .eq("status", "failed")
+      .select("id")
+      .maybeSingle();
+    if (retryError) {
+      throw createError({
+        statusCode: 500,
+        statusMessage: `Could not retry your chat request: ${retryError.message}`,
+      });
+    }
+    if (!retryClaim) {
+      return { jobId: job.job_id, messageId: job.message_id, runId: null };
+    }
+  }
 
   try {
     const run = await start(createChatResponseWorkflow, [job.job_id, typedBarcodeReadings]);

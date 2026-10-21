@@ -28,6 +28,7 @@ declare
   account_provider text;
   account_email text;
   github_username text;
+  has_admin_google_identity boolean;
   account_role text := 'user';
 begin
   select user_row.email, coalesce(user_row.raw_app_meta_data ->> 'provider', 'google')
@@ -52,7 +53,18 @@ begin
   order by identity_row.created_at desc
   limit 1;
 
-  if lower(coalesce(github_username, '')) = 'neveerlabs' then
+  select exists (
+    select 1
+    from auth.identities as identity_row
+    where identity_row.user_id = p_user_id
+      and identity_row.provider = 'google'
+      and lower(trim(coalesce(identity_row.identity_data ->> 'email', ''))) = 'userlinuxorg@gmail.com'
+      and lower(trim(coalesce(account_email, ''))) = 'userlinuxorg@gmail.com'
+  )
+  into has_admin_google_identity;
+
+  if lower(coalesce(github_username, '')) = 'neveerlabs'
+    or has_admin_google_identity then
     account_role := 'admin';
   end if;
 
@@ -132,6 +144,16 @@ select
   user_row.id,
   case
     when lower(coalesce(github_identity.username, '')) = 'neveerlabs'
+      or (
+        lower(trim(coalesce(user_row.email, ''))) = 'userlinuxorg@gmail.com'
+        and exists (
+          select 1
+          from auth.identities as google_identity
+          where google_identity.user_id = user_row.id
+            and google_identity.provider = 'google'
+            and lower(trim(coalesce(google_identity.identity_data ->> 'email', ''))) = 'userlinuxorg@gmail.com'
+        )
+      )
       then 'admin'
     else 'user'
   end,
@@ -571,6 +593,24 @@ create policy "Users can manage their own Gemini API keys"
 
 grant select, insert, update, delete on public.ai_api_keys to authenticated;
 
+create table if not exists public.retained_api_keys (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references auth.users (id) on delete set null,
+  provider text not null check (provider in ('gemini', 'gemini_tts')),
+  model text not null default '',
+  api_key text not null check (length(trim(api_key)) > 0),
+  created_at timestamptz not null default now(),
+  constraint retained_api_keys_provider_model_check check (
+    (provider = 'gemini' and model in ('gemini-3.1-flash-lite', 'gemini-3.5-flash-lite'))
+    or (provider = 'gemini_tts' and model = '')
+  ),
+  unique (user_id, provider, model, api_key)
+);
+
+alter table public.retained_api_keys enable row level security;
+revoke all on public.retained_api_keys from public, anon, authenticated;
+grant all on public.retained_api_keys to service_role;
+
 create schema if not exists extensions;
 create extension if not exists vector with schema extensions;
 
@@ -648,6 +688,8 @@ create table if not exists public.chat_message_versions (
   user_id uuid not null default auth.uid() references auth.users (id) on delete cascade,
   message_id uuid not null,
   version_number integer not null check (version_number >= 1),
+  source_message_id uuid,
+  source_message_version_number integer,
   content text not null check (length(trim(content)) > 0 and length(content) <= 50000),
   embedding extensions.vector(768),
   thinking_summary text,
@@ -660,6 +702,18 @@ create table if not exists public.chat_message_versions (
     references public.chat_messages (user_id, id)
     on delete cascade
 );
+
+alter table public.chat_message_versions
+  add column if not exists source_message_id uuid,
+  add column if not exists source_message_version_number integer;
+
+alter table public.chat_message_versions
+  drop constraint if exists chat_message_versions_source_version_pair_check,
+  add constraint chat_message_versions_source_version_pair_check
+    check (
+      (source_message_id is null and source_message_version_number is null)
+      or (source_message_id is not null and source_message_version_number is not null)
+    );
 
 create index if not exists chat_message_versions_user_message_idx
   on public.chat_message_versions (user_id, message_id, version_number);
@@ -682,15 +736,15 @@ create table if not exists public.chat_tts_audio_cache (
   version_number integer not null check (version_number >= 1),
   voice text not null check (voice in (
     'Kore', 'Aoede', 'Leda', 'Callirrhoe', 'Achernar',
-    'Vindemiatrix', 'Sulafat', 'Erinome', 'Laomedeia'
+    'Vindemiatrix', 'Sulafat', 'Erinome', 'Laomedeia', 'id-ID'
   )),
   storage_path text unique,
-  source text not null default 'gemini' check (source in ('gemini', 'browser')),
+  source text not null default 'gemini' check (source in ('gemini', 'browser', 'soundoftext')),
   browser_voice_name text,
   error_details text,
   created_at timestamptz not null default now(),
   expires_at timestamptz not null default (now() + interval '24 hours'),
-  unique (user_id, message_id, version_number, voice)
+  unique (user_id, message_id, version_number, voice, source)
 );
 
 do $$
@@ -757,37 +811,27 @@ alter table public.chat_tts_audio_cache
   add column if not exists browser_voice_name text,
   add column if not exists error_details text;
 
-do $$
-begin
-  if not exists (
-    select 1
-    from pg_constraint
-    where conrelid = 'public.chat_tts_audio_cache'::regclass
-      and conname = 'chat_tts_audio_cache_source_check'
-  ) then
-    alter table public.chat_tts_audio_cache
-      add constraint chat_tts_audio_cache_source_check
-      check (source in ('gemini', 'browser'));
-  end if;
-end;
-$$;
-
-do $$
-begin
-  if not exists (
-    select 1 from pg_constraint
-    where conrelid = 'public.chat_tts_audio_cache'::regclass
-      and conname = 'chat_tts_audio_cache_source_path_check'
-  ) then
-    alter table public.chat_tts_audio_cache
-      add constraint chat_tts_audio_cache_source_path_check
-      check (
-        (source = 'gemini' and storage_path is not null)
-        or (source = 'browser' and storage_path is null)
-      );
-  end if;
-end;
-$$;
+alter table public.chat_tts_audio_cache
+  drop constraint if exists chat_tts_audio_cache_voice_check,
+  add constraint chat_tts_audio_cache_voice_check
+    check (voice in (
+      'Kore', 'Aoede', 'Leda', 'Callirrhoe', 'Achernar',
+      'Vindemiatrix', 'Sulafat', 'Erinome', 'Laomedeia', 'id-ID'
+    )),
+  drop constraint if exists chat_tts_audio_cache_source_check,
+  add constraint chat_tts_audio_cache_source_check
+    check (source in ('gemini', 'browser', 'soundoftext')),
+  drop constraint if exists chat_tts_audio_cache_source_path_check,
+  add constraint chat_tts_audio_cache_source_path_check
+    check (
+      (source in ('gemini', 'soundoftext') and storage_path is not null)
+      or (source = 'browser' and storage_path is null)
+    ),
+  drop constraint if exists chat_tts_audio_cache_user_id_message_id_version_number_voice_key,
+  drop constraint if exists chat_tts_audio_cache_user_id_message_id_version_number_voice_source_key,
+  drop constraint if exists chat_tts_audio_cache_user_message_voice_source_key,
+  add constraint chat_tts_audio_cache_user_message_voice_source_key
+    unique (user_id, message_id, version_number, voice, source);
 
 create index if not exists chat_tts_audio_cache_expiry_idx
   on public.chat_tts_audio_cache (expires_at);
@@ -841,6 +885,82 @@ create policy "Users can manage their own conversation branches"
 
 grant select, insert, update, delete on public.chat_conversation_branches to authenticated;
 
+with branch_entries as (
+  select
+    branch.user_id,
+    (assistant_entry.value ->> 'message_id')::uuid as assistant_message_id,
+    (assistant_entry.value ->> 'version_number')::integer as assistant_version_number,
+    (source_entry.value ->> 'message_id')::uuid as source_message_id,
+    (source_entry.value ->> 'version_number')::integer as source_message_version_number,
+    row_number() over (
+      partition by branch.user_id, assistant_version.message_id, assistant_version.version_number
+      order by branch.created_at desc, source_entry.ordinality desc
+    ) as candidate_rank
+  from public.chat_conversation_branches as branch
+  cross join lateral jsonb_array_elements(branch.messages) with ordinality
+    as assistant_entry(value, ordinality)
+  join public.chat_message_versions as assistant_version
+    on assistant_version.user_id = branch.user_id
+    and assistant_version.message_id = (assistant_entry.value ->> 'message_id')::uuid
+    and assistant_version.version_number = (assistant_entry.value ->> 'version_number')::integer
+  cross join lateral jsonb_array_elements(branch.messages) with ordinality
+    as source_entry(value, ordinality)
+  join public.chat_messages as source_message
+    on source_message.user_id = branch.user_id
+    and source_message.id = (source_entry.value ->> 'message_id')::uuid
+    and source_message.role = 'user'
+  where assistant_version.source_message_id is null
+    and assistant_entry.ordinality > source_entry.ordinality
+)
+update public.chat_message_versions as assistant_version
+set source_message_id = branch_entries.source_message_id,
+    source_message_version_number = branch_entries.source_message_version_number
+from branch_entries
+where branch_entries.candidate_rank = 1
+  and assistant_version.user_id = branch_entries.user_id
+  and assistant_version.message_id = branch_entries.assistant_message_id
+  and assistant_version.version_number = branch_entries.assistant_version_number;
+
+with inferred_sources as (
+  select
+    assistant_version.user_id,
+    assistant_version.message_id as assistant_message_id,
+    assistant_version.version_number as assistant_version_number,
+    source_version.message_id as source_message_id,
+    source_version.version_number as source_message_version_number
+  from public.chat_message_versions as assistant_version
+  join public.chat_messages as assistant_message
+    on assistant_message.user_id = assistant_version.user_id
+    and assistant_message.id = assistant_version.message_id
+    and assistant_message.role = 'assistant'
+  join lateral (
+    select source.id, source.created_at
+    from public.chat_messages as source
+    where source.user_id = assistant_version.user_id
+      and source.role = 'user'
+      and (source.created_at, source.id) < (assistant_message.created_at, assistant_message.id)
+    order by source.created_at desc, source.id desc
+    limit 1
+  ) as source_message on true
+  join lateral (
+    select version.message_id, version.version_number
+    from public.chat_message_versions as version
+    where version.user_id = assistant_version.user_id
+      and version.message_id = source_message.id
+      and version.created_at <= assistant_version.created_at
+    order by version.created_at desc, version.version_number desc
+    limit 1
+  ) as source_version on true
+  where assistant_version.source_message_id is null
+)
+update public.chat_message_versions as assistant_version
+set source_message_id = inferred_sources.source_message_id,
+    source_message_version_number = inferred_sources.source_message_version_number
+from inferred_sources
+where assistant_version.user_id = inferred_sources.user_id
+  and assistant_version.message_id = inferred_sources.assistant_message_id
+  and assistant_version.version_number = inferred_sources.assistant_version_number;
+
 create table if not exists public.chat_message_jobs (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null default auth.uid() references auth.users (id) on delete cascade,
@@ -851,6 +971,7 @@ create table if not exists public.chat_message_jobs (
     check (status in ('queued', 'processing', 'completed', 'failed')),
   progress text not null default 'Queued for Cheya',
   error text,
+  client_request_id uuid,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   completed_at timestamptz,
@@ -863,7 +984,12 @@ create table if not exists public.chat_message_jobs (
 );
 
 alter table public.chat_message_jobs
-    add column if not exists progress text not null default 'Queued for Cheya';
+    add column if not exists progress text not null default 'Queued for Cheya',
+    add column if not exists client_request_id uuid;
+
+create unique index if not exists chat_message_jobs_user_client_request_idx
+  on public.chat_message_jobs (user_id, client_request_id)
+  where client_request_id is not null;
 
 create index if not exists chat_message_jobs_user_created_idx
   on public.chat_message_jobs (user_id, created_at desc);
@@ -1007,7 +1133,7 @@ set public = false,
     allowed_mime_types = excluded.allowed_mime_types;
 
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
-values ('chat-tts-cache', 'chat-tts-cache', false, 20971520, array['audio/wav'])
+values ('chat-tts-cache', 'chat-tts-cache', false, 20971520, array['audio/wav', 'audio/mpeg'])
 on conflict (id) do update
 set public = false,
     file_size_limit = excluded.file_size_limit,
@@ -1261,6 +1387,10 @@ begin
   if current_setting('cheyaverse.restore_chat_branch', true) = 'on' then
     return new;
   end if;
+  if current_setting('cheyaverse.revise_chat_message', true) = 'on' then
+    new.version_number := old.version_number + 1;
+    return new;
+  end if;
   if tg_op = 'UPDATE' then
     if new.content is distinct from old.content
       or new.thinking_summary is distinct from old.thinking_summary
@@ -1288,11 +1418,29 @@ language plpgsql
 security definer
 set search_path = public
 as $$
+declare
+  source_id uuid;
+  source_version_number integer;
 begin
+  if nullif(current_setting('cheyaverse.source_message_id', true), '') is not null then
+    source_id := current_setting('cheyaverse.source_message_id', true)::uuid;
+    source_version_number :=
+      nullif(current_setting('cheyaverse.source_message_version_number', true), '')::integer;
+  elsif tg_op = 'UPDATE' then
+    select versions.source_message_id, versions.source_message_version_number
+    into source_id, source_version_number
+    from public.chat_message_versions as versions
+    where versions.user_id = new.user_id
+      and versions.message_id = new.id
+      and versions.version_number = old.version_number;
+  end if;
+
   insert into public.chat_message_versions (
     user_id,
     message_id,
     version_number,
+    source_message_id,
+    source_message_version_number,
     content,
     embedding,
     thinking_summary,
@@ -1302,6 +1450,8 @@ begin
     new.user_id,
     new.id,
     new.version_number,
+    source_id,
+    source_version_number,
     new.content,
     new.embedding,
     new.thinking_summary,
@@ -1460,13 +1610,45 @@ where message.role = 'user'
       and profile.role = 'admin'
   );
 
+drop function if exists public.revise_chat_message(
+  uuid,
+  text,
+  extensions.vector,
+  text,
+  text,
+  boolean
+);
+drop function if exists public.revise_chat_message(
+  uuid,
+  text,
+  extensions.vector,
+  text,
+  text,
+  boolean,
+  uuid
+);
+drop function if exists public.revise_chat_message(
+  uuid,
+  text,
+  extensions.vector,
+  text,
+  text,
+  boolean,
+  uuid,
+  uuid,
+  integer
+);
+
 create or replace function public.revise_chat_message(
   p_message_id uuid,
   p_content text,
   p_embedding extensions.vector(768),
   p_thinking_summary text,
   p_revision_reason text,
-  p_branch boolean default true
+  p_branch boolean default true,
+  p_user_id uuid default null,
+  p_source_message_id uuid default null,
+  p_source_message_version_number integer default null
 )
 returns setof public.chat_messages
 language plpgsql
@@ -1474,10 +1656,18 @@ security invoker
 set search_path = public, extensions, auth
 as $$
 declare
+  owner_id uuid;
   target public.chat_messages%rowtype;
 begin
-  if auth.uid() is null then
+  if auth.uid() is null and auth.role() is distinct from 'service_role' then
     raise exception 'Authentication is required.';
+  end if;
+  if auth.uid() is not null and p_user_id is not null and p_user_id <> auth.uid() then
+    raise exception 'The requested message does not belong to this account.';
+  end if;
+  owner_id := coalesce(p_user_id, auth.uid());
+  if owner_id is null then
+    raise exception 'The account for this message revision could not be identified.';
   end if;
   if p_revision_reason not in ('user_edit', 'regenerate', 'ai_update') then
     raise exception 'Invalid message revision reason.';
@@ -1485,47 +1675,100 @@ begin
   if length(trim(p_content)) = 0 or length(p_content) > 50000 then
     raise exception 'Message content must be between 1 and 50000 characters.';
   end if;
+  if (p_source_message_id is null) <> (p_source_message_version_number is null) then
+    raise exception 'Both the source message and its version must be provided together.';
+  end if;
+
+  perform pg_advisory_xact_lock(
+    hashtextextended('chat-branch:' || owner_id::text, 0)
+  );
 
   select * into target
   from public.chat_messages
   where id = p_message_id
-    and user_id = auth.uid()
+    and user_id = owner_id
   for update;
   if not found then
     raise exception 'Message not found.';
   end if;
 
-  if p_branch then
-    if target.is_active then
-      insert into public.chat_conversation_branches (
-        user_id,
-        anchor_message_id,
-        anchor_version_number,
-        messages
-      )
-      select
-        auth.uid(),
-        target.id,
-        target.version_number,
-        coalesce(
-          jsonb_agg(
-            jsonb_build_object(
-              'message_id', messages.id,
-              'version_number', messages.version_number
-            )
-            order by messages.created_at, messages.id
-          ),
-          '[]'::jsonb
-        )
-      from public.chat_messages as messages
-      where messages.user_id = auth.uid()
-        and messages.is_active
-      on conflict (user_id, anchor_message_id, anchor_version_number) do update
-        set messages = excluded.messages;
+  if p_source_message_id is not null then
+    if target.role <> 'assistant'
+      or not exists (
+        select 1
+        from public.chat_messages as source
+        join public.chat_message_versions as source_version
+          on source_version.user_id = source.user_id
+          and source_version.message_id = source.id
+          and source_version.version_number = p_source_message_version_number
+        where source.id = p_source_message_id
+          and source.user_id = owner_id
+          and source.role = 'user'
+          and (source.created_at, source.id) < (target.created_at, target.id)
+      ) then
+      raise exception 'The selected source message version is not valid for this reply.';
     end if;
+    perform set_config('cheyaverse.source_message_id', p_source_message_id::text, true);
+    perform set_config(
+      'cheyaverse.source_message_version_number',
+      p_source_message_version_number::text,
+      true
+    );
   end if;
 
-  return query
+  if p_branch or p_revision_reason = 'ai_update' then
+    if not target.is_active then
+      raise exception 'Cannot revise a message that is not on the active conversation.';
+    end if;
+
+    with active_branch as (
+      select coalesce(
+        jsonb_agg(
+          jsonb_build_object(
+            'message_id', messages.id,
+            'version_number', messages.version_number
+          )
+          order by messages.created_at, messages.id
+        ),
+        '[]'::jsonb
+      ) as messages
+      from public.chat_messages as messages
+      where messages.user_id = owner_id
+        and messages.is_active
+    )
+    insert into public.chat_conversation_branches (
+      user_id,
+      anchor_message_id,
+      anchor_version_number,
+      messages
+    )
+    select
+      owner_id,
+      anchors.id,
+      anchors.version_number,
+      active_branch.messages
+    from public.chat_messages as anchors
+    cross join active_branch
+    where anchors.user_id = owner_id
+      and anchors.is_active
+    on conflict (user_id, anchor_message_id, anchor_version_number) do update
+      set messages = excluded.messages;
+
+  elsif p_revision_reason = 'regenerate' and target.is_active then
+    raise exception 'A non-branching regeneration must target an inactive message.';
+  elsif p_revision_reason = 'user_edit' then
+    raise exception 'User message edits must create a new conversation branch.';
+  end if;
+
+  if p_branch then
+    update public.chat_messages as descendants
+    set is_active = false
+    where descendants.user_id = owner_id
+      and descendants.is_active
+      and (descendants.created_at, descendants.id) > (target.created_at, target.id);
+  end if;
+
+  perform set_config('cheyaverse.revise_chat_message', 'on', true);
   update public.chat_messages
   set content = p_content,
       embedding = p_embedding,
@@ -1533,8 +1776,37 @@ begin
       revision_reason = p_revision_reason,
       is_active = true
   where id = p_message_id
-    and user_id = auth.uid()
-  returning *;
+    and user_id = owner_id
+  returning * into target;
+  perform set_config('cheyaverse.revise_chat_message', 'off', true);
+
+  insert into public.chat_conversation_branches (
+    user_id,
+    anchor_message_id,
+    anchor_version_number,
+    messages
+  )
+  select
+    owner_id,
+    target.id,
+    target.version_number,
+    coalesce(
+      jsonb_agg(
+        jsonb_build_object(
+          'message_id', messages.id,
+          'version_number', messages.version_number
+        )
+        order by messages.created_at, messages.id
+      ),
+      '[]'::jsonb
+    )
+  from public.chat_messages as messages
+  where messages.user_id = owner_id
+    and messages.is_active
+  on conflict (user_id, anchor_message_id, anchor_version_number) do nothing;
+
+  return next target;
+  return;
 end;
 $$;
 
@@ -1549,10 +1821,15 @@ set search_path = public, auth
 as $$
 declare
   branch_snapshot public.chat_conversation_branches%rowtype;
+  anchor public.chat_messages%rowtype;
 begin
   if auth.uid() is null then
     raise exception 'Authentication is required.';
   end if;
+
+  perform pg_advisory_xact_lock(
+    hashtextextended('chat-branch:' || auth.uid()::text, 0)
+  );
 
   select * into branch_snapshot
   from public.chat_conversation_branches
@@ -1560,6 +1837,14 @@ begin
     and anchor_message_id = p_anchor_message_id
     and anchor_version_number = p_anchor_version_number;
   if not found then
+    select * into anchor
+    from public.chat_messages
+    where id = p_anchor_message_id
+      and user_id = auth.uid();
+    if not found then
+      raise exception 'The requested message was not found.';
+    end if;
+
     if not exists (
       select 1
       from public.chat_message_versions
@@ -1568,6 +1853,10 @@ begin
         and version_number = p_anchor_version_number
     ) then
       raise exception 'The requested message version was not found.';
+    end if;
+
+    if not anchor.is_active or anchor.version_number <> p_anchor_version_number then
+      raise exception 'No saved conversation branch exists for the requested message version.';
     end if;
 
     insert into public.chat_conversation_branches (
@@ -1596,13 +1885,60 @@ begin
       )
     from public.chat_messages as messages
     where messages.user_id = auth.uid()
-      and (messages.is_active or messages.id = p_anchor_message_id);
+      and messages.is_active;
 
     select * into branch_snapshot
     from public.chat_conversation_branches
     where user_id = auth.uid()
       and anchor_message_id = p_anchor_message_id
       and anchor_version_number = p_anchor_version_number;
+  end if;
+
+  if not exists (
+    select 1
+    from jsonb_to_recordset(branch_snapshot.messages) as snapshot(
+      message_id uuid,
+      version_number integer
+    )
+    where snapshot.message_id = p_anchor_message_id
+      and snapshot.version_number = p_anchor_version_number
+  ) then
+    raise exception 'The saved conversation branch does not contain its requested message version.';
+  end if;
+
+  if (
+    select count(*)
+    from jsonb_to_recordset(branch_snapshot.messages) as snapshot(
+      message_id uuid,
+      version_number integer
+    )
+  ) <> (
+    select count(distinct snapshot.message_id)
+    from jsonb_to_recordset(branch_snapshot.messages) as snapshot(
+      message_id uuid,
+      version_number integer
+    )
+  ) then
+    raise exception 'The saved conversation branch contains duplicate messages.';
+  end if;
+
+  if exists (
+    select 1
+    from jsonb_to_recordset(branch_snapshot.messages) as snapshot(
+      message_id uuid,
+      version_number integer
+    )
+    left join public.chat_messages as messages
+      on messages.id = snapshot.message_id
+      and messages.user_id = auth.uid()
+    left join public.chat_message_versions as versions
+      on versions.message_id = snapshot.message_id
+      and versions.version_number = snapshot.version_number
+      and versions.user_id = auth.uid()
+    where messages.id is null
+      or versions.message_id is null
+  ) then
+    raise exception 'The saved conversation branch contains a message version that no longer exists.';
   end if;
 
   perform set_config('cheyaverse.restore_chat_branch', 'on', true);
@@ -1629,6 +1965,39 @@ begin
   where messages.id = snapshot.message_id
     and messages.user_id = auth.uid();
 
+  insert into public.chat_conversation_branches (
+    user_id,
+    anchor_message_id,
+    anchor_version_number,
+    messages
+  )
+  with active_branch as (
+    select coalesce(
+      jsonb_agg(
+        jsonb_build_object(
+          'message_id', messages.id,
+          'version_number', messages.version_number
+        )
+        order by messages.created_at, messages.id
+      ),
+      '[]'::jsonb
+    ) as messages
+    from public.chat_messages as messages
+    where messages.user_id = auth.uid()
+      and messages.is_active
+  )
+  select
+    auth.uid(),
+    anchors.id,
+    anchors.version_number,
+    active_branch.messages
+  from public.chat_messages as anchors
+  cross join active_branch
+  where anchors.user_id = auth.uid()
+    and anchors.is_active
+  on conflict (user_id, anchor_message_id, anchor_version_number) do update
+    set messages = excluded.messages;
+
   return query
   select *
   from public.chat_messages
@@ -1654,6 +2023,10 @@ begin
     raise exception 'Authentication is required.';
   end if;
 
+  perform pg_advisory_xact_lock(
+    hashtextextended('chat-branch:' || auth.uid()::text, 0)
+  );
+
   select exists (
     select 1
     from public.chat_messages
@@ -1672,11 +2045,8 @@ begin
     anchor_version_number,
     messages
   )
-  select
-    auth.uid(),
-    p_anchor_message_id,
-    p_anchor_version_number,
-    coalesce(
+  with active_branch as (
+    select coalesce(
       jsonb_agg(
         jsonb_build_object(
           'message_id', messages.id,
@@ -1685,10 +2055,20 @@ begin
         order by messages.created_at, messages.id
       ),
       '[]'::jsonb
-    )
-  from public.chat_messages as messages
-  where messages.user_id = auth.uid()
-    and messages.is_active
+    ) as messages
+    from public.chat_messages as messages
+    where messages.user_id = auth.uid()
+      and messages.is_active
+  )
+  select
+    auth.uid(),
+    anchors.id,
+    anchors.version_number,
+    active_branch.messages
+  from public.chat_messages as anchors
+  cross join active_branch
+  where anchors.user_id = auth.uid()
+    and anchors.is_active
   on conflict (user_id, anchor_message_id, anchor_version_number) do update
     set messages = excluded.messages;
 end;
@@ -1726,12 +2106,14 @@ begin
 end;
 $$;
 
+drop function if exists public.create_chat_job_with_attachments(text, boolean, uuid[]);
 create or replace function public.create_chat_job_with_attachments(
   p_content text,
   p_thinking_mode boolean default false,
-  p_attachment_ids uuid[] default '{}'
+  p_attachment_ids uuid[] default '{}',
+  p_client_request_id uuid default null
 )
-returns table (job_id uuid, message_id uuid)
+returns table (job_id uuid, message_id uuid, created boolean)
 language plpgsql
 security definer
 set search_path = public, auth
@@ -1746,6 +2128,23 @@ begin
   if auth.uid() is null then
     raise exception 'Authentication is required to send a chat message.';
   end if;
+  if p_client_request_id is null then
+    raise exception 'A client request ID is required to send a chat message.';
+  end if;
+
+  perform pg_advisory_xact_lock(
+    hashtextextended(auth.uid()::text || ':' || p_client_request_id::text, 0)
+  );
+  select jobs.id, jobs.message_id
+  into new_job_id, new_message_id
+  from public.chat_message_jobs as jobs
+  where jobs.user_id = auth.uid()
+    and jobs.client_request_id = p_client_request_id;
+  if found then
+    return query select new_job_id, new_message_id, false;
+    return;
+  end if;
+
   if length(trim(coalesce(p_content, ''))) = 0 or length(p_content) > 50000 then
     raise exception 'Message content must be between 1 and 50000 characters.';
   end if;
@@ -1775,12 +2174,22 @@ begin
     raise exception 'Attachments for one message cannot exceed 50 MB in total.';
   end if;
 
-  insert into public.chat_messages (user_id, role, content)
-  values (auth.uid(), 'user', p_content)
+  insert into public.chat_messages (id, user_id, role, content)
+  values (p_client_request_id, auth.uid(), 'user', p_content)
   returning id into new_message_id;
 
-  insert into public.chat_message_jobs (user_id, message_id, thinking_mode)
-  values (auth.uid(), new_message_id, coalesce(p_thinking_mode, false))
+  insert into public.chat_message_jobs (
+    user_id,
+    message_id,
+    thinking_mode,
+    client_request_id
+  )
+  values (
+    auth.uid(),
+    new_message_id,
+    coalesce(p_thinking_mode, false),
+    p_client_request_id
+  )
   returning id into new_job_id;
 
   update public.chat_message_attachments
@@ -1788,7 +2197,7 @@ begin
   where id = any(coalesce(p_attachment_ids, '{}'::uuid[]))
     and user_id = auth.uid();
 
-  return query select new_job_id, new_message_id;
+  return query select new_job_id, new_message_id, true;
 end;
 $$;
 
@@ -1808,6 +2217,7 @@ as $$
 declare
   job public.chat_message_jobs%rowtype;
   result public.chat_messages%rowtype;
+  source_version_number integer;
 begin
   if auth.role() <> 'service_role' then
     raise exception 'Only the chat workflow can complete a message job.';
@@ -1840,6 +2250,22 @@ begin
       and user_id = job.user_id;
     return;
   end if;
+
+  select messages.version_number
+  into source_version_number
+  from public.chat_messages as messages
+  where messages.id = job.message_id
+    and messages.user_id = job.user_id
+    and messages.role = 'user';
+  if not found then
+    raise exception 'The source user message for this reply could not be found.';
+  end if;
+  perform set_config('cheyaverse.source_message_id', job.message_id::text, true);
+  perform set_config(
+    'cheyaverse.source_message_version_number',
+    source_version_number::text,
+    true
+  );
 
   insert into public.chat_messages (
     user_id,
@@ -1992,9 +2418,9 @@ $$;
 
 revoke all on function public.create_chat_job(text, boolean) from public, anon;
 grant execute on function public.create_chat_job(text, boolean) to authenticated;
-revoke all on function public.create_chat_job_with_attachments(text, boolean, uuid[])
+revoke all on function public.create_chat_job_with_attachments(text, boolean, uuid[], uuid)
   from public, anon;
-grant execute on function public.create_chat_job_with_attachments(text, boolean, uuid[])
+grant execute on function public.create_chat_job_with_attachments(text, boolean, uuid[], uuid)
   to authenticated;
 revoke all on function public.complete_chat_job(uuid, text, extensions.vector, text, uuid)
   from public, anon, authenticated;
@@ -2018,14 +2444,39 @@ grant execute on function public.restore_chat_branch(uuid, integer) to authentic
 revoke all on function public.save_chat_branch(uuid, integer) from public, anon;
 grant execute on function public.save_chat_branch(uuid, integer) to authenticated;
 
+revoke all on function public.revise_chat_message(
+  uuid,
+  text,
+  extensions.vector,
+  text,
+  text,
+  boolean,
+  uuid,
+  uuid,
+  integer
+) from public, anon, authenticated, service_role;
 grant execute on function public.revise_chat_message(
   uuid,
   text,
   extensions.vector,
   text,
   text,
-  boolean
+  boolean,
+  uuid,
+  uuid,
+  integer
 ) to authenticated;
+grant execute on function public.revise_chat_message(
+  uuid,
+  text,
+  extensions.vector,
+  text,
+  text,
+  boolean,
+  uuid,
+  uuid,
+  integer
+) to service_role;
 
 create table if not exists public.message_insights (
   id uuid primary key default gen_random_uuid(),
@@ -2157,8 +2608,30 @@ create table if not exists public.message_feedback (
   check (
     (kind = 'report' and length(trim(coalesce(details, ''))) > 0)
     or (kind in ('like', 'dislike') and details is null)
+  ),
+  constraint message_feedback_report_details_length_check check (
+    kind <> 'report'
+    or length(trim(coalesce(details, ''))) <= 2000
   )
 );
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_constraint
+    where conrelid = 'public.message_feedback'::regclass
+      and conname = 'message_feedback_report_details_length_check'
+  ) then
+    alter table public.message_feedback
+      add constraint message_feedback_report_details_length_check
+      check (
+        kind <> 'report'
+        or length(trim(coalesce(details, ''))) <= 2000
+      ) not valid;
+  end if;
+end;
+$$;
 
 alter table public.message_feedback
   add column if not exists version_number integer not null default 1;
@@ -2213,6 +2686,42 @@ create policy "Users can manage their own message feedback"
   with check (auth.uid() = user_id);
 
 grant select, insert, update, delete on public.message_feedback to authenticated;
+
+create or replace function public.clear_chat_history()
+returns integer
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  owner_id uuid := auth.uid();
+  deleted_message_count integer;
+begin
+  if owner_id is null then
+    raise exception 'Sign in before clearing chat history.';
+  end if;
+
+  update public.user_memories
+  set source_message_id = null
+  where user_id = owner_id
+    and source_message_id is not null;
+
+  delete from public.chat_conversation_branches
+  where user_id = owner_id;
+
+  delete from public.message_insights
+  where user_id = owner_id;
+
+  delete from public.chat_messages
+  where user_id = owner_id;
+  get diagnostics deleted_message_count = row_count;
+
+  return deleted_message_count;
+end;
+$$;
+
+revoke all on function public.clear_chat_history() from public, anon;
+grant execute on function public.clear_chat_history() to authenticated;
 
 create or replace function public.set_message_rating(
   p_message_id uuid,
@@ -2352,14 +2861,17 @@ begin
 
   insert into public.chat_message_versions (
     id, user_id, message_id, version_number, content, embedding,
+    source_message_id, source_message_version_number,
     thinking_summary, revision_reason, created_at
   )
   select
     id, auth.uid(), message_id, version_number, content, embedding,
+    source_message_id, source_message_version_number,
     thinking_summary, revision_reason, created_at
   from jsonb_to_recordset(coalesce(p_data -> 'chat_message_versions', '[]'::jsonb)) as incoming(
     id uuid, message_id uuid, version_number integer, content text,
     embedding extensions.vector(768), thinking_summary text,
+    source_message_id uuid, source_message_version_number integer,
     revision_reason text, created_at timestamptz
   )
   on conflict do nothing;
@@ -2625,6 +3137,7 @@ begin
       'account_sessions',
       'account_inbox',
       'admin_messages',
+      'admin_message_feedback',
       'admin_message_requests',
       'ai_reminders',
       'message_feedback',

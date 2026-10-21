@@ -75,6 +75,18 @@ type GeminiApiError = {
   };
 };
 
+function readableErrorResponse(body: string, fallback: string): string {
+  const trimmed = body.trim();
+  if (!trimmed.startsWith("<")) return trimmed.slice(0, 500) || fallback;
+  const title = trimmed.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]
+    ?.replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return title
+    ? `The server returned an HTML error page: ${title.slice(0, 240)}`
+    : "The server returned an HTML error page instead of a Gemini TTS response.";
+}
+
 export async function generateGeminiSpeech(
   apiKeys: string[],
   text: string,
@@ -152,14 +164,16 @@ async function generateSpeechWithKey(
   } catch {
     throw new Error(
       response.ok
-        ? "Gemini TTS returned an invalid response."
-        : `Gemini TTS request failed (${response.status}): ${responseText || response.statusText}`,
+        ? `Gemini TTS returned an invalid response: ${readableErrorResponse(responseText, "The response was empty.")}`
+        : `Gemini TTS request failed (${response.status}): ${readableErrorResponse(responseText, response.statusText)}`,
     );
   }
 
   if (!response.ok) {
     throw new Error(
-      payload.error?.message || `Gemini TTS request failed (${response.status}).`,
+      `Gemini TTS request failed (${response.status}): ${
+        readableErrorResponse(payload.error?.message ?? "", response.statusText)
+      }`,
     );
   }
 

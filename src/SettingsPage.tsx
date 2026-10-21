@@ -10,6 +10,7 @@ import {
   Eye,
   EyeOff,
   FileText,
+  GitCommitHorizontal,
   Laptop,
   LoaderCircle,
   LogOut,
@@ -25,6 +26,7 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState, type CSSProperties, type FormEvent } from "react";
 import { LegalPageContent } from "./LegalPage";
+import { ChangelogsPage } from "./ChangelogsPage";
 import { ActionToast } from "./components/ActionToast";
 import {
   clearAccountSessionId,
@@ -78,6 +80,11 @@ interface SettingsPageProps {
   onGeminiKeyChange: (isConfigured: boolean) => void;
   onGeneralSettingsChange: (settings: GeneralSettings) => void;
 }
+
+type ApiDeleteTarget =
+  | { kind: "chat"; apiKey: GeminiApiKey }
+  | { kind: "tts"; index: number; apiKey: string }
+  | null;
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "An unexpected error occurred.";
@@ -251,6 +258,7 @@ type SettingsSection =
   | "configure"
   | "memory"
   | "messages"
+  | "changelogs"
   | "account"
   | "privacy"
   | "terms";
@@ -284,6 +292,12 @@ const settingsSections: Array<{
     label: "Memory",
     description: "Review and manage facts Cheya remembers long-term",
     icon: Brain,
+  },
+  {
+    id: "changelogs",
+    label: "Changelogs",
+    description: "Public commit history and source changes",
+    icon: GitCommitHorizontal,
   },
   {
     id: "account",
@@ -335,16 +349,17 @@ export function SettingsPage({
   const [apiKeys, setApiKeys] = useState<GeminiApiKey[]>([]);
   const [personalization, setPersonalization] =
     useState<PersonalizationSettings>(DEFAULT_PERSONALIZATION);
+  const personalizationDraftRef = useRef<PersonalizationSettings>(DEFAULT_PERSONALIZATION);
   const [generalSettings, setGeneralSettings] = useState<GeneralSettings>(DEFAULT_GENERAL_SETTINGS);
   const [enterKeyTarget, setEnterKeyTarget] = useState<"desktop" | "mobile" | "both">("both");
   const [ttsApiKeys, setTtsApiKeys] = useState(DEFAULT_GEMINI_TTS_SETTINGS.tts_api_keys);
+  const ttsApiKeysDraftRef = useRef<string[]>(DEFAULT_GEMINI_TTS_SETTINGS.tts_api_keys);
   const [ttsVoice, setTtsVoice] = useState<GeminiTtsVoice>(DEFAULT_GEMINI_TTS_VOICE);
   const [isTtsVoiceMenuOpen, setIsTtsVoiceMenuOpen] = useState(false);
   const [ttsPreviewUrl, setTtsPreviewUrl] = useState("");
   const [ttsTestMessage, setTtsTestMessage] = useState("");
   const [personalizationError, setPersonalizationError] = useState("");
   const selectedModel: GeminiModel = MULTIMODAL_GEMINI_MODELS[0];
-  const [newApiKey, setNewApiKey] = useState("");
   const [isHelpOpen, setIsHelpOpen] = useState(false);
   const [isSavingPersonalization, setIsSavingPersonalization] = useState(false);
   const [isSavingGeneralSetting, setIsSavingGeneralSetting] = useState(false);
@@ -354,6 +369,8 @@ export function SettingsPage({
   const [isLoadingPersonalization, setIsLoadingPersonalization] = useState(false);
   const [isAddingKey, setIsAddingKey] = useState(false);
   const [busyKeyId, setBusyKeyId] = useState<string | null>(null);
+  const [apiDeleteTarget, setApiDeleteTarget] = useState<ApiDeleteTarget>(null);
+  const [isDeletingApi, setIsDeletingApi] = useState(false);
   const [showApiKey, setShowApiKey] = useState(false);
   const [showTtsApiKey, setShowTtsApiKey] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
@@ -392,7 +409,12 @@ export function SettingsPage({
   const [isClearingChats, setIsClearingChats] = useState(false);
   const [isClearChatsConfirmationOpen, setIsClearChatsConfirmationOpen] = useState(false);
   const settingsContentRef = useRef<HTMLDivElement>(null);
+  const newApiKeyInputRef = useRef<HTMLInputElement>(null);
+  const displayNameInputRef = useRef<HTMLInputElement>(null);
+  const customPromptInputRef = useRef<HTMLTextAreaElement>(null);
+  const chatStyleInputRef = useRef<HTMLInputElement>(null);
   const deleteAccountConfirmationRef = useRef<HTMLInputElement>(null);
+  const ttsApiKeyInputRefs = useRef<Array<HTMLInputElement | null>>([]);
   const deleteAccountConfirmationValidRef = useRef(false);
   const personalizationDraftDirtyRef = useRef(false);
   const ttsDraftDirtyRef = useRef(false);
@@ -400,9 +422,26 @@ export function SettingsPage({
   const ttsPreviewAudioRef = useRef<HTMLAudioElement>(null);
   const ttsPreviewUrlRef = useRef("");
   const ttsVoicePickerRef = useRef<HTMLDivElement>(null);
-  const normalizedTtsApiKeys = [
-    ...new Set(ttsApiKeys.map((key) => key.trim()).filter(Boolean)),
-  ];
+  function getNormalizedTtsApiKeys() {
+    return [...new Set(ttsApiKeysDraftRef.current.map((key) => key.trim()).filter(Boolean))];
+  }
+
+  function updateTtsApiKeys(keys: string[]) {
+    ttsApiKeysDraftRef.current = keys;
+    setTtsApiKeys(keys);
+    keys.forEach((key, index) => {
+      const input = ttsApiKeyInputRefs.current[index];
+      if (input) input.value = key;
+    });
+  }
+
+  function applyPersonalizationDraft(settings: PersonalizationSettings) {
+    personalizationDraftRef.current = settings;
+    setPersonalization(settings);
+    if (displayNameInputRef.current) displayNameInputRef.current.value = settings.display_name;
+    if (customPromptInputRef.current) customPromptInputRef.current.value = settings.custom_prompt;
+    if (chatStyleInputRef.current) chatStyleInputRef.current.value = settings.chat_style;
+  }
 
   useEffect(() => {
     if (activeSection !== "account") return;
@@ -454,6 +493,15 @@ export function SettingsPage({
     };
   }, [isTtsVoiceMenuOpen]);
 
+  useEffect(() => {
+    if (!apiDeleteTarget) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !isDeletingApi) setApiDeleteTarget(null);
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [apiDeleteTarget, isDeletingApi]);
+
   function openSection(section: Exclude<SettingsSection, "home">) {
     onNavigate(`/settings/${section}`);
     setActiveSection(section);
@@ -462,7 +510,7 @@ export function SettingsPage({
 
   function goBack() {
     if (activeSection !== "home") {
-      window.history.back();
+      onNavigate("/settings");
       return;
     }
     onBack();
@@ -559,12 +607,12 @@ export function SettingsPage({
     const refreshWhenVisible = () => {
       if (document.visibilityState === "visible") void refreshAccountSessions();
     };
-    const timer = window.setInterval(() => void refreshAccountSessions(), 10_000);
     document.addEventListener("visibilitychange", refreshWhenVisible);
+    window.addEventListener("pageshow", refreshWhenVisible);
     return () => {
       isMounted = false;
-      window.clearInterval(timer);
       document.removeEventListener("visibilitychange", refreshWhenVisible);
+      window.removeEventListener("pageshow", refreshWhenVisible);
     };
   }, [activeSection, client, isDatabaseReady]);
 
@@ -637,7 +685,7 @@ export function SettingsPage({
       setGeneralSettings(savedGeneralSettings);
       onGeneralSettingsChange(savedGeneralSettings);
       if (!personalizationDraftDirtyRef.current) {
-        setPersonalization({
+        applyPersonalizationDraft({
           display_name: data?.display_name ?? DEFAULT_PERSONALIZATION.display_name,
           custom_prompt: data?.custom_prompt ?? DEFAULT_PERSONALIZATION.custom_prompt,
           chat_style: data?.chat_style ?? DEFAULT_PERSONALIZATION.chat_style,
@@ -648,7 +696,7 @@ export function SettingsPage({
         const savedTtsKeys = Array.isArray(data?.tts_api_keys)
           ? data.tts_api_keys
           : [];
-        setTtsApiKeys(
+        updateTtsApiKeys(
           savedTtsKeys.length > 0
             ? savedTtsKeys
             : data?.tts_api_key
@@ -662,27 +710,45 @@ export function SettingsPage({
         );
       }
     };
+    const refreshingTables = new Set<(typeof tables)[number]>();
+    const pendingRefreshTables = new Set<(typeof tables)[number]>();
+    const refreshFrames = new Map<(typeof tables)[number], number>();
     const refreshForTable = (table: (typeof tables)[number]) => {
-      const refresh =
-        table === "account_sessions"
-          ? refreshAccountSessions
-          : table === "ai_api_keys"
-            ? refreshApiKeys
-            : table === "user_memories"
-              ? refreshMemories
-              : table === "user_settings"
-                ? refreshPersonalization
-                : null;
-      if (!refresh) return;
-      void refresh().catch((error: unknown) => {
-        if (!isMounted) return;
-        const detail = getErrorMessage(error);
-        if (table === "account_sessions") {
-          setAccountSessionsError(`Could not sync active sessions: ${detail}`);
-        } else {
-          setErrorMessage(`Could not sync ${table.split("_").join(" ")}: ${detail}`);
+      if (refreshFrames.has(table)) return;
+      const frame = window.requestAnimationFrame(() => {
+        refreshFrames.delete(table);
+        const refresh =
+          table === "account_sessions"
+            ? refreshAccountSessions
+            : table === "ai_api_keys"
+              ? refreshApiKeys
+              : table === "user_memories"
+                ? refreshMemories
+                : table === "user_settings"
+                  ? refreshPersonalization
+                  : null;
+        if (!refresh) return;
+        if (refreshingTables.has(table)) {
+          pendingRefreshTables.add(table);
+          return;
         }
+        refreshingTables.add(table);
+        void refresh()
+          .catch((error: unknown) => {
+            if (!isMounted) return;
+            const detail = getErrorMessage(error);
+            if (table === "account_sessions") {
+              setAccountSessionsError(`Could not sync active sessions: ${detail}`);
+            } else {
+              setErrorMessage(`Could not sync ${table.split("_").join(" ")}: ${detail}`);
+            }
+          })
+          .finally(() => {
+            refreshingTables.delete(table);
+            if (pendingRefreshTables.delete(table) && isMounted) refreshForTable(table);
+          });
       });
+      refreshFrames.set(table, frame);
     };
     const stopRealtime = subscribeWithReconnect(
       client,
@@ -731,6 +797,8 @@ export function SettingsPage({
     return () => {
       isMounted = false;
       stopRealtime();
+      for (const frame of refreshFrames.values()) window.cancelAnimationFrame(frame);
+      refreshFrames.clear();
     };
   }, [accountUserId, client, isDatabaseReady, onGeneralSettingsChange]);
 
@@ -826,7 +894,7 @@ export function SettingsPage({
           };
           setGeneralSettings(savedGeneralSettings);
           onGeneralSettingsChange(savedGeneralSettings);
-          setPersonalization({
+          applyPersonalizationDraft({
             display_name: data.display_name,
             custom_prompt: data.custom_prompt,
             chat_style: data.chat_style,
@@ -834,7 +902,7 @@ export function SettingsPage({
           const savedTtsKeys = Array.isArray(data.tts_api_keys)
             ? data.tts_api_keys
             : [];
-          setTtsApiKeys(
+          updateTtsApiKeys(
             savedTtsKeys.length > 0
               ? savedTtsKeys
               : data.tts_api_key
@@ -847,7 +915,7 @@ export function SettingsPage({
         } else if (isMounted) {
           setGeneralSettings(DEFAULT_GENERAL_SETTINGS);
           onGeneralSettingsChange(DEFAULT_GENERAL_SETTINGS);
-          setTtsApiKeys(DEFAULT_GEMINI_TTS_SETTINGS.tts_api_keys);
+          updateTtsApiKeys(DEFAULT_GEMINI_TTS_SETTINGS.tts_api_keys);
           setTtsVoice(DEFAULT_GEMINI_TTS_SETTINGS.tts_voice);
         }
       } catch (error) {
@@ -1025,9 +1093,9 @@ export function SettingsPage({
       const { error } = await client.from("user_settings").upsert(
         {
           user_id: data.user.id,
-          ...personalization,
-          tts_api_key: ttsApiKeys.find((key) => key.trim())?.trim() ?? "",
-          tts_api_keys: ttsApiKeys.map((key) => key.trim()).filter(Boolean),
+          ...personalizationDraftRef.current,
+          tts_api_key: ttsApiKeysDraftRef.current.find((key) => key.trim())?.trim() ?? "",
+          tts_api_keys: ttsApiKeysDraftRef.current.map((key) => key.trim()).filter(Boolean),
           tts_voice: ttsVoice,
           updated_at: new Date().toISOString(),
         },
@@ -1054,6 +1122,7 @@ export function SettingsPage({
   async function saveTtsSettings() {
     clearMessages();
     setTtsTestMessage("");
+    const normalizedTtsApiKeys = getNormalizedTtsApiKeys();
     if (!isDatabaseReady) {
       setErrorMessage("Sign in to your account before saving Gemini TTS settings.");
       return;
@@ -1074,7 +1143,7 @@ export function SettingsPage({
       const { error } = await client.from("user_settings").upsert(
         {
           user_id: data.user.id,
-          ...personalization,
+          ...personalizationDraftRef.current,
           tts_api_key: normalizedTtsApiKeys[0] ?? "",
           tts_api_keys: normalizedTtsApiKeys,
           tts_voice: ttsVoice,
@@ -1087,7 +1156,7 @@ export function SettingsPage({
           `Could not save Gemini TTS settings. The CheyaVerse database may need the latest supabase/schema.sql. ${error.message}`,
         );
       }
-      setTtsApiKeys(normalizedTtsApiKeys);
+      updateTtsApiKeys(normalizedTtsApiKeys);
       ttsDraftDirtyRef.current = false;
       personalizationDraftDirtyRef.current = false;
       setNotice(`${normalizedTtsApiKeys.length} Gemini TTS API key(s) and voice saved to your CheyaVerse account.`);
@@ -1101,6 +1170,7 @@ export function SettingsPage({
   async function testGeminiTts() {
     clearMessages();
     setTtsTestMessage("");
+    const normalizedTtsApiKeys = getNormalizedTtsApiKeys();
     ttsPreviewAudioRef.current?.pause();
     if (ttsPreviewUrlRef.current) URL.revokeObjectURL(ttsPreviewUrlRef.current);
     ttsPreviewUrlRef.current = "";
@@ -1285,7 +1355,7 @@ export function SettingsPage({
       setErrorMessage("Sign in to your CheyaVerse account before adding API keys.");
       return;
     }
-    const key = newApiKey.trim();
+    const key = newApiKeyInputRef.current?.value.trim() ?? "";
     if (!key) {
       setErrorMessage("Enter a Gemini API key.");
       return;
@@ -1312,7 +1382,7 @@ export function SettingsPage({
         ),
       );
       onGeminiKeyChange(true);
-      setNewApiKey("");
+      if (newApiKeyInputRef.current) newApiKeyInputRef.current.value = "";
       setNotice("Gemini API key added. Test it or send a message to check the connection.");
     } catch (error) {
       setErrorMessage(`Could not save the API key: ${getErrorMessage(error)}`);
@@ -1371,6 +1441,7 @@ export function SettingsPage({
   async function removeApiKey(apiKey: GeminiApiKey) {
     if (!client) return;
     clearMessages();
+    setIsDeletingApi(true);
     setBusyKeyId(apiKey.id);
     try {
       const { data, error } = await client
@@ -1387,6 +1458,59 @@ export function SettingsPage({
       setErrorMessage(`Could not remove the API key: ${getErrorMessage(error)}`);
     } finally {
       setBusyKeyId(null);
+      setIsDeletingApi(false);
+      setApiDeleteTarget(null);
+    }
+  }
+
+  async function removeTtsApiKey(index: number, expectedApiKey: string) {
+    if (!client) return;
+    clearMessages();
+    setIsDeletingApi(true);
+    try {
+      if (ttsApiKeysDraftRef.current[index]?.trim() !== expectedApiKey.trim()) {
+        throw new Error("The selected TTS API key changed. Review the list and try again.");
+      }
+      const remainingKeys = [
+        ...new Set(
+          ttsApiKeysDraftRef.current
+            .filter((_, keyIndex) => keyIndex !== index)
+            .map((key) => key.trim())
+            .filter(Boolean),
+        ),
+      ];
+      const { data, error: userError } = await client.auth.getUser();
+      if (userError) throw userError;
+      if (!data.user) throw new Error("Your account session has expired. Sign in again.");
+
+      const { error } = await client.from("user_settings").upsert(
+        {
+          user_id: data.user.id,
+          tts_api_key: remainingKeys[0] ?? "",
+          tts_api_keys: remainingKeys,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "user_id" },
+      );
+      if (error) throw error;
+
+      updateTtsApiKeys(remainingKeys);
+      ttsDraftDirtyRef.current = false;
+      setNotice("Gemini TTS API key removed and settings updated.");
+    } catch (error) {
+      setErrorMessage(`Could not remove the Gemini TTS API key: ${getErrorMessage(error)}`);
+    } finally {
+      setIsDeletingApi(false);
+      setApiDeleteTarget(null);
+    }
+  }
+
+  function confirmApiKeyRemoval() {
+    if (!apiDeleteTarget || isDeletingApi) return;
+    if (apiDeleteTarget.kind === "chat") {
+      void removeApiKey(apiDeleteTarget.apiKey);
+    } else {
+      void removeTtsApiKey(apiDeleteTarget.index, apiDeleteTarget.apiKey);
     }
   }
 
@@ -1470,36 +1594,21 @@ export function SettingsPage({
     if (isClearingChats) return;
     clearMessages();
     setIsClearingChats(true);
-    let memoryReferencesDetached = false;
     try {
-      const { data, error } = await client.auth.getUser();
-      if (error) throw error;
-      if (!data.user) throw new Error("Sign in before clearing chat history.");
-
-      const { error: memoryError } = await client
-        .from("user_memories")
-        .update({ source_message_id: null })
-        .eq("user_id", data.user.id)
-        .not("source_message_id", "is", null);
-      if (memoryError) throw memoryError;
-      memoryReferencesDetached = true;
-
-      const { data: deletedMessages, error: deleteError } = await client
-        .from("chat_messages")
-        .delete()
-        .eq("user_id", data.user.id)
-        .select("id");
-      if (deleteError) throw deleteError;
+      const { data: deletedCount, error } = await client.rpc("clear_chat_history");
+      if (error) {
+        throw new Error(
+          `Could not clear chats. Apply the latest supabase/schema.sql and try again. ${error.message}`,
+        );
+      }
+      setMemories((current) =>
+        current.map((memory) => ({ ...memory, source_message_id: null })),
+      );
       setNotice(
-        `Deleted ${deletedMessages.length} chat message${deletedMessages.length === 1 ? "" : "s"} and their insights. Long-term memories were preserved.`,
+        `Deleted ${deletedCount} chat message${deletedCount === 1 ? "" : "s"}, all branches, and their insights. Long-term memories were preserved.`,
       );
     } catch (error) {
-      const detail = getErrorMessage(error);
-      setErrorMessage(
-        memoryReferencesDetached
-          ? `Could not delete chat history after protecting long-term memories. Those memories are safe; retry clearing chats. ${detail}`
-          : `Could not clear chat history: ${detail}`,
-      );
+      setErrorMessage(`Could not clear chat history: ${getErrorMessage(error)}`);
     } finally {
       setIsClearingChats(false);
     }
@@ -1750,10 +1859,10 @@ export function SettingsPage({
   );
 
   return (
-    <main className="fixed inset-0 flex justify-center bg-[#f5f6f8]">
+    <main className="fixed inset-0 flex w-screen max-w-[100vw] justify-center overflow-x-hidden bg-[#f5f6f8]">
       <section
         aria-label="Settings"
-        className={`relative flex h-full w-full overflow-hidden bg-transparent lg:flex-row ${
+        className={`relative flex h-full w-full min-w-0 overflow-hidden bg-transparent lg:flex-row ${
           activeSection === "home" ? "max-w-[720px]" : ""
         }`}
       >
@@ -1814,8 +1923,8 @@ export function SettingsPage({
         <header
           className={`absolute inset-x-0 top-0 z-20 flex h-[68px] shrink-0 items-center gap-2 border-0 bg-transparent shadow-none ${
             activeSection === "home"
-              ? "px-3 pr-[22px] sm:px-5 sm:pr-[29px]"
-              : "px-3 pr-[22px] sm:px-6 sm:pr-[34px] lg:px-6 lg:pr-[34px]"
+              ? "px-3 sm:px-5"
+              : "px-3 sm:px-6 lg:px-6"
           }`}
         >
           <button
@@ -1826,7 +1935,7 @@ export function SettingsPage({
           >
             <ArrowLeft aria-hidden="true" className="size-[21px]" />
           </button>
-          <h1 className="flex h-11 min-w-0 flex-1 items-center gap-2 rounded-full border border-[#e5e6e9] bg-white px-4 text-lg font-semibold text-[#17181b]">
+          <h1 className="-ml-1 flex h-11 min-w-0 flex-1 items-center gap-2 rounded-full border border-[#e5e6e9] bg-white px-2.5 text-lg font-semibold text-[#17181b] sm:px-3.5">
             {activeSection === "home"
               ? "Settings"
               : settingsSections.find((section) => section.id === activeSection)?.label}
@@ -1958,8 +2067,8 @@ export function SettingsPage({
                 </p>
               </div>
 
-              <div className="divide-y divide-[#eceef1] overflow-hidden rounded-2xl border border-[#e2e4e8] bg-white px-4">
-                <div className="space-y-3 py-4">
+              <div className="space-y-5">
+                <div className="space-y-3">
                   <div>
                     <h3 className="text-sm font-medium text-[#292a30]">Enter key behavior</h3>
                     <p className="mt-1 text-xs leading-5 text-[#777a81]">
@@ -2032,7 +2141,7 @@ export function SettingsPage({
                   />
                 </div>
 
-                <div className="flex min-h-[72px] items-center justify-between gap-4 py-3">
+                <div className="flex min-h-[72px] items-center justify-between gap-4">
                   <span className="min-w-0">
                     <span className="block text-sm font-medium text-[#292a30]">Notifications</span>
                     <span className="mt-1 block text-xs leading-5 text-[#777a81]">
@@ -2062,7 +2171,7 @@ export function SettingsPage({
                   )}
                 </div>
 
-                <div className="space-y-3 py-4">
+                <div className="space-y-3">
                   <div>
                     <h3 className="text-sm font-medium text-[#292a30]">Time format</h3>
                     <p className="mt-1 text-xs leading-5 text-[#777a81]">
@@ -2082,7 +2191,7 @@ export function SettingsPage({
                   />
                 </div>
 
-                <div className="space-y-3 py-4">
+                <div className="space-y-3">
                   <div className="flex items-center justify-between gap-3">
                     <span>
                       <span className="block text-sm font-medium text-[#292a30]">Chat font size</span>
@@ -2138,7 +2247,7 @@ export function SettingsPage({
                   </div>
                 </div>
 
-                <div className="flex min-h-[72px] items-center justify-between gap-4 py-3">
+                <div className="flex min-h-[72px] items-center justify-between gap-4">
                   <span className="min-w-0">
                     <span className="block text-sm font-medium text-[#292a30]">Web search</span>
                     <span className="mt-1 block text-xs leading-5 text-[#777a81]">
@@ -2175,6 +2284,8 @@ export function SettingsPage({
             </section>
           )}
 
+          {activeSection === "changelogs" && <ChangelogsPage />}
+
           {activeSection === "personal" && (
             <section
               aria-labelledby="personal-settings-title"
@@ -2204,13 +2315,14 @@ export function SettingsPage({
                   <label className="block text-xs font-medium text-[#656870]">
                     Name
                     <input
-                      value={personalization.display_name}
+                      ref={displayNameInputRef}
+                      defaultValue={personalization.display_name}
                       onChange={(event) => {
                         personalizationDraftDirtyRef.current = true;
-                        setPersonalization((current) => ({
-                          ...current,
+                        personalizationDraftRef.current = {
+                          ...personalizationDraftRef.current,
                           display_name: event.target.value,
-                        }));
+                        };
                       }}
                       maxLength={80}
                       placeholder="What should CheyaVerse call you?"
@@ -2220,13 +2332,14 @@ export function SettingsPage({
                   <label className="block text-xs font-medium text-[#656870]">
                     Custom prompt
                     <textarea
-                      value={personalization.custom_prompt}
+                      ref={customPromptInputRef}
+                      defaultValue={personalization.custom_prompt}
                       onChange={(event) => {
                         personalizationDraftDirtyRef.current = true;
-                        setPersonalization((current) => ({
-                          ...current,
+                        personalizationDraftRef.current = {
+                          ...personalizationDraftRef.current,
                           custom_prompt: event.target.value,
-                        }));
+                        };
                       }}
                       maxLength={4000}
                       rows={5}
@@ -2237,13 +2350,14 @@ export function SettingsPage({
                   <label className="block text-xs font-medium text-[#656870]">
                     Conversation style
                     <input
-                      value={personalization.chat_style}
+                      ref={chatStyleInputRef}
+                      defaultValue={personalization.chat_style}
                       onChange={(event) => {
                         personalizationDraftDirtyRef.current = true;
-                        setPersonalization((current) => ({
-                          ...current,
+                        personalizationDraftRef.current = {
+                          ...personalizationDraftRef.current,
                           chat_style: event.target.value,
-                        }));
+                        };
                       }}
                       maxLength={120}
                       placeholder="For example: friendly, concise, and casual"
@@ -2736,9 +2850,8 @@ export function SettingsPage({
                     Gemini API key
                     <span className="mt-1.5 flex h-11 items-center rounded-xl border border-[#e1e3e7] bg-white px-3 focus-within:border-[#9380dc]">
                       <input
+                        ref={newApiKeyInputRef}
                         type={showApiKey ? "text" : "password"}
-                        value={newApiKey}
-                        onChange={(event) => setNewApiKey(event.target.value)}
                         autoComplete="off"
                         spellCheck={false}
                         placeholder="Paste your Gemini API key"
@@ -2833,7 +2946,7 @@ export function SettingsPage({
                             aria-label={`Remove ${apiKey.model} API`}
                             title="Remove API"
                             disabled={busyKeyId !== null}
-                            onClick={() => void removeApiKey(apiKey)}
+                            onClick={() => setApiDeleteTarget({ kind: "chat", apiKey })}
                             className="flex size-9 shrink-0 items-center justify-center rounded-full border border-[#e6e8eb] text-[#777a81] hover:bg-red-50 hover:text-red-700 disabled:opacity-50"
                           >
                             <Trash2 aria-hidden="true" className="size-4" />
@@ -2870,16 +2983,15 @@ export function SettingsPage({
                   <div key={index} className="flex items-center gap-2">
                     <span className="flex h-11 min-w-0 flex-1 items-center rounded-xl border border-[#e1e3e7] bg-white px-3 focus-within:border-[#9380dc]">
                       <input
+                        ref={(input) => {
+                          ttsApiKeyInputRefs.current[index] = input;
+                        }}
                         aria-label={`Gemini TTS API key ${index + 1}`}
                         type={showTtsApiKey ? "text" : "password"}
-                        value={apiKey}
+                        defaultValue={apiKey}
                         onChange={(event) => {
                           ttsDraftDirtyRef.current = true;
-                          setTtsApiKeys((keys) =>
-                            keys.map((key, keyIndex) =>
-                              keyIndex === index ? event.target.value : key,
-                            ),
-                          );
+                          ttsApiKeysDraftRef.current[index] = event.currentTarget.value;
                         }}
                         autoComplete="new-password"
                         spellCheck={false}
@@ -2902,11 +3014,19 @@ export function SettingsPage({
                     <button
                       type="button"
                       aria-label={`Remove Gemini TTS API key ${index + 1}`}
+                      disabled={isDeletingApi || isSavingTtsSettings}
                       onClick={() => {
-                        ttsDraftDirtyRef.current = true;
-                        setTtsApiKeys((keys) => keys.filter((_, keyIndex) => keyIndex !== index));
+                        const currentKey = ttsApiKeysDraftRef.current[index] ?? "";
+                        if (currentKey.trim()) {
+                          setApiDeleteTarget({ kind: "tts", index, apiKey: currentKey });
+                        } else {
+                          ttsDraftDirtyRef.current = true;
+                          updateTtsApiKeys(
+                            ttsApiKeysDraftRef.current.filter((_, keyIndex) => keyIndex !== index),
+                          );
+                        }
                       }}
-                      className="flex size-10 shrink-0 items-center justify-center rounded-full text-[#777a81] transition hover:bg-red-50 hover:text-red-700"
+                      className="flex size-10 shrink-0 items-center justify-center rounded-full text-[#777a81] transition hover:bg-red-50 hover:text-red-700 disabled:opacity-50"
                     >
                       <Trash2 aria-hidden="true" className="size-4" />
                     </button>
@@ -2916,7 +3036,7 @@ export function SettingsPage({
                   type="button"
                   onClick={() => {
                     ttsDraftDirtyRef.current = true;
-                    setTtsApiKeys((keys) => [...keys, ""]);
+                    updateTtsApiKeys([...ttsApiKeysDraftRef.current, ""]);
                   }}
                   className="flex h-9 items-center gap-1.5 rounded-full px-2 text-sm font-medium text-[#565961] transition hover:bg-[#f1f2f4]"
                 >
@@ -3204,7 +3324,7 @@ export function SettingsPage({
               <div className="mt-6 pt-5">
                 <h3 className="text-sm font-semibold text-[#34363b]">Chat history</h3>
                 <p className="mt-1 text-sm leading-5 text-[#777a81]">
-                  Clear all chat messages and their insights without removing long-term memories,
+                  Clear all messages, branches, and insights without removing long-term memories,
                   API keys, or settings.
                 </p>
                 <button
@@ -3227,6 +3347,61 @@ export function SettingsPage({
         </div>
       </section>
 
+      {apiDeleteTarget && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !isDeletingApi) {
+              setApiDeleteTarget(null);
+            }
+          }}
+        >
+          <section
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="delete-api-key-title"
+            aria-describedby="delete-api-key-description"
+            className="w-full max-w-md rounded-[26px] border border-[#e2e4e8] bg-white p-5 shadow-2xl"
+          >
+            <h2 id="delete-api-key-title" className="text-base font-semibold text-[#22242a]">
+              Delete this {apiDeleteTarget.kind === "tts" ? "Gemini TTS " : ""}API key?
+            </h2>
+            <p id="delete-api-key-description" className="mt-2 text-sm leading-6 text-[#64666d]">
+              The key ending in{" "}
+              <strong>
+                {apiDeleteTarget.kind === "chat"
+                  ? apiDeleteTarget.apiKey.api_key.slice(-4)
+                  : apiDeleteTarget.apiKey.slice(-4)}
+              </strong>{" "}
+              will be removed from your account immediately. This cannot be undone.
+            </p>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={isDeletingApi}
+                onClick={() => setApiDeleteTarget(null)}
+                className="h-10 rounded-full border border-[#e5e6e9] px-4 text-sm font-medium text-[#34363b] hover:bg-[#f7f8fa] disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isDeletingApi || !isDatabaseReady}
+                onClick={confirmApiKeyRemoval}
+                className="flex h-10 items-center gap-2 rounded-full bg-red-700 px-4 text-sm font-medium text-white hover:bg-red-800 disabled:opacity-50"
+              >
+                {isDeletingApi ? (
+                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                ) : (
+                  <Trash2 aria-hidden="true" className="size-4" />
+                )}
+                Delete API key
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
       {isClearChatsConfirmationOpen && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4"
@@ -3247,8 +3422,8 @@ export function SettingsPage({
               Clear all chats?
             </h2>
             <p id="clear-chats-description" className="mt-2 text-sm leading-6 text-[#64666d]">
-              This permanently deletes all chat messages and their insights. Long-term memories,
-              API keys, and settings will be kept. This action cannot be undone.
+              This permanently deletes all chat messages, their branches, and insights. Long-term
+              memories, API keys, and settings will be kept. This action cannot be undone.
             </p>
             <div className="mt-5 flex justify-end gap-2">
               <button
@@ -3296,9 +3471,10 @@ export function SettingsPage({
               Delete your account permanently?
             </h2>
             <p id="delete-account-description" className="mt-2 text-sm leading-6 text-[#64666d]">
-              This permanently deletes your CheyaAPP account, conversations, settings, API keys,
-              memories, and stored files. This cannot be undone. Type <strong>DELETE</strong> to
-              confirm.
+              This permanently deletes your CheyaAPP account, conversations, insights, memories,
+              settings, and stored files. Gemini and TTS API keys will remain stored in the
+              database without an account link and cannot be used by this account. This cannot be
+              undone. Type <strong>DELETE</strong> to confirm.
             </p>
             <input
               ref={deleteAccountConfirmationRef}

@@ -95,6 +95,54 @@ export default defineEventHandler(async (event) => {
   const serviceClient = createServiceRoleClient();
   const attachmentPaths: string[] = [];
   const ttsPaths: string[] = [];
+  const { data: settings, error: settingsError } = await serviceClient
+    .from("user_settings")
+    .select("tts_api_key, tts_api_keys")
+    .eq("user_id", user.id)
+    .maybeSingle();
+  if (settingsError) {
+    throw createError({
+      statusCode: 500,
+      statusMessage: `Could not prepare TTS API key retention: ${settingsError.message}`,
+    });
+  }
+  const { data: geminiApiKeys, error: geminiApiKeysError } = await serviceClient
+    .from("ai_api_keys")
+    .select("model, api_key")
+    .eq("user_id", user.id);
+  if (geminiApiKeysError) {
+    throw createError({
+      statusCode: 500,
+      statusMessage: `Could not prepare Gemini API key retention: ${geminiApiKeysError.message}`,
+    });
+  }
+  const ttsApiKeys = [
+    settings?.tts_api_key,
+    ...(Array.isArray(settings?.tts_api_keys) ? settings.tts_api_keys : []),
+  ]
+    .filter((key): key is string => typeof key === "string")
+    .map((key) => key.trim())
+    .filter((key, index, keys) => key.length > 0 && keys.indexOf(key) === index);
+  const retainedApiKeys = [
+    ...geminiApiKeys.map(({ model, api_key }) => ({
+      user_id: user.id,
+      provider: "gemini" as const,
+      model,
+      api_key: api_key.trim(),
+    })),
+    ...ttsApiKeys.map((api_key) => ({
+      user_id: user.id,
+      provider: "gemini_tts" as const,
+      model: "",
+      api_key,
+    })),
+  ];
+  const uniqueRetainedApiKeys = [
+    ...new Map(retainedApiKeys.map((key) => [
+      `${key.provider}:${key.model}:${key.api_key}`,
+      key,
+    ])).values(),
+  ];
   const pageSize = 500;
   for (let offset = 0; ; offset += pageSize) {
     const { data, error } = await serviceClient
@@ -159,6 +207,32 @@ export default defineEventHandler(async (event) => {
     throw createError({
       statusCode: 500,
       statusMessage: `Account files were removed, but TTS cache metadata could not be deleted: ${ttsMetadataError.message}`,
+    });
+  }
+
+  if (uniqueRetainedApiKeys.length > 0) {
+    const { error: retainKeysError } = await serviceClient
+      .from("retained_api_keys")
+      .upsert(uniqueRetainedApiKeys, {
+        onConflict: "user_id,provider,model,api_key",
+        ignoreDuplicates: true,
+      });
+    if (retainKeysError) {
+      throw createError({
+        statusCode: 500,
+        statusMessage: `Account files were removed, but API keys could not be retained. The account was not deleted: ${retainKeysError.message}`,
+      });
+    }
+  }
+
+  const { error: sentInboxError } = await serviceClient
+    .from("account_inbox")
+    .delete()
+    .eq("sender_user_id", user.id);
+  if (sentInboxError) {
+    throw createError({
+      statusCode: 500,
+      statusMessage: `Account files were removed, but messages sent from this account could not be deleted: ${sentInboxError.message}`,
     });
   }
 

@@ -28,6 +28,7 @@ export default defineEventHandler(async (event) => {
   const versionNumber = Number(query.versionNumber);
   const voice = query.voice;
   if (
+    (query.source !== undefined && query.source !== "gemini") ||
     !getUuid(messageId) ||
     !Number.isInteger(versionNumber) ||
     versionNumber < 1 ||
@@ -72,7 +73,8 @@ export default defineEventHandler(async (event) => {
         .eq("user_id", user.id)
         .eq("message_id", messageId)
         .eq("version_number", versionNumber)
-        .eq("voice", voice);
+        .eq("voice", voice)
+        .eq("source", "gemini");
       if (deleteError) {
         throw createError({
           statusCode: 500,
@@ -86,7 +88,7 @@ export default defineEventHandler(async (event) => {
   if (!cache.storage_path) {
     throw createError({
       statusCode: 500,
-      statusMessage: "The saved Gemini speech is missing its storage path.",
+      statusMessage: "The saved speech is missing its storage path.",
     });
   }
   const secondsUntilExpiry = Math.floor((Date.parse(cache.expires_at) - Date.now()) / 1000);

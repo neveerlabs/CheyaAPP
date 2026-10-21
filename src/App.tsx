@@ -46,6 +46,8 @@ import {
   useState,
 } from "react";
 import cheyaLogo from "../assets/circle.png";
+import sendMessageSound from "../assets/sounds/send.mp3";
+import receivedMessageSound from "../assets/sounds/received.mp3";
 import { AccountLogin } from "./AccountLogin";
 import { ErrorPage } from "./ErrorPage";
 import { ActionToast } from "./components/ActionToast";
@@ -85,6 +87,14 @@ import {
   getAccountSessionLocation,
 } from "./lib/account-sessions";
 import { subscribeWithReconnect } from "./lib/realtime";
+import {
+  createSpeechWordTimeline,
+  speechTextFromMarkdown,
+  speechWordIndexAtAudioTime,
+  speechWordIndexAtCharacter,
+  speechWordIndexAtProgress,
+  type SpeechWordTimeline,
+} from "./lib/speech-text";
 import {
   ACCOUNT_AI_ACTION_NAMES,
   executeAccountAiActionFromClient,
@@ -288,6 +298,7 @@ function MediaPreview({
   fileName,
   fileSize,
   isVideo,
+  isLoading = false,
   downloadHref,
   onClose,
 }: {
@@ -295,6 +306,7 @@ function MediaPreview({
   fileName: string;
   fileSize: number;
   isVideo: boolean;
+  isLoading?: boolean;
   downloadHref?: string;
   onClose: () => void;
 }) {
@@ -592,7 +604,12 @@ function MediaPreview({
         onPointerUp={handlePointerEnd}
         onPointerCancel={handlePointerEnd}
       >
-        {isVideo ? (
+        {isLoading ? (
+          <div role="status" className="flex items-center gap-2 text-sm text-white/70">
+            <LoaderCircle aria-hidden="true" className="size-5 animate-spin" />
+            Preparing preview…
+          </div>
+        ) : isVideo ? (
           <video
             ref={(element) => {
               videoRef.current = element;
@@ -696,11 +713,13 @@ const ChatMessageAttachmentTile = memo(function ChatMessageAttachmentTile({
   expired,
   onOpen,
   getPreviewUrl,
+  size = "default",
 }: {
   attachment: ChatAttachment;
   expired: boolean;
   onOpen: (attachment: ChatAttachment) => void;
   getPreviewUrl: (attachment: ChatAttachment) => Promise<string>;
+  size?: "default" | "large";
 }) {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [previewError, setPreviewError] = useState(false);
@@ -729,7 +748,9 @@ const ChatMessageAttachmentTile = memo(function ChatMessageAttachmentTile({
       disabled={expired}
       onClick={() => onOpen(attachment)}
       dir="ltr"
-      className="group/attachment relative flex size-[96px] shrink-0 flex-col items-center justify-center overflow-hidden rounded-xl border border-[#e5e6e9] bg-white text-[#3d4148] shadow-sm transition hover:border-[#cdd3da] hover:shadow-md disabled:cursor-not-allowed disabled:opacity-65"
+      className={`group/attachment relative flex ${
+        size === "large" ? "size-[200px]" : "size-[96px]"
+      } shrink-0 flex-col items-center justify-center overflow-hidden rounded-xl border border-[#e5e6e9] bg-white text-[#3d4148] shadow-sm transition hover:border-[#cdd3da] hover:shadow-md disabled:cursor-not-allowed disabled:opacity-65`}
       aria-label={
         expired
           ? `${attachment.file_name}, expired`
@@ -990,6 +1011,89 @@ interface ChatMessage {
   attachments?: ChatAttachment[];
 }
 
+interface ChatSubmissionPayload {
+  clientRequestId: string;
+  content: string;
+  thinkingMode: boolean;
+  attachmentIds: string[];
+  barcodeReadings: AiBarcodeReading[];
+}
+
+interface FailedChatSubmission {
+  error: string;
+  retryable: boolean;
+  retrying: boolean;
+}
+
+class ChatSubmissionError extends Error {
+  retryable: boolean;
+
+  constructor(message: string, retryable: boolean) {
+    super(message);
+    this.name = "ChatSubmissionError";
+    this.retryable = retryable;
+  }
+}
+
+let chatNotificationAudioContext: AudioContext | null = null;
+const chatNotificationAudioBuffers = new Map<string, Promise<AudioBuffer>>();
+
+function getChatNotificationAudioContext(): AudioContext | null {
+  if (typeof window === "undefined" || !window.AudioContext) return null;
+  chatNotificationAudioContext ??= new window.AudioContext();
+  return chatNotificationAudioContext;
+}
+
+function loadChatNotificationSound(source: string): Promise<AudioBuffer> {
+  const existing = chatNotificationAudioBuffers.get(source);
+  if (existing) return existing;
+  const context = getChatNotificationAudioContext();
+  if (!context) return Promise.reject(new Error("Web Audio is not supported by this browser."));
+  const buffer = fetch(source)
+    .then((response) => {
+      if (!response.ok) throw new Error(`Could not load notification sound (${response.status}).`);
+      return response.arrayBuffer();
+    })
+    .then((data) => context.decodeAudioData(data));
+  chatNotificationAudioBuffers.set(source, buffer);
+  void buffer.catch(() => chatNotificationAudioBuffers.delete(source));
+  return buffer;
+}
+
+function unlockChatNotificationSounds() {
+  const context = getChatNotificationAudioContext();
+  if (!context) return;
+  if (context.state !== "running") {
+    void context.resume().catch((error: unknown) => {
+      console.warn("Could not enable chat notification sounds:", error);
+    });
+  }
+  for (const source of [sendMessageSound, receivedMessageSound]) {
+    void loadChatNotificationSound(source).catch((error: unknown) => {
+      console.warn("Could not preload chat notification sound:", error);
+    });
+  }
+}
+
+function playChatSound(source: string) {
+  const context = getChatNotificationAudioContext();
+  if (!context) return;
+  void (async () => {
+    if (context.state !== "running") await context.resume();
+    const buffer = await loadChatNotificationSound(source);
+    if (context.state !== "running") return;
+    const sound = context.createBufferSource();
+    const volume = context.createGain();
+    sound.buffer = buffer;
+    volume.gain.value = 1;
+    sound.connect(volume);
+    volume.connect(context.destination);
+    sound.start();
+  })().catch((error: unknown) => {
+    console.warn("Could not play chat notification sound:", error);
+  });
+}
+
 interface PendingChatAttachment {
   id: string;
   file: File;
@@ -1075,6 +1179,7 @@ interface TtsPlayback {
   status: "loading" | "ready" | "playing" | "paused" | "ended" | "error";
   durationSeconds: number;
   elapsedSeconds: number;
+  activeWordIndex?: number | null;
   browserVoiceName?: string;
   errorSummary?: string;
   errorDetails?: string;
@@ -1121,20 +1226,6 @@ const textFileExtensions = new Set([
 ]);
 const binaryFileExtensions = new Set(["7z", "doc", "docx", "gz", "pdf", "rar", "tar", "xls", "xlsx", "zip"]);
 
-function speechTextFromMarkdown(markdown: string): string {
-  return markdown
-    .replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1")
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-    .replace(/```[^\n]*\n?([\s\S]*?)```/g, "$1")
-    .replace(/`([^`]+)`/g, "$1")
-    .replace(/^\s{0,3}(?:#{1,6}\s+|>\s?)/gm, "")
-    .replace(/^\s*(?:[-*+]|\d+[.)])\s+/gm, "")
-    .replace(/<\/?[a-z][^>]*>/gi, "")
-    .replace(/(\*\*|__|~~|\*|_)/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
 function estimateSpeechDurationSeconds(text: string): number {
   const wordCount = text.split(/\s+/).filter(Boolean).length;
   return Math.max(1, Math.ceil((wordCount / 155) * 60));
@@ -1148,6 +1239,25 @@ function formatSpeechTime(seconds: number): string {
 function speechWaveHeight(text: string, index: number): number {
   const character = text.charCodeAt((index * 7) % Math.max(text.length, 1)) || index * 13;
   return 18 + ((character * (index + 11)) % 72);
+}
+
+async function decodeSpeechAudio(audio: Blob): Promise<AudioBuffer> {
+  if (!window.AudioContext) throw new Error("Audio validation is not supported by this browser.");
+  const audioContext = new AudioContext();
+  try {
+    const decoded = await audioContext.decodeAudioData(await audio.arrayBuffer());
+    let peak = 0;
+    for (let channel = 0; channel < decoded.numberOfChannels; channel += 1) {
+      const samples = decoded.getChannelData(channel);
+      for (let index = 0; index < samples.length; index += 1) {
+        peak = Math.max(peak, Math.abs(samples[index]));
+      }
+    }
+    if (peak < 0.0001) throw new Error("The generated audio contains no audible signal.");
+    return decoded;
+  } finally {
+    await audioContext.close();
+  }
 }
 
 function summarizeSpeechError(details: string): string {
@@ -1190,7 +1300,13 @@ function selectBrowserSpeechVoice(
   const likelyFemale = indonesianVoices.find((voice) =>
     /female|woman|perempuan|wanita|gadis/i.test(voice.name),
   );
-  return likelyFemale ?? indonesianVoices[0] ?? voices.find((voice) => /google/i.test(voice.name)) ?? null;
+  return (
+    likelyFemale ??
+    indonesianVoices[0] ??
+    voices.find((voice) => /google/i.test(voice.name)) ??
+    voices[0] ??
+    null
+  );
 }
 
 function isTextAttachment(mimeType: string, fileName: string): boolean {
@@ -1240,6 +1356,7 @@ function isPreparedAdminMessageResult(
 
 export function App() {
   const [pathname, setPathname] = useState(window.location.pathname);
+  const pathnameRef = useRef(window.location.pathname);
   const [isLoginOpen, setIsLoginOpen] = useState(false);
   const [authClient, setAuthClient] = useState<AppSupabaseClient | null>(null);
   const [authUser, setAuthUser] = useState<{
@@ -1275,8 +1392,12 @@ export function App() {
   const [historyLoadError, setHistoryLoadError] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatJobs, setChatJobs] = useState<ChatMessageJob[]>([]);
+  const [failedChatSubmissions, setFailedChatSubmissions] = useState<
+    Record<string, FailedChatSubmission>
+  >({});
   const [messageVersions, setMessageVersions] = useState<Record<string, ChatMessageVersion[]>>({});
   const [selectedMessageVersions, setSelectedMessageVersions] = useState<Record<string, number>>({});
+  const [isRestoringMessageVersion, setIsRestoringMessageVersion] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [isRestoringDraftAttachments, setIsRestoringDraftAttachments] = useState(false);
@@ -1293,8 +1414,10 @@ export function App() {
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [ttsPlayback, setTtsPlayback] = useState<TtsPlayback | null>(null);
   const [isTtsErrorExpanded, setIsTtsErrorExpanded] = useState(false);
+  const [isTtsWarningCopied, setIsTtsWarningCopied] = useState(false);
   const [reportTarget, setReportTarget] = useState<ReportTarget | null>(null);
   const reportDetailsRef = useRef("");
+  const reportCharacterCountRef = useRef<HTMLParagraphElement>(null);
   const [reportError, setReportError] = useState("");
   const [isSavingReport, setIsSavingReport] = useState(false);
   const userEditTargetRef = useRef<string | null>(null);
@@ -1349,7 +1472,9 @@ export function App() {
     attachment: ChatAttachment;
     signedUrl: string;
     textContent: string | null;
+    isLoading: boolean;
   } | null>(null);
+  const remoteAttachmentViewRequestRef = useRef(0);
   const [attachmentView, setAttachmentView] = useState<AttachmentView | null>(null);
   const [editorContent, setEditorContent] = useState("");
   const editorOriginalContentRef = useRef<string | null>(null);
@@ -1358,9 +1483,11 @@ export function App() {
   const conversationRef = useRef<HTMLDivElement>(null);
   const chatFooterObserverRef = useRef<ResizeObserver | null>(null);
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
+  const ttsWordTimelineRef = useRef<SpeechWordTimeline | null>(null);
   const ttsUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   const ttsAudioUrlRef = useRef("");
   const ttsRequestControllerRef = useRef<AbortController | null>(null);
+  const ttsStartTimeoutRef = useRef<number | null>(null);
   const ttsTokenRef = useRef(0);
   const pendingConversationScrollRestoreRef = useRef<number | null>(null);
   const pendingHistoryScrollRestoreRef = useRef<{ height: number; top: number } | null>(null);
@@ -1369,7 +1496,7 @@ export function App() {
   const loadingOlderHistoryRef = useRef(false);
   const historyGenerationRef = useRef(0);
   const versionRestoreGenerationRef = useRef(0);
-  const versionRestoreQueueRef = useRef(Promise.resolve());
+  const isRestoringMessageVersionRef = useRef(false);
   const realtimeRefreshTimerRef = useRef<number | null>(null);
   const jobRefreshTimerRef = useRef<number | null>(null);
   const cameraVideoRef = useRef<HTMLVideoElement>(null);
@@ -1417,6 +1544,22 @@ export function App() {
     chatFooterObserverRef.current = observer;
   }, []);
   const pendingOptimisticMessageIdsRef = useRef(new Set<string>());
+  useEffect(() => {
+    const visibleMessageIds = new Set(messages.map((message) => message.id));
+    for (const messageId of pendingOptimisticMessageIdsRef.current) {
+      if (!visibleMessageIds.has(messageId)) {
+        pendingOptimisticMessageIdsRef.current.delete(messageId);
+      }
+    }
+  }, [messages]);
+  const pendingChatSubmissionsRef = useRef(new Map<string, ChatSubmissionPayload>());
+  const chatSubmissionRetryAttemptsRef = useRef(new Map<string, number>());
+  const chatSubmissionNextRetryAtRef = useRef(new Map<string, number>());
+  const retryingChatSubmissionsRef = useRef(new Set<string>());
+  const retryingAttachmentUploadsRef = useRef(new Set<string>());
+  const attachmentUploadRetryAttemptsRef = useRef(new Map<string, number>());
+  const attachmentUploadNextRetryAtRef = useRef(new Map<string, number>());
+  const receivedMessageSoundsRef = useRef(new Set<string>());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const filesInputRef = useRef<HTMLInputElement>(null);
   const knownAdminRequestIdsRef = useRef<Set<string> | null>(null);
@@ -1429,9 +1572,25 @@ export function App() {
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const longPressStartRef = useRef<{ x: number; y: number } | null>(null);
   const wasSettingsRef = useRef(window.location.pathname === "/settings");
-  const activeChatJob = chatJobs.find(
-    (job) => job.status === "queued" || job.status === "processing",
+  const activeChatJob =
+    chatJobs.find((job) => job.status === "queued" || job.status === "processing") ??
+    chatJobs.find(
+      (job) =>
+        job.status === "completed" &&
+        job.message_id === pendingAssistantAnchorRef.current &&
+        job.assistant_message_id !== null &&
+        !messages.some((message) => message.id === job.assistant_message_id),
+    );
+  const pendingAssistantAnchorIndex = messages.findIndex(
+    (message) => message.id === pendingAssistantAnchorRef.current,
   );
+  const isAwaitingAssistantResponse =
+    pendingAssistantAnchorIndex >= 0 &&
+    !messages
+      .slice(pendingAssistantAnchorIndex + 1)
+      .some((message) => message.role === "assistant");
+  const isAssistantBusy =
+    isSending || Boolean(typingAssistant) || isAwaitingAssistantResponse;
   const unreadInboxMessageCount = inboxItems.filter((item) => !item.read_at).length;
   const unreadInboxCount =
     unreadInboxMessageCount +
@@ -1741,16 +1900,37 @@ export function App() {
 
   function closeTts() {
     ttsTokenRef.current += 1;
+    if (ttsStartTimeoutRef.current !== null) {
+      window.clearTimeout(ttsStartTimeoutRef.current);
+      ttsStartTimeoutRef.current = null;
+    }
     ttsRequestControllerRef.current?.abort();
     ttsRequestControllerRef.current = null;
     ttsAudioRef.current?.pause();
     ttsAudioRef.current = null;
+    ttsWordTimelineRef.current = null;
     ttsUtteranceRef.current = null;
     window.speechSynthesis?.cancel();
     if (ttsAudioUrlRef.current) URL.revokeObjectURL(ttsAudioUrlRef.current);
     ttsAudioUrlRef.current = "";
     setIsTtsErrorExpanded(false);
+    setIsTtsWarningCopied(false);
     setTtsPlayback(null);
+  }
+
+  async function copyTtsWarning(details: string) {
+    try {
+      await navigator.clipboard.writeText(details);
+      setIsTtsWarningCopied(true);
+      showActionToast("Speech warning copied.");
+      window.setTimeout(() => setIsTtsWarningCopied(false), 1800);
+    } catch (error) {
+      showAttachmentToast(
+        error instanceof Error
+          ? `Could not copy the speech warning: ${error.message}`
+          : "Could not copy the speech warning.",
+      );
+    }
   }
 
   async function startBrowserSpeech(
@@ -1768,37 +1948,65 @@ export function App() {
     const voices = await loadBrowserSpeechVoices();
     if (ttsTokenRef.current !== token) return;
     const voice = selectBrowserSpeechVoice(voices, preferredVoiceName);
-    if (!voice) {
-      throw new Error("No Google or Indonesian speech voice is installed in this browser.");
-    }
 
     const synthesis = window.speechSynthesis;
     synthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.voice = voice;
-    utterance.lang = voice.lang || "id-ID";
+    utterance.lang = voice?.lang || "id-ID";
     utterance.rate = 1;
     utterance.pitch = 1.05;
     ttsUtteranceRef.current = utterance;
+    let hasStarted = false;
+    const clearStartTimeout = () => {
+      if (ttsStartTimeoutRef.current !== null) {
+        window.clearTimeout(ttsStartTimeoutRef.current);
+        ttsStartTimeoutRef.current = null;
+      }
+    };
+    utterance.onstart = () => {
+      if (ttsTokenRef.current !== token) return;
+      hasStarted = true;
+      clearStartTimeout();
+      setTtsPlayback((current) =>
+        current?.messageId === messageId && current.status === "loading"
+          ? { ...current, status: "playing" }
+          : current,
+      );
+    };
     utterance.onboundary = (event) => {
       if (ttsTokenRef.current !== token || !text.length) return;
+      hasStarted = true;
+      clearStartTimeout();
       const progress = Math.min(1, Math.max(0, event.charIndex / text.length));
       setTtsPlayback((current) =>
         current?.messageId === messageId
-          ? { ...current, elapsedSeconds: durationSeconds * progress }
+          ? {
+              ...current,
+              status: "playing",
+              elapsedSeconds: durationSeconds * progress,
+              activeWordIndex: speechWordIndexAtCharacter(text, event.charIndex),
+            }
           : current,
       );
     };
     utterance.onend = () => {
       if (ttsTokenRef.current !== token) return;
+      clearStartTimeout();
       ttsUtteranceRef.current = null;
       setTtsPlayback((current) =>
         current?.messageId === messageId
-          ? { ...current, status: "ended", elapsedSeconds: durationSeconds }
+          ? {
+              ...current,
+              status: "ended",
+              elapsedSeconds: durationSeconds,
+              activeWordIndex: null,
+            }
           : current,
       );
     };
     utterance.onerror = (event) => {
+      clearStartTimeout();
       if (
         ttsTokenRef.current !== token ||
         event.error === "canceled" ||
@@ -1808,7 +2016,7 @@ export function App() {
       }
       const details = [
         ...previousErrors,
-        `Browser speech synthesis (${voice.name}) failed: ${event.error}.`,
+        `Browser speech synthesis (${voice?.name ?? "default system voice"}) failed: ${event.error}.`,
       ].join("\n\n");
       setTtsPlayback((current) =>
         current?.messageId === messageId
@@ -1822,22 +2030,94 @@ export function App() {
           : current,
       );
     };
-    synthesis.speak(utterance);
     setTtsPlayback({
       messageId,
       versionNumber,
       text,
       engine: "browser",
-      status: "playing",
+      status: "loading",
       durationSeconds,
       elapsedSeconds: 0,
-      browserVoiceName: voice.name,
+      browserVoiceName: voice?.name,
       errorSummary: previousErrors.length
-        ? "Gemini TTS failed; using the browser voice."
+        ? "Remote TTS failed; using the browser voice."
         : undefined,
       errorDetails: previousErrors.length ? previousErrors.join("\n\n") : undefined,
     });
-    return voice.name;
+    synthesis.speak(utterance);
+    ttsStartTimeoutRef.current = window.setTimeout(() => {
+      ttsStartTimeoutRef.current = null;
+      if (ttsTokenRef.current !== token || hasStarted) return;
+      synthesis.cancel();
+      ttsUtteranceRef.current = null;
+      const details = [
+        ...previousErrors,
+        `Browser speech synthesis (${voice?.name ?? "default system voice"}) did not start.`,
+      ].join("\n\n");
+      setTtsPlayback((current) =>
+        current?.messageId === messageId && current.status === "loading"
+          ? {
+              ...current,
+              status: "error",
+              errorSummary: summarizeSpeechError(details),
+              errorDetails: details,
+            }
+          : current,
+      );
+    }, 8000);
+    return voice?.name;
+  }
+
+  async function fallbackToBrowserSpeech(
+    messageId: string,
+    versionNumber: number,
+    text: string,
+    durationSeconds: number,
+    previousErrors: string[],
+    preferredVoiceName?: string,
+  ) {
+    const token = ttsTokenRef.current;
+    setTtsPlayback((current) =>
+      current?.messageId === messageId
+        ? {
+            ...current,
+            engine: "browser",
+            status: "loading",
+            elapsedSeconds: 0,
+            activeWordIndex: null,
+            errorSummary: undefined,
+            errorDetails: undefined,
+          }
+        : current,
+    );
+    try {
+      await startBrowserSpeech(
+        messageId,
+        versionNumber,
+        text,
+        token,
+        durationSeconds,
+        previousErrors,
+        preferredVoiceName,
+      );
+    } catch (error) {
+      if (ttsTokenRef.current !== token) return;
+      const details = [
+        ...previousErrors,
+        error instanceof Error ? error.message : "Browser speech synthesis failed.",
+      ].join("\n\n");
+      setTtsPlayback((current) =>
+        current?.messageId === messageId
+          ? {
+              ...current,
+              engine: "browser",
+              status: "error",
+              errorSummary: summarizeSpeechError(details),
+              errorDetails: details,
+            }
+          : current,
+      );
+    }
   }
 
   async function playAssistantSpeech(
@@ -1855,65 +2135,73 @@ export function App() {
       if (ttsPlayback.status === "loading") return;
       if (ttsPlayback.engine === "browser") {
         const synthesis = window.speechSynthesis;
-        if (ttsPlayback.status === "playing" && synthesis.speaking) {
-          synthesis.pause();
-          setTtsPlayback((current) =>
-            current?.messageId === messageId
-              ? { ...current, status: "paused" }
-              : current,
-          );
-          return;
+        if (ttsPlayback.status === "playing") {
+          if (synthesis.speaking && !synthesis.paused) {
+            synthesis.pause();
+            setTtsPlayback((current) =>
+              current?.messageId === messageId
+                ? { ...current, status: "paused", activeWordIndex: null }
+                : current,
+            );
+            return;
+          }
+          if (ttsUtteranceRef.current && synthesis.paused) {
+            synthesis.resume();
+            return;
+          }
         }
-        if (ttsPlayback.status === "paused" && synthesis.paused) {
+        if (
+          ttsPlayback.status === "paused" &&
+          ttsUtteranceRef.current &&
+          (synthesis.paused || synthesis.speaking)
+        ) {
           synthesis.resume();
           setTtsPlayback((current) =>
             current?.messageId === messageId
-              ? { ...current, status: "playing" }
+              ? { ...current, status: "playing", activeWordIndex: null }
               : current,
           );
           return;
         }
-        if (ttsPlayback.status === "ended" || ttsPlayback.status === "error") {
-          const previousErrors = ttsPlayback.errorDetails
-            ? ttsPlayback.errorDetails.split("\n\n")
-            : [];
-          try {
-            await startBrowserSpeech(
-              messageId,
-              versionNumber,
-              text,
-              ttsTokenRef.current,
-              ttsPlayback.durationSeconds,
-              previousErrors,
-              ttsPlayback.browserVoiceName,
-            );
-          } catch (error) {
-            const details = [
-              ttsPlayback.errorDetails,
-              error instanceof Error ? error.message : "Browser speech synthesis failed.",
-            ]
-              .filter(Boolean)
-              .join("\n\n");
-            setTtsPlayback((current) =>
-              current?.messageId === messageId
-                ? {
-                    ...current,
-                    status: "error",
-                    errorSummary: summarizeSpeechError(details),
-                    errorDetails: details,
-                  }
-                : current,
-            );
-          }
-          return;
-        }
+        const previousErrors = ttsPlayback.errorDetails
+          ? ttsPlayback.errorDetails.split("\n\n")
+          : [];
+        await fallbackToBrowserSpeech(
+          messageId,
+          versionNumber,
+          text,
+          ttsPlayback.durationSeconds,
+          previousErrors,
+          ttsPlayback.browserVoiceName,
+        );
+        return;
       }
       const audio = ttsAudioRef.current;
+      if (audio?.error) {
+        const previousErrors = [
+          ...(ttsPlayback.errorDetails ? ttsPlayback.errorDetails.split("\n\n") : []),
+          "The generated audio could not be played by this browser.",
+        ];
+        await fallbackToBrowserSpeech(
+          messageId,
+          versionNumber,
+          text,
+          ttsPlayback.durationSeconds,
+          previousErrors,
+          ttsPlayback.browserVoiceName,
+        );
+        return;
+      }
       if (audio && !audio.paused) {
         audio.pause();
         setTtsPlayback((current) =>
           current?.messageId === messageId
-            ? { ...current, elapsedSeconds: audio.currentTime, status: "paused" }
+            ? {
+                ...current,
+                elapsedSeconds: audio.currentTime,
+                status: "paused",
+                activeWordIndex: null,
+              }
             : current,
         );
         return;
@@ -1922,27 +2210,36 @@ export function App() {
         if (audio.ended) audio.currentTime = 0;
         const playbackToken = ttsTokenRef.current;
         const playPromise = audio.play();
-        setTtsPlayback((current) =>
-          current?.messageId === messageId
-            ? { ...current, status: "playing", elapsedSeconds: audio.currentTime }
-            : current,
-        );
         void playPromise.catch((error: unknown) => {
           if (ttsTokenRef.current !== playbackToken) return;
+          if (error instanceof DOMException && error.name === "AbortError") return;
           const details = error instanceof Error ? error.message : "Browser playback was blocked.";
-          setTtsPlayback((current) =>
-            current?.messageId === messageId && current.status !== "paused"
-              ? {
-                  ...current,
-                  status: "paused",
-                  errorSummary: summarizeSpeechError(details),
-                  errorDetails: details,
-                }
-              : current,
+          void fallbackToBrowserSpeech(
+            messageId,
+            versionNumber,
+            text,
+            ttsPlayback.durationSeconds,
+            [
+              ...(ttsPlayback.errorDetails ? ttsPlayback.errorDetails.split("\n\n") : []),
+              details,
+            ],
+            ttsPlayback.browserVoiceName,
           );
         });
         return;
       }
+      const previousErrors = ttsPlayback.errorDetails
+        ? ttsPlayback.errorDetails.split("\n\n")
+        : [];
+      await fallbackToBrowserSpeech(
+        messageId,
+        versionNumber,
+        text,
+        ttsPlayback.durationSeconds,
+        previousErrors,
+        ttsPlayback.browserVoiceName,
+      );
+      return;
     }
 
     closeTts();
@@ -1962,7 +2259,7 @@ export function App() {
     });
 
     try {
-      const prepared = await prepareAssistantSpeech(
+      let prepared = await prepareAssistantSpeech(
         authClient,
         messageId,
         versionNumber,
@@ -1971,6 +2268,48 @@ export function App() {
       );
       errors = prepared.errors;
       if (ttsTokenRef.current !== token) return;
+
+      let decodedAudio: AudioBuffer | null = null;
+      if (prepared.audio && prepared.audio.size <= 12 * 1024 * 1024 && window.AudioContext) {
+        try {
+          decodedAudio = await decodeSpeechAudio(prepared.audio);
+        } catch (error) {
+          const reason = error instanceof Error
+            ? error.message
+            : "The generated audio could not be decoded.";
+          errors.push(`${prepared.source === "gemini" ? "Gemini TTS" : "Sound of Text"} audio could not be played: ${reason}`);
+          decodedAudio = null;
+          if (prepared.source === "gemini") {
+            prepared = await prepareAssistantSpeech(
+              authClient,
+              messageId,
+              versionNumber,
+              text,
+              requestController.signal,
+              true,
+            );
+            errors.push(...prepared.errors);
+            if (ttsTokenRef.current !== token) return;
+            if (prepared.audio) {
+              try {
+                decodedAudio = await decodeSpeechAudio(prepared.audio);
+              } catch (fallbackError) {
+                errors.push(
+                  `Sound of Text audio could not be played: ${
+                    fallbackError instanceof Error
+                      ? fallbackError.message
+                      : "The generated audio could not be decoded."
+                  }`,
+                );
+                prepared = { ...prepared, audio: null, source: null };
+                decodedAudio = null;
+              }
+            }
+          } else {
+            prepared = { ...prepared, audio: null, source: null };
+          }
+        }
+      }
 
       if (!prepared.audio) {
         await startBrowserSpeech(
@@ -1995,7 +2334,13 @@ export function App() {
       const actualDuration = await new Promise<number>((resolve, reject) => {
         audio.addEventListener(
           "loadedmetadata",
-          () => resolve(Number.isFinite(audio.duration) ? audio.duration : durationSeconds),
+          () => {
+            if (Number.isFinite(audio.duration) && audio.duration > 0) {
+              resolve(audio.duration);
+            } else {
+              reject(new Error("The generated audio has no valid playback duration."));
+            }
+          },
           { once: true },
         );
         audio.addEventListener(
@@ -2007,12 +2352,55 @@ export function App() {
       });
       if (ttsTokenRef.current !== token) return;
 
+      let wordTimeline: SpeechWordTimeline | null = null;
+      if (decodedAudio && actualDuration <= 300) {
+        wordTimeline = createSpeechWordTimeline(decodedAudio, text);
+        if (!wordTimeline) {
+          console.warn(
+            `Local speech timing analysis found too few reliable sound peaks for message ${messageId}; using estimated word timing instead.`,
+          );
+        }
+      } else {
+        console.warn(
+          `Local speech timing analysis was skipped for message ${messageId} because the browser, audio size, or duration is unsupported.`,
+        );
+      }
+      if (ttsTokenRef.current !== token) return;
+      ttsWordTimelineRef.current = wordTimeline;
+
       audio.addEventListener("timeupdate", () => {
         if (ttsTokenRef.current !== token) return;
+        const progress = actualDuration > 0 ? audio.currentTime / actualDuration : 0;
         setTtsPlayback((current) =>
           current?.messageId === messageId
-            ? { ...current, elapsedSeconds: audio.currentTime }
+            ? {
+                ...current,
+                elapsedSeconds: audio.currentTime,
+                activeWordIndex: audio.paused
+                  ? null
+                  : wordTimeline
+                    ? speechWordIndexAtAudioTime(wordTimeline, audio.currentTime)
+                    : speechWordIndexAtProgress(text, progress),
+              }
             : current,
+        );
+      });
+      audio.addEventListener("playing", () => {
+        if (ttsTokenRef.current !== token) return;
+        setTtsPlayback((current) =>
+            current?.messageId === messageId
+              ? {
+                  ...current,
+                  status: "playing",
+                  elapsedSeconds: audio.currentTime,
+                  activeWordIndex: wordTimeline
+                    ? speechWordIndexAtAudioTime(wordTimeline, audio.currentTime)
+                    : speechWordIndexAtProgress(
+                        text,
+                        actualDuration > 0 ? audio.currentTime / actualDuration : 0,
+                      ),
+                }
+              : current,
         );
       });
       audio.addEventListener("ended", () => {
@@ -2023,6 +2411,7 @@ export function App() {
                 ...current,
                 elapsedSeconds: actualDuration,
                 status: "ended",
+                activeWordIndex: null,
               }
             : current,
         );
@@ -2042,6 +2431,19 @@ export function App() {
             : current,
         );
       });
+      audio.addEventListener("pause", () => {
+        if (ttsTokenRef.current !== token || audio.ended) return;
+        setTtsPlayback((current) =>
+            current?.messageId === messageId && current.status === "playing"
+              ? {
+                  ...current,
+                  status: "paused",
+                  elapsedSeconds: audio.currentTime,
+                  activeWordIndex: null,
+                }
+              : current,
+        );
+      });
       setTtsPlayback({
         messageId,
         versionNumber,
@@ -2057,16 +2459,12 @@ export function App() {
       if (ttsTokenRef.current !== token || requestController.signal.aborted) return;
       const details = error instanceof Error ? error.message : "Could not generate speech.";
       const allErrors = errors.length ? `${errors.join("\n\n")}\n\n${details}` : details;
-      setTtsPlayback((current) =>
-        current?.messageId === messageId
-          ? {
-              ...current,
-              engine: "loading",
-              status: "error",
-              errorSummary: summarizeSpeechError(allErrors),
-              errorDetails: allErrors,
-            }
-          : current,
+      await fallbackToBrowserSpeech(
+        messageId,
+        versionNumber,
+        text,
+        durationSeconds,
+        [allErrors],
       );
     } finally {
       if (ttsRequestControllerRef.current === requestController) {
@@ -2084,31 +2482,71 @@ export function App() {
 
     void audio.play().then(
       () => {
-        if (ttsTokenRef.current !== token) return;
-        setTtsPlayback((current) =>
-          current?.messageId === messageId && current.status === "ready"
-            ? { ...current, status: "playing" }
-            : current,
-        );
-      },
-      (error: unknown) => {
-        if (ttsTokenRef.current !== token || !audio.paused) return;
-        const details = error instanceof Error
-          ? error.message
-          : "Browser playback was blocked.";
+        if (ttsTokenRef.current !== token || audio.paused) return;
         setTtsPlayback((current) =>
           current?.messageId === messageId && current.status === "ready"
             ? {
                 ...current,
-                status: "paused",
-                errorSummary: summarizeSpeechError(details),
-                errorDetails: details,
+                status: "playing",
+                elapsedSeconds: audio.currentTime,
               }
             : current,
         );
       },
+      (error: unknown) => {
+        if (ttsTokenRef.current !== token) return;
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        const details = error instanceof Error
+          ? error.message
+          : "Browser playback was blocked.";
+        const current = ttsPlayback;
+        void fallbackToBrowserSpeech(
+          messageId,
+          current.versionNumber,
+          current.text,
+          current.durationSeconds,
+          [
+            ...(current.errorDetails ? current.errorDetails.split("\n\n") : []),
+            details,
+          ],
+          current.browserVoiceName,
+        );
+      },
     );
   }, [ttsPlayback]);
+
+  useEffect(() => {
+    if (
+      !ttsPlayback ||
+      ttsPlayback.engine !== "audio" ||
+      ttsPlayback.status !== "playing"
+    ) {
+      return;
+    }
+    const audio = ttsAudioRef.current;
+    if (!audio) return;
+
+    let frameId = 0;
+    const updateActiveWord = () => {
+      if (!audio.paused && !audio.ended && audio.duration > 0) {
+        const activeWordIndex = ttsWordTimelineRef.current
+          ? speechWordIndexAtAudioTime(ttsWordTimelineRef.current, audio.currentTime)
+          : speechWordIndexAtProgress(
+              ttsPlayback.text,
+              audio.currentTime / audio.duration,
+            );
+        setTtsPlayback((current) =>
+          current?.messageId === ttsPlayback.messageId &&
+          current.activeWordIndex !== activeWordIndex
+            ? { ...current, activeWordIndex }
+            : current,
+        );
+        frameId = window.requestAnimationFrame(updateActiveWord);
+      }
+    };
+    frameId = window.requestAnimationFrame(updateActiveWord);
+    return () => window.cancelAnimationFrame(frameId);
+  }, [ttsPlayback?.engine, ttsPlayback?.messageId, ttsPlayback?.status, ttsPlayback?.text]);
 
   useEffect(() => {
     if (pathname.startsWith("/settings")) closeTts();
@@ -2117,6 +2555,10 @@ export function App() {
   useEffect(
     () => () => {
       ttsTokenRef.current += 1;
+      if (ttsStartTimeoutRef.current !== null) {
+        window.clearTimeout(ttsStartTimeoutRef.current);
+        ttsStartTimeoutRef.current = null;
+      }
       ttsRequestControllerRef.current?.abort();
       ttsAudioRef.current?.pause();
       window.speechSynthesis?.cancel();
@@ -2360,6 +2802,28 @@ export function App() {
     return selectedMessageVersions[chatMessage.id] ?? chatMessage.versionNumber;
   }
 
+  function messageVersionsForDisplay(chatMessage: ChatMessage): ChatMessageVersion[] {
+    const versions = messageVersions[chatMessage.id] ?? [];
+    if (chatMessage.role !== "assistant") return versions;
+
+    const messageIndex = messages.findIndex((item) => item.id === chatMessage.id);
+    const sourceMessage = messages
+      .slice(0, messageIndex)
+      .reverse()
+      .find((item) => item.role === "user");
+    if (!sourceMessage) return versions;
+
+    const contextualVersions = versions.filter(
+      (version) =>
+        version.source_message_id === sourceMessage.id &&
+        version.source_message_version_number === displayedVersionNumber(sourceMessage),
+    );
+    return contextualVersions.length > 0 ||
+      versions.some((version) => version.source_message_id !== null)
+      ? contextualVersions
+      : versions;
+  }
+
   function displayedMessageText(chatMessage: ChatMessage): string {
     const versionNumber = displayedVersionNumber(chatMessage);
     const content =
@@ -2392,11 +2856,9 @@ export function App() {
   }
 
   async function setMessageVersion(chatMessage: ChatMessage, direction: -1 | 1) {
-    if (isSending) return;
-    setSendError("");
-    setTypingAssistant(null);
+    if (isSending || isRestoringMessageVersionRef.current) return;
     const messageIndex = messages.findIndex((item) => item.id === chatMessage.id);
-    const versions = messageVersions[chatMessage.id] ?? [];
+    const versions = messageVersionsForDisplay(chatMessage);
     if (versions.length < 2) return;
     const currentNumber = displayedVersionNumber(chatMessage);
     const currentIndex = versions.findIndex((item) => item.version_number === currentNumber);
@@ -2409,77 +2871,111 @@ export function App() {
 
     if (authClient) {
       const restoreGeneration = ++versionRestoreGenerationRef.current;
-      setSelectedMessageVersions((current) => ({
-        ...current,
-        [chatMessage.id]: nextVersion.version_number,
-      }));
+      isRestoringMessageVersionRef.current = true;
+      setIsRestoringMessageVersion(true);
+      setSendError("");
+      setTypingAssistant(null);
       try {
         const {
           restoreChatBranch,
           loadMessageAttachments,
           loadMessageVersions,
         } = await import("./lib/chat-data");
-        const branchRequest = versionRestoreQueueRef.current.then(() => {
-          if (versionRestoreGenerationRef.current !== restoreGeneration) return null;
-          return restoreChatBranch(
-            authClient,
-            chatMessage.id,
-            nextVersion.version_number,
-          );
-        });
-        versionRestoreQueueRef.current = branchRequest.then(
-          () => undefined,
-          () => undefined,
+        const branch = await restoreChatBranch(
+          authClient,
+          chatMessage.id,
+          nextVersion.version_number,
         );
-        const branch = await branchRequest;
-        if (!branch) return;
+        if (versionRestoreGenerationRef.current !== restoreGeneration) return;
         if (branch.length === 0) {
           throw new Error("No saved conversation branch was returned for this message version.");
         }
-        const [loadedVersions, loadedAttachments] = await Promise.all([
-          loadMessageVersions(
-            authClient,
-            branch.map((item) => item.id),
-          ),
-          loadMessageAttachments(
-            authClient,
-            branch.map((item) => item.id),
-          ),
-        ]);
-        if (versionRestoreGenerationRef.current !== restoreGeneration) return;
         setMessages(
-          branch.map(({ id, role, content, created_at, version_number, thinking_summary, is_reminder, admin_message_id }) => ({
-            id,
-            role,
-            text: content,
-            createdAt: created_at,
-            versionNumber: version_number,
-            thinkingSummary: thinking_summary,
-            adminMessageId: admin_message_id,
-            isReminder: is_reminder,
-            attachments: loadedAttachments[id] ?? [],
-          })),
+          (current) => {
+            const existingAttachments = new Map(
+              current.map((message) => [message.id, message.attachments ?? []]),
+            );
+            return branch.map(
+              ({
+                id,
+                role,
+                content,
+                created_at,
+                version_number,
+                thinking_summary,
+                is_reminder,
+                admin_message_id,
+              }) => ({
+                id,
+                role,
+                text: content,
+                createdAt: created_at,
+                versionNumber: version_number,
+                thinkingSummary: thinking_summary,
+                adminMessageId: admin_message_id,
+                isReminder: is_reminder,
+                attachments: existingAttachments.get(id) ?? [],
+              }),
+            );
+          },
         );
-        setMessageVersions((current) => ({ ...current, ...loadedVersions }));
+        branch.forEach((item) => hiddenChatMessageIdsRef.current.delete(item.id));
         setSelectedMessageVersions(
           Object.fromEntries(branch.map((item) => [item.id, item.version_number])),
         );
         setSendError("");
-        return;
+        isRestoringMessageVersionRef.current = false;
+        setIsRestoringMessageVersion(false);
+
+        const branchMessageIds = branch.map((item) => item.id);
+        const [versionsResult, attachmentsResult] = await Promise.allSettled([
+          loadMessageVersions(authClient, branchMessageIds),
+          loadMessageAttachments(authClient, branchMessageIds),
+        ]);
+        if (versionRestoreGenerationRef.current !== restoreGeneration) return;
+
+        const loadErrors: string[] = [];
+        if (versionsResult.status === "fulfilled") {
+          setMessageVersions((current) => ({ ...current, ...versionsResult.value }));
+        } else {
+          loadErrors.push(
+            versionsResult.reason instanceof Error
+              ? versionsResult.reason.message
+              : "Could not load message versions for this branch.",
+          );
+        }
+        if (attachmentsResult.status === "fulfilled") {
+          setMessages((current) =>
+            current.map((message) => ({
+              ...message,
+              attachments: attachmentsResult.value[message.id] ?? [],
+            })),
+          );
+        } else {
+          loadErrors.push(
+            attachmentsResult.reason instanceof Error
+              ? attachmentsResult.reason.message
+              : "Could not load attachments for this branch.",
+          );
+        }
+        if (loadErrors.length > 0) setSendError(loadErrors.join("\n"));
       } catch (error) {
         if (versionRestoreGenerationRef.current === restoreGeneration) {
-          setSelectedMessageVersions((current) => ({
-            ...current,
-            [chatMessage.id]: currentNumber,
-          }));
           setSendError(
             error instanceof Error ? error.message : "Could not restore this conversation branch.",
           );
         }
-        return;
+      } finally {
+        if (versionRestoreGenerationRef.current === restoreGeneration) {
+          isRestoringMessageVersionRef.current = false;
+          setIsRestoringMessageVersion(false);
+        }
       }
+      return;
     }
 
+    setSendError("");
+    setTypingAssistant(null);
     const selectedVersions = {
       ...selectedMessageVersions,
       [chatMessage.id]: nextVersion.version_number,
@@ -2591,6 +3087,68 @@ export function App() {
   }, [isSending, thinkingSteps, messages.length]);
 
   useEffect(() => {
+    const retryPendingMessages = (force = false) => {
+      if (!navigator.onLine) return;
+      for (const [requestId, submission] of Object.entries(failedChatSubmissions)) {
+        if (
+          submission.retryable &&
+          !submission.retrying &&
+          (force || (chatSubmissionNextRetryAtRef.current.get(requestId) ?? 0) <= Date.now())
+        ) {
+          void retryChatSubmission(requestId, force);
+        }
+      }
+    };
+    const retryOnReconnect = () => retryPendingMessages(true);
+    const retryOnTimer = () => retryPendingMessages();
+    window.addEventListener("online", retryOnReconnect);
+    const retryTimer = window.setInterval(retryOnTimer, 3000);
+    return () => {
+      window.removeEventListener("online", retryOnReconnect);
+      window.clearInterval(retryTimer);
+    };
+  }, [failedChatSubmissions]);
+
+  useEffect(() => {
+    const retryFailedUploads = () => {
+      if (!navigator.onLine) return;
+      const now = Date.now();
+      for (const attachment of attachedMedia) {
+        if (
+          !attachment.uploadError ||
+          attachment.isBlocked ||
+          attachment.isUploading ||
+          attachment.uploaded ||
+          !/(network|fetch|timeout|connection|offline|temporar|502|503|504)/i.test(
+            attachment.uploadError,
+          ) ||
+          (attachmentUploadNextRetryAtRef.current.get(attachment.id) ?? 0) > now
+        ) {
+          continue;
+        }
+        setAttachedMedia((current) =>
+          current.map((item) =>
+            item.id === attachment.id
+              ? { ...item, isUploading: true, uploadError: null }
+              : item,
+          ),
+        );
+        void uploadPendingAttachment({
+          ...attachment,
+          isUploading: true,
+          uploadError: null,
+        });
+      }
+    };
+    window.addEventListener("online", retryFailedUploads);
+    const retryTimer = window.setInterval(retryFailedUploads, 3000);
+    return () => {
+      window.removeEventListener("online", retryFailedUploads);
+      window.clearInterval(retryTimer);
+    };
+  }, [attachedMedia]);
+
+  useEffect(() => {
     if (!isSending || !followLatestRef.current) return;
     const viewport = window.visualViewport;
     const scrollToLatest = () => {
@@ -2680,6 +3238,10 @@ export function App() {
     const response = messages.slice(anchorIndex + 1).find((item) => item.role === "assistant");
     if (!response) return;
     pendingAssistantAnchorRef.current = null;
+    if (!receivedMessageSoundsRef.current.has(response.id)) {
+      receivedMessageSoundsRef.current.add(response.id);
+      playChatSound(receivedMessageSound);
+    }
     setTypingAssistant({ id: response.id, content: displayedMessageText(response) });
   }, [messages]);
 
@@ -2809,6 +3371,7 @@ export function App() {
 
   useEffect(() => {
     const historyGeneration = ++historyGenerationRef.current;
+    hiddenChatMessageIdsRef.current.clear();
     loadingOlderHistoryRef.current = false;
     pendingHistoryScrollRestoreRef.current = null;
     if (!authClient || !authenticatedUserId) {
@@ -2900,7 +3463,7 @@ export function App() {
           authClient
             .from("chat_message_jobs")
             .select("*")
-            .or("status.in.(queued,processing,failed),error.not.is.null")
+            .or("status.in.(queued,processing,completed,failed),error.not.is.null")
             .order("created_at", { ascending: false })
             .limit(50),
           loadMessageVersions(
@@ -2957,8 +3520,17 @@ export function App() {
           const pendingJob = jobsResult.data.find(
             (job) => job.status === "queued" || job.status === "processing",
           );
-          if (pendingJob) {
-            pendingAssistantAnchorRef.current = pendingJob.message_id;
+          const completedReplyAwaitingDisplay = jobsResult.data.find(
+            (job) =>
+              job.status === "completed" &&
+              job.message_id ===
+                [...savedMessages].reverse().find((message) => message.role === "user")?.id &&
+              job.assistant_message_id !== null &&
+              !savedMessages.some((message) => message.id === job.assistant_message_id),
+          );
+          if (pendingJob || completedReplyAwaitingDisplay) {
+            pendingAssistantAnchorRef.current =
+              pendingJob?.message_id ?? completedReplyAwaitingDisplay?.message_id ?? null;
           } else if (
             jobsResult.data.some(
               (job) =>
@@ -2969,7 +3541,8 @@ export function App() {
             pendingAssistantAnchorRef.current = null;
           }
           setIsSending(
-            Boolean(pendingJob) || directReplyProcessingRef.current,
+            Boolean(pendingJob || completedReplyAwaitingDisplay) ||
+              directReplyProcessingRef.current,
           );
           setRatings(loadedRatings);
           setAdminRelayRatings(loadedAdminRelayRatings);
@@ -3170,7 +3743,100 @@ export function App() {
       "ai_api_keys",
     ] as const;
     let hasConnected = false;
+    let isSyncingChatData = false;
+    let chatSyncRequested = false;
+    let isRefreshingJobStatus = false;
+    let jobStatusRefreshRequested = false;
+    let previousJobState = "";
+    let jobStatusPoll: number | null = null;
+    let generalSettingsRefreshFrame: number | null = null;
+    let isRefreshingGeneralSettings = false;
+    let generalSettingsRefreshRequested = false;
+    const setJobStatusPolling = (enabled: boolean) => {
+      if (enabled && jobStatusPoll === null) {
+        jobStatusPoll = window.setInterval(() => void refreshJobStatus(), 5_000);
+      } else if (!enabled && jobStatusPoll !== null) {
+        window.clearInterval(jobStatusPoll);
+        jobStatusPoll = null;
+      }
+    };
+    const refreshGeneralSettings = async () => {
+      if (!isMounted) return;
+      if (isRefreshingGeneralSettings) {
+        generalSettingsRefreshRequested = true;
+        return;
+      }
+      isRefreshingGeneralSettings = true;
+      try {
+        const { data, error } = await authClient
+          .from("user_settings")
+          .select("enter_key_behavior_desktop, enter_key_behavior_mobile, time_format, font_size, web_search_enabled")
+          .eq("user_id", authUser.id)
+          .maybeSingle();
+        if (error) throw error;
+        if (!isMounted) return;
+        const nextSettings: GeneralSettings = data
+          ? {
+              enter_key_behavior_desktop:
+                data.enter_key_behavior_desktop === "newline" ||
+                data.enter_key_behavior_desktop === "submit"
+                  ? data.enter_key_behavior_desktop
+                  : "system",
+              enter_key_behavior_mobile:
+                data.enter_key_behavior_mobile === "newline" ||
+                data.enter_key_behavior_mobile === "submit"
+                  ? data.enter_key_behavior_mobile
+                  : "system",
+              time_format:
+                data.time_format === "12h" || data.time_format === "24h"
+                  ? data.time_format
+                  : "system",
+              font_size:
+                typeof data.font_size === "number" && Number.isFinite(data.font_size)
+                  ? Math.min(20, Math.max(12, data.font_size))
+                  : 14,
+              web_search_enabled: data.web_search_enabled !== false,
+            }
+          : DEFAULT_GENERAL_SETTINGS;
+        setGeneralSettings((current) =>
+          current.enter_key_behavior_desktop === nextSettings.enter_key_behavior_desktop &&
+          current.enter_key_behavior_mobile === nextSettings.enter_key_behavior_mobile &&
+          current.time_format === nextSettings.time_format &&
+          current.font_size === nextSettings.font_size &&
+          current.web_search_enabled === nextSettings.web_search_enabled
+            ? current
+            : nextSettings,
+        );
+      } catch (error) {
+        if (isMounted) {
+          setSendError(
+            `Could not sync General settings: ${
+              error instanceof Error ? error.message : "Unknown database error."
+            }`,
+          );
+        }
+      } finally {
+        isRefreshingGeneralSettings = false;
+        if (generalSettingsRefreshRequested && isMounted) {
+          generalSettingsRefreshRequested = false;
+          scheduleGeneralSettingsRefresh();
+        }
+      }
+    };
+    const scheduleGeneralSettingsRefresh = () => {
+      if (!isMounted || generalSettingsRefreshFrame !== null) return;
+      generalSettingsRefreshFrame = window.requestAnimationFrame(() => {
+        generalSettingsRefreshFrame = null;
+        void refreshGeneralSettings();
+      });
+    };
     const syncChatData = async () => {
+      if (!isMounted) return;
+      if (isSyncingChatData) {
+        chatSyncRequested = true;
+        return;
+      }
+      isSyncingChatData = true;
       try {
         const currentMessages = messagesRef.current;
         const persistedMessageCount = currentMessages.filter(
@@ -3185,14 +3851,15 @@ export function App() {
           limit: Math.max(50, persistedMessageCount + 1),
           userId: authUser.id,
         });
-        const messageIds = page.messages.map((message) => message.id);
-        const assistantMessageIds = page.messages
+        let syncMessages = [...page.messages];
+        const messageIds = syncMessages.map((message) => message.id);
+        const assistantMessageIds = syncMessages
           .filter((message) => message.role === "assistant")
           .map((message) => message.id);
         const adminRelayMessageIds = [
-          ...new Set(page.messages.flatMap((message) => message.admin_message_id ?? [])),
+          ...new Set(syncMessages.flatMap((message) => message.admin_message_id ?? [])),
         ];
-        const [
+        let [
           attachments,
           versions,
           feedbackResult,
@@ -3219,7 +3886,7 @@ export function App() {
           authClient
             .from("chat_message_jobs")
             .select("*")
-            .or("status.in.(queued,processing,failed),error.not.is.null")
+            .or("status.in.(queued,processing,completed,failed),error.not.is.null")
             .order("created_at", { ascending: false })
             .limit(50),
         ]);
@@ -3229,8 +3896,51 @@ export function App() {
         if (jobsResult.error) throw jobsResult.error;
         if (!isMounted) return;
 
-        const persistedIds = new Set(messageIds);
-        const serverMessages: ChatMessage[] = page.messages.map(
+        const completedAnchorJob = jobsResult.data.find(
+          (job) =>
+            job.status === "completed" &&
+            job.message_id === pendingAssistantAnchorRef.current &&
+            job.assistant_message_id !== null,
+        );
+        if (completedAnchorJob?.assistant_message_id) {
+          hiddenChatMessageIdsRef.current.delete(completedAnchorJob.assistant_message_id);
+        }
+        if (
+          completedAnchorJob?.assistant_message_id &&
+          !syncMessages.some((message) => message.id === completedAnchorJob.assistant_message_id)
+        ) {
+          const { data: recoveredAssistant, error: recoveryError } = await authClient
+            .from("chat_messages")
+            .select("id, user_id, role, content, embedding, created_at, version_number, thinking_summary, is_reminder, is_active, revision_reason, admin_message_id")
+            .eq("id", completedAnchorJob.assistant_message_id)
+            .eq("user_id", authUser.id)
+            .eq("is_active", true)
+            .maybeSingle();
+          if (recoveryError) {
+            throw new Error(`Could not recover the completed AI response: ${recoveryError.message}`);
+          }
+          if (recoveredAssistant) {
+            syncMessages = [...syncMessages, recoveredAssistant].sort(
+              (left, right) =>
+                new Date(left.created_at).getTime() - new Date(right.created_at).getTime(),
+            );
+            const [recoveredAttachments, recoveredVersions] = await Promise.all([
+              loadMessageAttachments(authClient, [recoveredAssistant.id]),
+              loadMessageVersions(authClient, [recoveredAssistant.id]),
+            ]);
+            attachments = { ...attachments, ...recoveredAttachments };
+            versions = { ...versions, ...recoveredVersions };
+          }
+        }
+
+        const persistedIds = new Set(syncMessages.map((message) => message.id));
+        for (const messageId of persistedIds) {
+          pendingOptimisticMessageIdsRef.current.delete(messageId);
+        }
+        const syncedAssistantIds = syncMessages
+          .filter((message) => message.role === "assistant")
+          .map((message) => message.id);
+        const serverMessages: ChatMessage[] = syncMessages.map(
           ({ id, role, content, created_at, version_number, thinking_summary, is_reminder, admin_message_id }) => ({
             id,
             role,
@@ -3243,6 +3953,17 @@ export function App() {
             attachments: attachments[id] ?? [],
           }),
         );
+        for (const job of jobsResult.data) {
+          if (
+            (job.assistant_message_id !== null &&
+              persistedIds.has(job.assistant_message_id)) ||
+            (job.status === "completed" &&
+              job.assistant_message_id === null &&
+              persistedIds.has(job.message_id))
+          ) {
+            pendingOptimisticMessageIdsRef.current.delete(job.message_id);
+          }
+        }
         const loadedRatings = Object.fromEntries(
           feedbackResult.data.flatMap((item) =>
             item.kind === "like" || item.kind === "dislike"
@@ -3258,7 +3979,7 @@ export function App() {
           ),
         ) as Record<string, AssistantRating>;
         const loadedSelections = Object.fromEntries(
-          page.messages.map((message) => [message.id, message.version_number]),
+          syncMessages.map((message) => [message.id, message.version_number]),
         );
 
         setMessages((current) => {
@@ -3292,16 +4013,28 @@ export function App() {
           ...loadedAdminRelayRatings,
         }));
         setHasGeminiApiKey(keysResult.data.length > 0);
-        setChatJobs(jobsResult.data);
-        setIsSending(
-          jobsResult.data.some(
-            (job) => job.status === "queued" || job.status === "processing",
-          ) || directReplyProcessingRef.current,
+        previousJobState = JSON.stringify(
+          jobsResult.data.map((job) => [job.id, job.status, job.progress, job.error, job.updated_at]),
         );
-        oldestHistoryCursorRef.current = page.messages[0]
+        setChatJobs(jobsResult.data);
+        const hasPendingJob = jobsResult.data.some(
+          (job) => job.status === "queued" || job.status === "processing",
+        );
+        const completedReplyAwaitingDisplay = jobsResult.data.some(
+          (job) =>
+            job.status === "completed" &&
+            job.message_id === pendingAssistantAnchorRef.current &&
+            job.assistant_message_id !== null &&
+            !syncedAssistantIds.includes(job.assistant_message_id),
+        );
+        setJobStatusPolling(hasPendingJob || completedReplyAwaitingDisplay);
+        setIsSending(
+          hasPendingJob || completedReplyAwaitingDisplay || directReplyProcessingRef.current,
+        );
+        oldestHistoryCursorRef.current = syncMessages[0]
           ? {
-              id: page.messages[0].id,
-              created_at: page.messages[0].created_at,
+              id: syncMessages[0].id,
+              created_at: syncMessages[0].created_at,
             }
           : null;
         hasOlderHistoryRef.current = page.hasMore;
@@ -3313,38 +4046,43 @@ export function App() {
               : "Could not sync live chat updates.",
           );
         }
+      } finally {
+        isSyncingChatData = false;
+        if (chatSyncRequested && isMounted) {
+          chatSyncRequested = false;
+          scheduleChatSync();
+        }
       }
     };
     const scheduleChatSync = () => {
       if (!isMounted) return;
-      if (realtimeRefreshTimerRef.current !== null) {
-        window.clearTimeout(realtimeRefreshTimerRef.current);
-      }
-      realtimeRefreshTimerRef.current = window.setTimeout(() => {
+      if (realtimeRefreshTimerRef.current !== null) return;
+      realtimeRefreshTimerRef.current = window.requestAnimationFrame(() => {
         realtimeRefreshTimerRef.current = null;
         if (isMounted) void syncChatData();
-      }, 120);
+      });
     };
     const scheduleJobRefresh = () => {
       if (!isMounted) return;
-      if (jobRefreshTimerRef.current !== null) {
-        window.clearTimeout(jobRefreshTimerRef.current);
-      }
-      jobRefreshTimerRef.current = window.setTimeout(() => {
+      if (jobRefreshTimerRef.current !== null) return;
+      jobRefreshTimerRef.current = window.requestAnimationFrame(() => {
         jobRefreshTimerRef.current = null;
         void refreshJobStatus();
-      }, 80);
+      });
     };
     let previousPendingJob = false;
-    let isRefreshingJobStatus = false;
     const refreshJobStatus = async () => {
-      if (!isMounted || isRefreshingJobStatus) return;
+      if (!isMounted) return;
+      if (isRefreshingJobStatus) {
+        jobStatusRefreshRequested = true;
+        return;
+      }
       isRefreshingJobStatus = true;
       try {
         const { data, error } = await authClient
           .from("chat_message_jobs")
           .select("*")
-          .or("status.in.(queued,processing,failed),error.not.is.null")
+          .or("status.in.(queued,processing,completed,failed),error.not.is.null")
           .order("created_at", { ascending: false })
           .limit(50);
         if (!isMounted) return;
@@ -3355,10 +4093,39 @@ export function App() {
         const hasPendingJob = data.some(
           (job) => job.status === "queued" || job.status === "processing",
         );
-        setChatJobs(data);
-        setIsSending(hasPendingJob || directReplyProcessingRef.current);
-        if (previousPendingJob && !hasPendingJob) void syncChatData();
-        previousPendingJob = hasPendingJob;
+        const anchorMessageId = pendingAssistantAnchorRef.current;
+        const anchoredJob = data.find((job) => job.message_id === anchorMessageId);
+        if (
+          anchoredJob &&
+          (anchoredJob.status === "failed" ||
+            (anchoredJob.status === "completed" && anchoredJob.assistant_message_id === null))
+        ) {
+          pendingAssistantAnchorRef.current = null;
+        }
+        const completedReplyAwaitingDisplay = data.some(
+          (job) =>
+            job.status === "completed" &&
+            job.message_id === pendingAssistantAnchorRef.current &&
+            job.assistant_message_id !== null &&
+            !messagesRef.current.some((message) => message.id === job.assistant_message_id),
+        );
+        const isChatStillInProgress = hasPendingJob || completedReplyAwaitingDisplay;
+        const jobState = JSON.stringify(
+          data.map((job) => [job.id, job.status, job.progress, job.error, job.updated_at]),
+        );
+        if (jobState !== previousJobState) {
+          previousJobState = jobState;
+          setChatJobs(data);
+        }
+        setJobStatusPolling(isChatStillInProgress);
+        setIsSending(isChatStillInProgress || directReplyProcessingRef.current);
+        if (
+          (previousPendingJob && !isChatStillInProgress) ||
+          completedReplyAwaitingDisplay
+        ) {
+          void syncChatData();
+        }
+        previousPendingJob = isChatStillInProgress;
       } catch (error) {
         if (isMounted) {
           setSendError(
@@ -3369,6 +4136,10 @@ export function App() {
         }
       } finally {
         isRefreshingJobStatus = false;
+        if (jobStatusRefreshRequested && isMounted) {
+          jobStatusRefreshRequested = false;
+          scheduleJobRefresh();
+        }
       }
     };
     const refreshOnVisible = () => {
@@ -3376,7 +4147,6 @@ export function App() {
       scheduleJobRefresh();
       scheduleChatSync();
     };
-    const jobStatusPoll = window.setInterval(() => void refreshJobStatus(), 5_000);
     document.addEventListener("visibilitychange", refreshOnVisible);
     window.addEventListener("pageshow", refreshOnVisible);
     void refreshJobStatus();
@@ -3396,19 +4166,31 @@ export function App() {
             scheduleChatSync,
           );
         }
-        return channel.on(
-          "postgres_changes",
-          {
-            event: "*",
-            schema: "public",
-            table: "chat_message_jobs",
-          },
-          scheduleJobRefresh,
-        );
+        return channel
+          .on(
+            "postgres_changes",
+            {
+              event: "*",
+              schema: "public",
+              table: "user_settings",
+              filter: `user_id=eq.${authUser.id}`,
+            },
+            scheduleGeneralSettingsRefresh,
+          )
+          .on(
+            "postgres_changes",
+            {
+              event: "*",
+              schema: "public",
+              table: "chat_message_jobs",
+            },
+            scheduleJobRefresh,
+          );
       },
       (status) => {
         if (!isMounted) return;
         if (status === "SUBSCRIBED") {
+          scheduleGeneralSettingsRefresh();
           if (hasConnected) {
             scheduleChatSync();
             scheduleJobRefresh();
@@ -3430,14 +4212,18 @@ export function App() {
     return () => {
       isMounted = false;
       if (realtimeRefreshTimerRef.current !== null) {
-        window.clearTimeout(realtimeRefreshTimerRef.current);
+        window.cancelAnimationFrame(realtimeRefreshTimerRef.current);
         realtimeRefreshTimerRef.current = null;
       }
       if (jobRefreshTimerRef.current !== null) {
-        window.clearTimeout(jobRefreshTimerRef.current);
+        window.cancelAnimationFrame(jobRefreshTimerRef.current);
         jobRefreshTimerRef.current = null;
       }
-      window.clearInterval(jobStatusPoll);
+      if (generalSettingsRefreshFrame !== null) {
+        window.cancelAnimationFrame(generalSettingsRefreshFrame);
+        generalSettingsRefreshFrame = null;
+      }
+      setJobStatusPolling(false);
       document.removeEventListener("visibilitychange", refreshOnVisible);
       window.removeEventListener("pageshow", refreshOnVisible);
       stopRealtime();
@@ -3454,7 +4240,7 @@ export function App() {
       setIsEditorLoading(false);
     };
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") window.history.back();
+      if (event.key === "Escape") closeAttachmentView();
     };
     window.addEventListener("popstate", closeOnBack);
     window.addEventListener("keydown", closeOnEscape);
@@ -3473,9 +4259,9 @@ export function App() {
       "",
       window.location.href,
     );
-    const closeOnBack = () => setRemoteAttachmentView(null);
+    const closeOnBack = () => closeRemoteAttachmentView();
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") window.history.back();
+      if (event.key === "Escape") closeRemoteAttachmentView();
     };
     window.addEventListener("popstate", closeOnBack);
     window.addEventListener("keydown", closeOnEscape);
@@ -3483,7 +4269,7 @@ export function App() {
       window.removeEventListener("popstate", closeOnBack);
       window.removeEventListener("keydown", closeOnEscape);
     };
-  }, [remoteAttachmentView]);
+  }, [remoteAttachmentView?.attachment.id]);
 
   useLayoutEffect(() => {
     const previousPosition = pendingHistoryScrollRestoreRef.current;
@@ -3621,26 +4407,28 @@ export function App() {
 
     const handlePopState = () => {
       const nextPath = window.location.pathname;
-      if (nextPath.startsWith("/settings")) {
-        if (
-          nextPath === "/settings" &&
-          wasSettingsRef.current &&
-          !window.history.state?.appRoute
-        ) {
-          window.location.replace("/");
-          return;
-        }
+      const currentPath = pathnameRef.current;
+      if (currentPath.startsWith("/settings/")) {
+        window.history.replaceState({ appRoute: "settings" }, "", "/settings");
         wasSettingsRef.current = true;
-        setPathname(nextPath);
+        pathnameRef.current = "/settings";
+        setPathname("/settings");
         return;
       }
-
-      if (wasSettingsRef.current) {
+      if (currentPath === "/settings" || wasSettingsRef.current) {
         window.location.replace("/");
         return;
       }
 
+      if (nextPath.startsWith("/settings")) {
+        wasSettingsRef.current = true;
+        pathnameRef.current = nextPath;
+        setPathname(nextPath);
+        return;
+      }
+
       if (nextPath === "/") shouldScrollToLatestRef.current = true;
+      pathnameRef.current = nextPath;
       setPathname(nextPath);
     };
     window.addEventListener("popstate", handlePopState);
@@ -3661,6 +4449,7 @@ export function App() {
         path,
       );
       wasSettingsRef.current = true;
+      pathnameRef.current = path;
       setPathname(path);
     } else {
       window.location.replace(path);
@@ -3745,7 +4534,7 @@ export function App() {
       if (sessionError) throw sessionError;
       if (!session?.access_token) throw new Error("Your account session has expired. Sign in again.");
       const response = await fetch("/api/account-inbox-clear", {
-        method: "POST",
+          method: "POST",
         headers: { Authorization: `Bearer ${session.access_token}` },
       });
       const payload: unknown = await response.json().catch(() => null);
@@ -3956,9 +4745,9 @@ export function App() {
       const response = await fetch("/api/chat-attachments", {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-        },
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
+          },
         body: JSON.stringify({
           action,
           id: attachment.id,
@@ -4011,8 +4800,13 @@ export function App() {
           contentType: attachment.mimeType,
           upsert: false,
         });
-      if (uploadError) throw new Error(`Could not upload ${attachment.file.name}: ${uploadError.message}`);
-      registration = await register("register");
+      if (uploadError && /already exists|resource exists/i.test(uploadError.message)) {
+        registration = await register("register");
+      } else if (uploadError) {
+        throw new Error(`Could not upload ${attachment.file.name}: ${uploadError.message}`);
+      } else {
+        registration = await register("register");
+      }
     }
 
     if (registration.uploadRequired || !registration.attachment) {
@@ -4024,6 +4818,8 @@ export function App() {
   async function uploadPendingAttachment(
     attachment: PendingChatAttachment,
   ): Promise<ChatAttachment | null> {
+    if (retryingAttachmentUploadsRef.current.has(attachment.id)) return null;
+    retryingAttachmentUploadsRef.current.add(attachment.id);
     let preprocessingFailed = false;
     try {
       if (!authUser) throw new Error("Sign in before saving an attachment draft.");
@@ -4040,7 +4836,7 @@ export function App() {
           throw new Error("The attachment was removed from the composer.");
         }
         if (processed.oversized) {
-          const message = `This file is still larger than ${formatChatAttachmentSize(MAX_CHAT_ATTACHMENT_BYTES)} after processing and was not uploaded.`;
+          const message = `This file cannot be safely reduced to the AI's ${formatChatAttachmentSize(MAX_CHAT_ATTACHMENT_BYTES)} per-file limit without risking media quality, so it was not uploaded.`;
           setAttachedMedia((current) =>
             current.map((item) =>
               item.id === attachment.id
@@ -4097,6 +4893,8 @@ export function App() {
             : item,
         ),
       );
+      attachmentUploadRetryAttemptsRef.current.delete(uploadable.id);
+      attachmentUploadNextRetryAtRef.current.delete(uploadable.id);
       return uploaded;
     } catch (error) {
       if (cancelledAttachmentsRef.current.has(attachment.id)) {
@@ -4116,6 +4914,16 @@ export function App() {
       }
       const message =
         error instanceof Error ? error.message : `Could not upload ${attachment.file.name}.`;
+      if (!preprocessingFailed) {
+        const attempts = (attachmentUploadRetryAttemptsRef.current.get(attachment.id) ?? 0) + 1;
+        attachmentUploadRetryAttemptsRef.current.set(attachment.id, attempts);
+        if (/(network|fetch|timeout|connection|offline|temporar|502|503|504)/i.test(message)) {
+          attachmentUploadNextRetryAtRef.current.set(
+            attachment.id,
+            Date.now() + Math.min(30_000, 1500 * 2 ** Math.min(attempts, 5)),
+          );
+        }
+      }
       if (preprocessingFailed) {
         setAttachedMedia((current) => current.filter((item) => item.id !== attachment.id));
         setSendError(message);
@@ -4130,6 +4938,8 @@ export function App() {
       );
       setSendError(message);
       return null;
+    } finally {
+      retryingAttachmentUploadsRef.current.delete(attachment.id);
     }
   }
 
@@ -4158,9 +4968,12 @@ export function App() {
   }
 
   function closeRemoteAttachmentView() {
+    remoteAttachmentViewRequestRef.current += 1;
     setRemoteAttachmentView(null);
-    if (window.history.state?.remoteAttachmentView) {
-      window.history.back();
+    const currentState = window.history.state;
+    if (currentState && typeof currentState === "object" && "remoteAttachmentView" in currentState) {
+      const { remoteAttachmentView: _remoteAttachmentView, ...nextState } = currentState;
+      window.history.replaceState(nextState, "", window.location.href);
     }
   }
 
@@ -4170,6 +4983,15 @@ export function App() {
       return;
     }
 
+    const requestId = ++remoteAttachmentViewRequestRef.current;
+    pendingConversationScrollRestoreRef.current = conversationRef.current?.scrollTop ?? 0;
+    setSendError("");
+    setRemoteAttachmentView({
+      attachment,
+      signedUrl: "",
+      textContent: null,
+      isLoading: true,
+    });
     try {
       const accessToken = await getAccessToken();
       const response = await fetch("/api/chat-attachment-link", {
@@ -4199,6 +5021,8 @@ export function App() {
       ) {
         throw new Error("The attachment service returned an invalid link.");
       }
+      if (requestId !== remoteAttachmentViewRequestRef.current) return;
+
       let textContent: string | null = null;
       if (isTextAttachment(attachment.mime_type, attachment.file_name)) {
         const fileResponse = await fetch(payload.signedUrl);
@@ -4210,10 +5034,18 @@ export function App() {
           throw new Error("This file contains binary data and cannot be previewed as text.");
         }
       }
-      pendingConversationScrollRestoreRef.current = conversationRef.current?.scrollTop ?? 0;
-      setRemoteAttachmentView({ attachment, signedUrl: payload.signedUrl, textContent });
+      if (requestId !== remoteAttachmentViewRequestRef.current) return;
+      setRemoteAttachmentView({
+        attachment,
+        signedUrl: payload.signedUrl,
+        textContent,
+        isLoading: false,
+      });
     } catch (error) {
-      setSendError(error instanceof Error ? error.message : "Could not open attachment.");
+      if (requestId === remoteAttachmentViewRequestRef.current) {
+        setRemoteAttachmentView(null);
+        setSendError(error instanceof Error ? error.message : "Could not open attachment.");
+      }
     }
   }
 
@@ -4287,7 +5119,7 @@ export function App() {
               continue;
             }
             if (processed.oversized) {
-              const message = `This file is still larger than ${formatChatAttachmentSize(MAX_CHAT_ATTACHMENT_BYTES)} after processing and was not uploaded.`;
+              const message = `This file cannot be safely reduced to the AI's ${formatChatAttachmentSize(MAX_CHAT_ATTACHMENT_BYTES)} per-file limit without risking media quality, so it was not uploaded.`;
               setAttachedMedia((current) =>
                 current.map((item) =>
                   item.id === attachment.id
@@ -4300,7 +5132,7 @@ export function App() {
                     : item,
                 ),
               );
-              rejectionReasons.push(`"${attachment.file.name}" is still too large after processing.`);
+              rejectionReasons.push(`"${attachment.file.name}" cannot be safely reduced to the AI's per-file limit.`);
               continue;
             }
 
@@ -4568,8 +5400,10 @@ export function App() {
     attachmentViewRequestRef.current += 1;
     setAttachmentView(null);
     setIsEditorLoading(false);
-    if (window.history.state?.attachmentView) {
-      window.history.back();
+    const currentState = window.history.state;
+    if (currentState && typeof currentState === "object" && "attachmentView" in currentState) {
+      const { attachmentView: _attachmentView, ...nextState } = currentState;
+      window.history.replaceState(nextState, "", window.location.href);
     }
   }
 
@@ -4639,7 +5473,187 @@ export function App() {
     return `${(size / (1024 * 1024)).toFixed(1)} MB`;
   }
 
+  async function submitChatRequest(payload: ChatSubmissionPayload): Promise<{
+    jobId: string;
+    messageId: string;
+  }> {
+    const accessToken = await getAccessToken();
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 30_000);
+    let response: Response;
+    try {
+      response = await fetch("/api/chat-jobs", {
+        method: "POST",
+        headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+        body: JSON.stringify({
+          content: payload.content,
+          thinkingMode: payload.thinkingMode,
+          attachmentIds: payload.attachmentIds,
+          barcodeReadings: payload.barcodeReadings,
+          clientRequestId: payload.clientRequestId,
+        }),
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new ChatSubmissionError(
+          "The connection timed out while sending your message. Cheya will retry safely.",
+          true,
+        );
+      }
+      throw error;
+    } finally {
+      window.clearTimeout(timeout);
+    }
+
+    const result = (await response.json().catch(() => null)) as
+      | { jobId?: string; messageId?: string; statusMessage?: string; message?: string }
+      | null;
+    if (!response.ok) {
+      const message =
+        result?.statusMessage ??
+        result?.message ??
+        `The chat server could not queue your message (${response.status}).`;
+      throw new ChatSubmissionError(
+        message,
+        !navigator.onLine ||
+          response.status === 408 ||
+          response.status === 425 ||
+          response.status === 429 ||
+          response.status >= 500,
+      );
+    }
+    if (!result?.jobId || !result.messageId) {
+      throw new ChatSubmissionError(
+        "The chat server accepted an invalid job response. Retry safely to check its status.",
+        true,
+      );
+    }
+    return { jobId: result.jobId, messageId: result.messageId };
+  }
+
+  function markChatSubmissionAccepted(
+    requestId: string,
+    messageId: string,
+    submittedAttachments: PendingChatAttachment[],
+  ) {
+    pendingOptimisticMessageIdsRef.current.add(messageId);
+    pendingChatSubmissionsRef.current.delete(requestId);
+    chatSubmissionRetryAttemptsRef.current.delete(requestId);
+    chatSubmissionNextRetryAtRef.current.delete(requestId);
+    retryingChatSubmissionsRef.current.delete(requestId);
+    setFailedChatSubmissions((current) => {
+      const next = { ...current };
+      delete next[requestId];
+      return next;
+    });
+    pendingAssistantAnchorRef.current = messageId;
+    setMessages((current) => {
+      const optimisticMessageExists = current.some((item) => item.id === requestId);
+      const serverMessageExists = current.some(
+        (item) => item.id === messageId && item.id !== requestId,
+      );
+      if (requestId === messageId && optimisticMessageExists) {
+        return current.map((item) =>
+          item.id === messageId
+            ? {
+                ...item,
+                attachments:
+                  submittedAttachments.length > 0
+                    ? submittedAttachments.flatMap((attachment) =>
+                        attachment.uploaded ? [attachment.uploaded] : [],
+                      )
+                    : item.attachments,
+              }
+            : item,
+        );
+      }
+      return current.flatMap((item) => {
+        if (item.id !== requestId) return [item];
+        if (serverMessageExists) return [];
+        return [
+          {
+            ...item,
+            id: messageId,
+            attachments:
+              submittedAttachments.length > 0
+                ? submittedAttachments.flatMap((attachment) =>
+                    attachment.uploaded ? [attachment.uploaded] : [],
+                  )
+                : item.attachments,
+          },
+        ];
+      });
+    });
+    playChatSound(sendMessageSound);
+  }
+
+  async function retryChatSubmission(requestId: string, force = true) {
+    const failedSubmission = failedChatSubmissions[requestId];
+    const payload = pendingChatSubmissionsRef.current.get(requestId);
+    if (
+      !failedSubmission ||
+      !payload ||
+      retryingChatSubmissionsRef.current.has(requestId) ||
+      directReplyProcessingRef.current ||
+      (!force &&
+        (chatSubmissionNextRetryAtRef.current.get(requestId) ?? 0) > Date.now())
+    ) return;
+    unlockChatNotificationSounds();
+    if (!navigator.onLine && !failedSubmission.retrying) {
+      setFailedChatSubmissions((current) => ({
+        ...current,
+        [requestId]: {
+          ...current[requestId],
+          error: "No internet connection. Cheya will retry when you are back online.",
+          retrying: false,
+        },
+      }));
+      return;
+    }
+
+    retryingChatSubmissionsRef.current.add(requestId);
+    setFailedChatSubmissions((current) => ({
+      ...current,
+      [requestId]: { ...current[requestId], retrying: true },
+    }));
+    setIsSending(true);
+    directReplyProcessingRef.current = true;
+    try {
+      const accepted = await submitChatRequest(payload);
+      markChatSubmissionAccepted(requestId, accepted.messageId, []);
+      directReplyProcessingRef.current = false;
+      setThinkingSteps(payload.thinkingMode ? ["Membaca pesan dan konteks percakapan…"] : []);
+    } catch (error) {
+      const attempts = (chatSubmissionRetryAttemptsRef.current.get(requestId) ?? 0) + 1;
+      chatSubmissionRetryAttemptsRef.current.set(requestId, attempts);
+      chatSubmissionNextRetryAtRef.current.set(
+        requestId,
+        Date.now() + Math.min(30_000, 1500 * 2 ** Math.min(attempts, 5)),
+      );
+      setFailedChatSubmissions((current) => ({
+        ...current,
+        [requestId]: {
+          error: error instanceof Error ? error.message : "Could not retry your message.",
+          retryable:
+            error instanceof ChatSubmissionError
+              ? error.retryable
+              : !navigator.onLine || error instanceof TypeError,
+          retrying: false,
+        },
+      }));
+      directReplyProcessingRef.current = false;
+      setIsSending(false);
+    } finally {
+      retryingChatSubmissionsRef.current.delete(requestId);
+    }
+  }
+
   async function sendMessage() {
+    if (isAssistantBusy || directReplyProcessingRef.current) return;
     if (isAttachmentUploadPending || isRestoringDraftAttachments) return;
     if (!authUser) {
       setSendError("Sign in with Google before starting a chat.");
@@ -4668,6 +5682,7 @@ export function App() {
       return;
     }
 
+    unlockChatNotificationSounds();
     setSendError("");
     setIsSending(true);
     directReplyProcessingRef.current = true;
@@ -4675,10 +5690,17 @@ export function App() {
     shouldScrollToLatestRef.current = true;
     const showThinking = thinkingModeRef.current;
     let jobAccepted = false;
-    const optimisticId = crypto.randomUUID();
+    const clientRequestId = crypto.randomUUID();
     const submittedAttachments = attachedMedia;
+    const submissionPayload: ChatSubmissionPayload = {
+      clientRequestId,
+      content: prompt || "Please review the attached files.",
+      thinkingMode: showThinking,
+      attachmentIds: submittedAttachments.map((attachment) => attachment.id),
+      barcodeReadings: [],
+    };
     const optimisticMessage: ChatMessage = {
-      id: optimisticId,
+      id: clientRequestId,
       role: "user",
       text: prompt || "Please review the attached files.",
       createdAt: new Date().toISOString(),
@@ -4688,22 +5710,25 @@ export function App() {
         attachment.uploaded ? [attachment.uploaded] : [],
       ),
     };
-    pendingOptimisticMessageIdsRef.current.add(optimisticId);
+    pendingOptimisticMessageIdsRef.current.add(clientRequestId);
+    pendingChatSubmissionsRef.current.set(clientRequestId, submissionPayload);
     setMessages((current) => [...current, optimisticMessage]);
     setAttachedMedia([]);
     if (messageInputRef.current) {
       messageInputRef.current.value = "";
       resizeMessageInput(messageInputRef.current);
     }
+    messageDraftRef.current = "";
+    if (messageDraftSaveTimerRef.current) {
+      clearTimeout(messageDraftSaveTimerRef.current);
+      messageDraftSaveTimerRef.current = null;
+    }
     try {
-      if (!authClient) throw new Error("Sign in before sending a message.");
-      const {
-        data: { session },
-        error: sessionError,
-      } = await authClient.auth.getSession();
-      if (sessionError) throw sessionError;
-      if (!session?.access_token) throw new Error("Your account session has expired. Sign in again.");
-
+      localStorage.removeItem(messageDraftStorageKey(authUser.id));
+    } catch (error) {
+      console.warn("Could not clear the submitted chat draft:", error);
+    }
+    try {
       const barcodeReadings = (
         await Promise.all(
           submittedAttachments.map(async (attachment) => {
@@ -4715,36 +5740,11 @@ export function App() {
           }),
         )
       ).filter((reading): reading is AiBarcodeReading => reading !== null);
-      const response = await fetch("/api/chat-jobs", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${session.access_token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          content: prompt,
-          thinkingMode: showThinking,
-          attachmentIds: submittedAttachments.map((attachment) => attachment.id),
-          barcodeReadings,
-        }),
-      });
-      const result = (await response.json().catch(() => null)) as
-        | { jobId?: string; messageId?: string; statusMessage?: string; message?: string }
-        | null;
-      if (!response.ok) {
-        throw new Error(
-          result?.statusMessage ??
-            result?.message ??
-            `The chat server could not queue your message (${response.status}).`,
-        );
-      }
-      if (!result?.jobId || !result.messageId) {
-        throw new Error("The chat server accepted an invalid job response.");
-      }
-
+      submissionPayload.barcodeReadings = barcodeReadings;
+      const accepted = await submitChatRequest(submissionPayload);
       jobAccepted = true;
       directReplyProcessingRef.current = false;
-      pendingOptimisticMessageIdsRef.current.delete(optimisticId);
+      markChatSubmissionAccepted(clientRequestId, accepted.messageId, submittedAttachments);
       submittedAttachments.forEach((attachment) => barcodeReadsRef.current.delete(attachment.id));
       messageDraftRef.current = "";
       if (messageDraftSaveTimerRef.current) {
@@ -4760,23 +5760,6 @@ export function App() {
             : "Your message was sent, but the local draft could not be cleared.",
         );
       }
-      pendingAssistantAnchorRef.current = result.messageId;
-      setMessages((current) => {
-        const serverMessageExists = current.some((item) => item.id === result.messageId);
-        return current.flatMap((item) => {
-          if (item.id !== optimisticId) return [item];
-          if (serverMessageExists) return [];
-          return [
-            {
-              ...item,
-              id: result.messageId!,
-              attachments: submittedAttachments.flatMap((attachment) =>
-                attachment.uploaded ? [attachment.uploaded] : [],
-              ),
-            },
-          ];
-        });
-      });
       if (authUser) {
         void Promise.all(
           submittedAttachments.map((attachment) =>
@@ -4793,14 +5776,24 @@ export function App() {
       setThinkingSteps(showThinking ? ["Membaca pesan dan konteks percakapan…"] : []);
     } catch (error) {
       if (!jobAccepted) {
-        pendingOptimisticMessageIdsRef.current.delete(optimisticId);
-        setMessages((current) => current.filter((item) => item.id !== optimisticId));
-        setAttachedMedia((current) => [...submittedAttachments, ...current]);
-        if (messageInputRef.current && !messageInputRef.current.value) {
-          messageInputRef.current.value = promptInput;
-          resizeMessageInput(messageInputRef.current);
-        }
-        messageDraftRef.current = promptInput;
+        const retryable =
+          error instanceof ChatSubmissionError
+            ? error.retryable
+            : !navigator.onLine || error instanceof TypeError;
+        const attempts = (chatSubmissionRetryAttemptsRef.current.get(clientRequestId) ?? 0) + 1;
+        chatSubmissionRetryAttemptsRef.current.set(clientRequestId, attempts);
+        chatSubmissionNextRetryAtRef.current.set(
+          clientRequestId,
+          Date.now() + Math.min(30_000, 1500 * 2 ** Math.min(attempts, 5)),
+        );
+        setFailedChatSubmissions((current) => ({
+          ...current,
+          [clientRequestId]: {
+            error: error instanceof Error ? error.message : "Could not send your message.",
+            retryable,
+            retrying: false,
+          },
+        }));
       }
       setSendError(error instanceof Error ? error.message : "Could not send your message.");
     } finally {
@@ -4818,25 +5811,26 @@ export function App() {
     rating: AssistantRating,
   ) {
     const ratingKey = `${messageId}:${versionNumber}`;
-    const nextRating = ratings[ratingKey] === rating ? null : rating;
+    const previousRating = ratings[ratingKey] ?? null;
+    const nextRating = previousRating === rating ? null : rating;
+    setRatings((current) => {
+      const updated = { ...current };
+      if (nextRating) updated[ratingKey] = nextRating;
+      else delete updated[ratingKey];
+      return updated;
+    });
     try {
-      const [
-        { createSupabaseClient, ensureSupabaseSession, loadDatabaseConfig },
-        { saveAssistantRating },
-      ] = await Promise.all([import("./lib/supabase"), import("./lib/chat-data")]);
-      const config = loadDatabaseConfig();
-      if (!config) throw new Error("The CheyaVerse account service is not configured.");
-      const client = createSupabaseClient(config);
-      await ensureSupabaseSession(client);
-      await saveAssistantRating(client, messageId, versionNumber, nextRating);
+      if (!authClient) throw new Error("The CheyaVerse account service is not configured.");
+      const { saveAssistantRating } = await import("./lib/chat-data");
+      await saveAssistantRating(authClient, messageId, versionNumber, nextRating);
+      showActionToast(nextRating ? "Feedback saved." : "Feedback removed.");
+    } catch (error) {
       setRatings((current) => {
         const updated = { ...current };
-        if (nextRating) updated[ratingKey] = nextRating;
+        if (previousRating) updated[ratingKey] = previousRating;
         else delete updated[ratingKey];
         return updated;
       });
-      showActionToast(nextRating ? "Feedback saved." : "Feedback removed.");
-    } catch (error) {
       setSendError(error instanceof Error ? error.message : "Could not save feedback.");
     }
   }
@@ -4878,17 +5872,24 @@ export function App() {
     adminMessageId: string,
     rating: AssistantRating,
   ) {
-    const nextRating = adminRelayRatings[adminMessageId] === rating ? null : rating;
+    const previousRating = adminRelayRatings[adminMessageId] ?? null;
+    const nextRating = previousRating === rating ? null : rating;
+    setAdminRelayRatings((current) => {
+      const next = { ...current };
+      if (nextRating) next[adminMessageId] = nextRating;
+      else delete next[adminMessageId];
+      return next;
+    });
     try {
       await postAdminRelayAction({ action: "rate", adminMessageId, rating: nextRating });
+      showActionToast(nextRating ? "Relay feedback saved" : "Relay feedback removed");
+    } catch (error) {
       setAdminRelayRatings((current) => {
         const next = { ...current };
-        if (nextRating) next[adminMessageId] = nextRating;
+        if (previousRating) next[adminMessageId] = previousRating;
         else delete next[adminMessageId];
         return next;
       });
-      showActionToast(nextRating ? "Relay feedback saved" : "Relay feedback removed");
-    } catch (error) {
       setSendError(error instanceof Error ? error.message : "Could not save relay feedback.");
     }
   }
@@ -4965,6 +5966,10 @@ export function App() {
       setReportError("Write a short description before sending a report.");
       return;
     }
+    if (details.length > 2000) {
+      setReportError("Feedback details cannot exceed 2000 characters.");
+      return;
+    }
     setIsSavingReport(true);
     setReportError("");
     try {
@@ -5006,14 +6011,15 @@ export function App() {
   }
 
   async function copyMessageText(messageId: string, text: string) {
+    setCopiedMessageId(messageId);
+    showActionToast("Message copied.");
     try {
       await navigator.clipboard.writeText(text);
-      setCopiedMessageId(messageId);
-      showActionToast("Message copied.");
       window.setTimeout(() => {
         setCopiedMessageId((current) => (current === messageId ? null : current));
       }, 1800);
     } catch (error) {
+      setCopiedMessageId((current) => (current === messageId ? null : current));
       showAttachmentToast(
         error instanceof Error ? `Could not copy this message: ${error.message}` : "Could not copy this message.",
       );
@@ -5087,13 +6093,14 @@ export function App() {
     messageId: string,
     editedSource?: { text: string; versionNumber: number },
   ) {
-    if (isSending) return;
+    if (isSending && !editedSource) return;
     if (!authUser) {
       setSendError("Sign in before regenerating a response.");
       return;
     }
     const assistantIndex = messages.findIndex((item) => item.id === messageId);
     const sourceIndex = assistantIndex - 1;
+    const previousMessages = messages;
     const sourceMessage = sourceIndex >= 0 ? messages[sourceIndex] : undefined;
     if (
       assistantIndex < 0 ||
@@ -5121,7 +6128,7 @@ export function App() {
       .forEach((message) => hiddenChatMessageIdsRef.current.add(message.id));
     setMessages((current) => {
       const currentAssistantIndex = current.findIndex((item) => item.id === messageId);
-      return currentAssistantIndex < 0 ? current : current.slice(0, currentAssistantIndex);
+      return currentAssistantIndex < 0 ? current : current.slice(0, currentAssistantIndex + 1);
     });
     const showThinking = thinkingModeRef.current;
     setThinkingSteps(["Checking the conversation and relevant context…"]);
@@ -5235,6 +6242,8 @@ export function App() {
               queryResult.value,
               sourceMessage.id,
               targetCreatedAt,
+              undefined,
+              sourceText,
             )
           : Promise.resolve({ messages: [], memories: [] }),
         targetCreatedAt
@@ -5534,6 +6543,11 @@ export function App() {
         thinkingSummary,
         "regenerate",
         !editedSource,
+        undefined,
+        {
+          id: sourceMessage.id,
+          versionNumber: editedSource?.versionNumber ?? displayedVersionNumber(sourceMessage),
+        },
       );
       if (!updatedMessage) throw new Error("This reply could not be found in the database.");
       responseSaved = true;
@@ -5554,7 +6568,13 @@ export function App() {
       }
 
       try {
-        await saveChatBranch(client, updatedMessage.id, updatedMessage.version_number);
+        await saveChatBranch(
+          client,
+          editedSource ? sourceMessage.id : updatedMessage.id,
+          editedSource?.versionNumber ?? updatedMessage.version_number,
+          undefined,
+          editedSource ? { [updatedMessage.id]: updatedMessage.version_number } : {},
+        );
       } catch (error) {
         regenerationWarnings.push(
           `Reply was regenerated, but its conversation branch could not be preserved: ${
@@ -5603,9 +6623,15 @@ export function App() {
     } catch (error) {
       try {
         if (!authClient) throw new Error("Sign in again before saving this AI error.");
+        const failureDetails =
+          error instanceof Error
+            ? `${error.name}: ${error.message}\n\n${
+                error.stack?.split("\n").slice(1).join("\n") ?? "Stack trace unavailable."
+              }`
+            : "Unknown error while regenerating the response.";
         await reportAiFailureFromClient(
           authClient,
-          error instanceof Error ? error.message : "Could not regenerate this reply.",
+          failureDetails.slice(0, 10000),
         );
       } catch (inboxError) {
         setSendError(
@@ -5616,12 +6642,12 @@ export function App() {
       }
       pendingAssistantAnchorRef.current = null;
       if (!responseSaved) {
-        hiddenChatMessageIdsRef.current.delete(messageId);
-        setMessages((current) => {
-          const sourceIndex = current.findIndex((item) => item.id === sourceMessage.id);
-          const retained = sourceIndex >= 0 ? current.slice(0, sourceIndex + 1) : current;
-          return [...retained, previousAssistant];
-        });
+        if (editedSource) {
+          hiddenChatMessageIdsRef.current.add(messageId);
+        } else {
+          previousMessages.forEach((message) => hiddenChatMessageIdsRef.current.delete(message.id));
+          setMessages(previousMessages);
+        }
       }
     } finally {
       setThinkingSteps([]);
@@ -5639,6 +6665,7 @@ export function App() {
       return;
     }
     const messageIndex = messages.findIndex((item) => item.id === userEditTarget);
+    const previousMessages = messages;
     const originalMessage = messages[messageIndex];
     if (!originalMessage || originalMessage.role !== "user") {
       setSendError("Could not find the user message to edit.");
@@ -5651,6 +6678,7 @@ export function App() {
     shouldScrollToLatestRef.current = true;
     setSendError("");
     setThinkingSteps(["Saving the edit and preparing a new reply…"]);
+    let editSaved = false;
     messages
       .slice(messageIndex + 1)
       .forEach((message) => hiddenChatMessageIdsRef.current.add(message.id));
@@ -5691,20 +6719,17 @@ export function App() {
         true,
       );
       if (!updatedMessage) throw new Error("The edited message was not found.");
-      setMessages((current) => {
-        const targetIndex = current.findIndex((item) => item.id === userEditTarget);
-        if (targetIndex < 0) return current;
-        return [
-          ...current.slice(0, targetIndex),
-          {
-            ...current[targetIndex],
-            text: updatedMessage.content,
-            createdAt: updatedMessage.created_at,
-            versionNumber: updatedMessage.version_number,
-            thinkingSummary: null,
-          },
-        ];
-      });
+      editSaved = true;
+      setMessages([
+        ...previousMessages.slice(0, messageIndex),
+        {
+          ...originalMessage,
+          text: updatedMessage.content,
+          createdAt: updatedMessage.created_at,
+          versionNumber: updatedMessage.version_number,
+          thinkingSummary: null,
+        },
+      ]);
       const versions = await loadMessageVersions(client, [userEditTarget]);
       setMessageVersions((current) => ({ ...current, ...versions }));
       setSelectedMessageVersions((current) => ({
@@ -5723,6 +6748,11 @@ export function App() {
         });
       }
     } catch (error) {
+      if (!editSaved) {
+        messages
+          .slice(messageIndex + 1)
+          .forEach((message) => hiddenChatMessageIdsRef.current.delete(message.id));
+      }
       const message = error instanceof Error ? error.message : "Could not edit this message.";
       setSendError(message);
       showAttachmentToast(message);
@@ -5734,7 +6764,7 @@ export function App() {
 
   if (
     pathname !== "/" &&
-    !/^\/settings(?:\/(?:general|personal|configure|memory|account|privacy|terms))?\/?$/.test(pathname)
+    !/^\/settings(?:\/(?:general|personal|configure|memory|messages|changelogs|account|privacy|terms))?\/?$/.test(pathname)
   ) {
     return (
       <ErrorPage
@@ -5790,110 +6820,6 @@ export function App() {
     );
   }
 
-  if (remoteAttachmentView) {
-    const { attachment, signedUrl } = remoteAttachmentView;
-    const isImage = attachment.mime_type.startsWith("image/");
-    const isVideo = attachment.mime_type.startsWith("video/");
-    const isPdf = attachment.mime_type === "application/pdf";
-    if (isImage || isVideo) {
-      return (
-        <MediaPreview
-          src={signedUrl}
-          fileName={attachment.file_name}
-          fileSize={attachment.size_bytes}
-          isVideo={isVideo}
-          downloadHref={signedUrl}
-          onClose={closeRemoteAttachmentView}
-        />
-      );
-    }
-    const textLines = (remoteAttachmentView.textContent ?? "").split(/\r\n|\r|\n/);
-    const longestTextLine = textLines.reduce(
-      (longest, line) => Math.max(longest, line.length),
-      0,
-    );
-    return (
-      <main className="fixed inset-0 z-50 flex flex-col bg-[#17181c] text-white">
-        <header className="flex min-h-14 items-center justify-between gap-3 border-b border-white/10 px-4">
-          <div className="min-w-0">
-            <p className="truncate text-sm font-medium">{attachment.file_name}</p>
-            <p className="text-xs text-white/60">{formatFileSize(attachment.size_bytes)}</p>
-          </div>
-          <div className="flex shrink-0 items-center gap-2">
-            <a
-              href={signedUrl}
-              download={attachment.file_name}
-              target="_blank"
-              rel="noreferrer"
-              className="rounded-full border border-white/20 px-3 py-1.5 text-xs font-medium hover:bg-white/10"
-            >
-              Download
-            </a>
-            <button
-              type="button"
-              aria-label="Close attachment"
-              onClick={closeRemoteAttachmentView}
-              className="flex size-9 items-center justify-center rounded-full hover:bg-white/10"
-            >
-              <X aria-hidden="true" className="size-5" />
-            </button>
-          </div>
-        </header>
-        <div
-          className={`flex min-h-0 flex-1 items-center justify-center overflow-auto ${
-            isTextAttachment(attachment.mime_type, attachment.file_name) ? "p-0" : "p-3 sm:p-6"
-          }`}
-        >
-          {isPdf ? (
-            <iframe
-              src={signedUrl}
-              title={attachment.file_name}
-              className="size-full rounded-lg bg-white"
-            />
-          ) : isTextAttachment(attachment.mime_type, attachment.file_name) ? (
-            <section
-              aria-label="File preview"
-              className="relative size-full min-h-0 overflow-hidden bg-white text-[#24252a]"
-            >
-              <div className="absolute inset-0 overflow-auto overscroll-contain">
-                <div className="flex min-h-full w-max min-w-full items-stretch font-mono text-[13px] leading-6">
-                  <div
-                    aria-hidden="true"
-                    className="sticky left-0 z-10 shrink-0 border-r border-[#eceef0] bg-[#fafafa] px-3 py-4 text-right text-[#a0a3aa] select-none"
-                  >
-                    {textLines.map((_, index) => (
-                      <div key={index} className="h-6 leading-6">
-                        {index + 1}
-                      </div>
-                    ))}
-                  </div>
-                  <textarea
-                    aria-label={`Preview ${attachment.file_name}`}
-                    readOnly
-                    spellCheck={false}
-                    wrap="off"
-                    value={remoteAttachmentView.textContent ?? ""}
-                    style={{
-                      width: `calc(${Math.max(40, longestTextLine)}ch + 1.5rem)`,
-                      minWidth: "calc(100vw - 56px)",
-                      height: `${Math.max(100, textLines.length * 24 + 32)}px`,
-                    }}
-                    className="m-0 block min-h-full shrink-0 resize-none overflow-hidden border-0 bg-white px-3 py-4 font-mono text-[13px] leading-6 text-[#25262a] outline-none"
-                  />
-                </div>
-              </div>
-            </section>
-          ) : (
-            <div className="text-center text-sm text-white/70">
-              <Files aria-hidden="true" className="mx-auto mb-3 size-10" />
-              <p>This file can be downloaded but does not have an in-app preview.</p>
-            </div>
-          )}
-        </div>
-      </main>
-    );
-  }
-
   if (pathname.startsWith("/settings") && authClient) {
     return (
       <Suspense
@@ -5930,7 +6856,6 @@ export function App() {
   const selectedUserMessageText = selectedUserMessage
     ? displayedMessageText(selectedUserMessage)
     : "";
-
   if (attachmentView && viewedFile && viewedAttachment) {
     const previewUrl = mediaPreviews.get(viewedFile);
     const isMediaView =
@@ -6014,9 +6939,6 @@ export function App() {
     );
   }
 
-  const pendingAssistantAnchorIndex = messages.findIndex(
-    (message) => message.id === pendingAssistantAnchorRef.current,
-  );
   const pendingAssistantResponseId =
     pendingAssistantAnchorIndex >= 0
       ? messages
@@ -6031,6 +6953,32 @@ export function App() {
       <section
         aria-label="CheyaVerse chat"
         className="relative flex h-full w-full max-w-[480px] flex-col overflow-hidden bg-[#f5f6f8]"
+        onPointerDownCapture={(event) => {
+          if (
+            event.target instanceof Element &&
+            event.target.closest(
+              "[data-header-panel-dismissible], [data-tts-warning-panel]",
+            )
+          ) {
+            return;
+          }
+          setNotificationsOpen(false);
+          setAdminApprovalToast(null);
+          setIsTtsErrorExpanded(false);
+        }}
+        onScrollCapture={(event) => {
+          if (
+            event.target instanceof Element &&
+            event.target.closest(
+              "[data-header-panel-dismissible], [data-tts-warning-panel]",
+            )
+          ) {
+            return;
+          }
+          setNotificationsOpen(false);
+          setAdminApprovalToast(null);
+          setIsTtsErrorExpanded(false);
+        }}
         onDragEnter={(event) => {
           if (!Array.from(event.dataTransfer.types).includes("Files")) return;
           event.preventDefault();
@@ -6141,27 +7089,7 @@ export function App() {
           </nav>
         </header>
 
-        {notificationsOpen && (
-          <div
-            aria-hidden="true"
-            onClick={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              setNotificationsOpen(false);
-            }}
-            className="absolute inset-0 z-40 bg-transparent"
-          />
-        )}
         <div
-          onClickCapture={(event) => {
-            if (
-              notificationsOpen &&
-              event.target instanceof Element &&
-              event.target.closest("[data-header-panel-interactive]")
-            ) {
-              setNotificationsOpen(false);
-            }
-          }}
           className="pointer-events-none absolute inset-x-3 top-[64px] z-50 flex max-h-[calc(100dvh-80px)] flex-col gap-1.5 overflow-y-auto"
         >
         {authUser?.role === "admin" && adminApprovalToast && (
@@ -6169,6 +7097,7 @@ export function App() {
             role="status"
             aria-label="AI message awaiting approval"
             data-header-panel-interactive
+            data-header-panel-dismissible
             className="pointer-events-auto flex items-center gap-2 rounded-2xl border border-[#e8d7b1] bg-[#fffaf0] px-3 py-2.5 shadow-lg"
           >
             <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-[#f5e8ca] text-[#8d6418]">
@@ -6202,7 +7131,8 @@ export function App() {
           <div
             role="dialog"
             aria-label="Notification inbox"
-            className="pointer-events-auto flex max-h-[min(54vh,420px)] shrink-0 flex-col overflow-hidden rounded-2xl border border-[#e1e3e8] bg-white shadow-xl"
+            data-header-panel-dismissible
+            className="chat-quick-panel pointer-events-auto flex max-h-[min(54vh,420px)] shrink-0 flex-col overflow-hidden rounded-2xl border border-[#e1e3e8] bg-white shadow-xl"
           >
             <header className="flex shrink-0 items-center justify-between gap-2 border-b border-[#eceef1] px-3 py-1">
               <div className="flex min-w-0 items-baseline gap-2">
@@ -6438,14 +7368,14 @@ export function App() {
               data-header-panel-interactive
               className="flex min-h-12 items-center gap-0 rounded-2xl border border-[#e6e7eb] bg-white px-1.5 py-1.5 shadow-sm"
             >
-              {ttsPlayback.status === "loading" ? (
+              {ttsPlayback.status === "loading" || ttsPlayback.status === "ready" ? (
                 <>
                   <LoaderCircle
                     aria-hidden="true"
                     className="ml-1 mr-2 size-4 shrink-0 animate-spin text-[#656871]"
                   />
                   <p role="status" className="min-w-0 flex-1 text-xs text-[#656871]">
-                    Preparing speech…
+                    {ttsPlayback.status === "ready" ? "Starting speech…" : "Preparing speech…"}
                   </p>
                 </>
               ) : (
@@ -6474,7 +7404,7 @@ export function App() {
                       aria-label="Show speech error details"
                       aria-expanded={isTtsErrorExpanded}
                       onClick={() => setIsTtsErrorExpanded((expanded) => !expanded)}
-                      className="flex size-7 shrink-0 items-center justify-center rounded-full text-amber-700 transition-colors hover:bg-amber-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-500"
+                      className="-ml-1 flex size-7 shrink-0 items-center justify-center rounded-full text-amber-700 transition-colors hover:bg-amber-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-500"
                     >
                       <TriangleAlert aria-hidden="true" className="size-4" />
                     </button>
@@ -6538,10 +7468,30 @@ export function App() {
         )}
         {ttsPlayback && isTtsErrorExpanded && ttsPlayback.errorDetails && (
           <div
-            role="alert"
-            className="pointer-events-auto max-h-40 shrink-0 overflow-y-auto whitespace-pre-wrap break-words rounded-2xl border border-[#e6e7eb] bg-white px-3 py-2.5 text-xs leading-5 text-[#55504a] shadow-sm"
+            data-tts-warning-panel
+            className="pointer-events-auto relative shrink-0"
           >
-            {ttsPlayback.errorDetails}
+            <button
+              type="button"
+              aria-label={isTtsWarningCopied ? "Speech warning copied" : "Copy speech warning"}
+              title={isTtsWarningCopied ? "Copied" : "Copy warning"}
+              onClick={() => void copyTtsWarning(ttsPlayback.errorDetails ?? "")}
+              className="absolute right-3 top-1.5 z-10 flex size-7 items-center justify-center rounded-md border border-[#e6e7eb] bg-white text-[#55575e] shadow-sm transition hover:bg-[#f1f2f4] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
+            >
+              {isTtsWarningCopied ? (
+                <Check aria-hidden="true" className="size-4" />
+              ) : (
+                <Copy aria-hidden="true" className="size-4" />
+              )}
+            </button>
+            <div
+              role="alert"
+              className="chat-quick-panel max-h-40 overflow-auto overscroll-contain rounded-2xl border border-[#e6e7eb] bg-white px-3 py-2.5 pr-11 text-xs leading-5 text-[#55504a] shadow-sm"
+            >
+              <pre className="w-max min-w-full whitespace-pre font-sans">
+                {ttsPlayback.errorDetails}
+              </pre>
+            </div>
           </div>
         )}
         </div>
@@ -6556,12 +7506,13 @@ export function App() {
           <div className="space-y-3">
             {messages.map((chatMessage) => {
               const versionNumber = displayedVersionNumber(chatMessage);
-              const versions = messageVersions[chatMessage.id] ?? [];
+              const versions = messageVersionsForDisplay(chatMessage);
               const versionIndex = versions.findIndex(
                 (item) => item.version_number === versionNumber,
               );
               const visibleText = displayedMessageText(chatMessage);
               const visibleThinkingSummary = displayedThinkingSummary(chatMessage);
+              const failedSubmission = failedChatSubmissions[chatMessage.id];
               const animateAssistant =
                 (typingAssistant?.id === chatMessage.id &&
                   typingAssistant.content === visibleText) ||
@@ -6574,7 +7525,7 @@ export function App() {
                   <button
                     type="button"
                     aria-label={`Show previous ${versionLabel} version`}
-                    disabled={isSending || versionIndex <= 0}
+                    disabled={isSending || isRestoringMessageVersion || versionIndex <= 0}
                     onClick={() => void setMessageVersion(chatMessage, -1)}
                     className="flex size-7 items-center justify-center rounded-md hover:bg-[#f1f2f4] disabled:opacity-30"
                   >
@@ -6586,6 +7537,7 @@ export function App() {
                     aria-label={`Show newer ${versionLabel} version`}
                     disabled={
                       isSending ||
+                      isRestoringMessageVersion ||
                       versionIndex < 0 ||
                       versionIndex >= versions.length - 1
                     }
@@ -6617,8 +7569,32 @@ export function App() {
                         ))}
                       </div>
                     )}
+                    <div className="user-message-action-group flex w-full max-w-full flex-col items-end">
                     <div
-                      onPointerDown={(event) => {
+                      className={
+                        failedSubmission
+                          ? "grid w-full grid-cols-[auto_minmax(0,1fr)] items-end gap-2"
+                          : "flex w-full items-end justify-end"
+                      }
+                    >
+                      {failedSubmission && (
+                        <button
+                          type="button"
+                          aria-label="Retry sending this message"
+                          title={failedSubmission.error}
+                          disabled={failedSubmission.retrying || isSending}
+                          onClick={() => void retryChatSubmission(chatMessage.id)}
+                          className="mb-1 flex size-8 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#555963] shadow-sm transition-none hover:bg-[#f7f8fa] disabled:opacity-50"
+                        >
+                          {failedSubmission.retrying ? (
+                            <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                          ) : (
+                            <RotateCw aria-hidden="true" className="size-4" />
+                          )}
+                        </button>
+                      )}
+                      <div
+                        onPointerDown={(event) => {
                         if (event.pointerType !== "touch") return;
                         clearLongPressTimer();
                         longPressStartRef.current = { x: event.clientX, y: event.clientY };
@@ -6627,7 +7603,7 @@ export function App() {
                             setActiveUserActions(chatMessage.id);
                             longPressTimerRef.current = null;
                           },
-                          450,
+                          320,
                         );
                       }}
                       onPointerMove={(event) => {
@@ -6654,7 +7630,7 @@ export function App() {
                         setActiveUserActions(chatMessage.id);
                       }}
                       onDragStart={(event) => event.preventDefault()}
-                      className="user-message-bubble max-w-[94%] select-none rounded-[18px] rounded-br-md bg-[#28292e] px-3.5 py-1.5 text-[13px] leading-[1.35] text-white [webkit-touch-callout:none]"
+                      className="user-message-bubble w-auto min-w-0 max-w-[94%] select-none rounded-[18px] rounded-br-md bg-[#28292e] px-3.5 py-1.5 text-[13px] leading-[1.35] text-white [webkit-touch-callout:none]"
                       style={{
                         WebkitTouchCallout: "none",
                         fontSize: Math.round(13 * chatFontScale),
@@ -6669,6 +7645,7 @@ export function App() {
                         client={authClient}
                         userMessage
                       />
+                      </div>
                     </div>
                     <div
                       data-user-actions
@@ -6679,7 +7656,7 @@ export function App() {
                         type="button"
                         aria-label="Copy user message"
                         onClick={() => void copyMessageText(chatMessage.id, visibleText)}
-                        className="flex size-5 items-center justify-center rounded-full text-[#777a82] opacity-0 pointer-events-none transition-[opacity,color,background-color] hover:bg-[#f1f2f4] hover:text-[#34363b]"
+                        className="flex size-5 items-center justify-center rounded-full text-[#777a82] opacity-0 pointer-events-none transition-none hover:bg-[#f1f2f4] hover:text-[#34363b]"
                       >
                         {copiedMessageId === chatMessage.id ? (
                           <Check aria-hidden="true" className="size-3 text-[#398650]" />
@@ -6691,7 +7668,7 @@ export function App() {
                         type="button"
                         aria-label="Edit user message"
                         onClick={() => openUserMessageEditor(chatMessage.id, visibleText)}
-                        className="flex size-5 items-center justify-center rounded-full text-[#777a82] opacity-0 pointer-events-none transition-[opacity,color,background-color] hover:bg-[#f1f2f4] hover:text-[#34363b]"
+                        className="flex size-5 items-center justify-center rounded-full text-[#777a82] opacity-0 pointer-events-none transition-none hover:bg-[#f1f2f4] hover:text-[#34363b]"
                       >
                         <Pencil aria-hidden="true" className="size-3" />
                       </button>
@@ -6703,11 +7680,22 @@ export function App() {
                           setDeleteChatTarget({ id: chatMessage.id, text: visibleText });
                           setActiveUserActions(null);
                         }}
-                        className="flex size-5 items-center justify-center rounded-full text-[#b43b3b] opacity-0 pointer-events-none transition-[opacity,color,background-color] hover:bg-red-50 disabled:opacity-40"
+                        className="flex size-5 items-center justify-center rounded-full text-[#b43b3b] opacity-0 pointer-events-none transition-none hover:bg-red-50 disabled:opacity-40"
                       >
                         <Trash2 aria-hidden="true" className="size-3" />
                       </button>
                     </div>
+                    </div>
+                    {failedSubmission && (
+                      <p role="status" className="mt-1 max-w-[94%] text-right text-[11px] leading-4 text-[#a34444]">
+                        Koneksi tidak stabil atau pesan gagal dikirim.{" "}
+                        {failedSubmission.retrying
+                          ? "Mencoba mengirim ulang…"
+                          : failedSubmission.retryable
+                            ? "Akan mencoba ulang saat koneksi kembali; tekan ikon untuk retry."
+                            : `${failedSubmission.error} Tekan ikon untuk mencoba lagi.`}
+                      </p>
+                    )}
                     {versionControls && (
                       <div className="mt-0.5 flex min-h-7 w-full items-center justify-end">
                         {versionControls}
@@ -6754,8 +7742,16 @@ export function App() {
                   >
                     <Suspense fallback={null}>
                       <AssistantMarkdown
+                        key={`${chatMessage.id}:${animateAssistant ? "typing" : "complete"}`}
                         content={visibleText}
                         animate={animateAssistant}
+                        activeSpeechWordIndex={
+                          ttsPlayback?.messageId === chatMessage.id &&
+                          ttsPlayback.versionNumber === versionNumber &&
+                          ttsPlayback.status === "playing"
+                            ? ttsPlayback.activeWordIndex ?? null
+                            : null
+                        }
                         onTypewriterProgress={() => {
                           if (followLatestRef.current) scrollConversationToLatest("auto");
                         }}
@@ -6773,7 +7769,7 @@ export function App() {
                   {chatMessage.attachments && chatMessage.attachments.length > 0 && (
                     <div
                       aria-label="AI-shared attachments"
-                      className="mt-2 grid w-fit max-w-[min(100%,320px)] grid-cols-3 gap-2"
+                      className="mt-2 grid w-fit max-w-[min(100%,420px)] grid-cols-2 gap-2"
                     >
                       {chatMessage.attachments.map((attachment) => (
                         <ChatMessageAttachmentTile
@@ -6782,6 +7778,7 @@ export function App() {
                           expired={isChatAttachmentExpired(attachment)}
                           getPreviewUrl={getAttachmentPreviewUrl}
                           onOpen={(item) => void openStoredAttachment(item)}
+                          size="large"
                         />
                       ))}
                     </div>
@@ -6918,7 +7915,7 @@ export function App() {
                 </article>
               );
             })}
-            {isSending && (
+            {isAssistantBusy && (
               <div
                 role="status"
                 aria-live="polite"
@@ -6930,12 +7927,18 @@ export function App() {
               >
                 {activeChatJob?.thinking_mode ?? thinkingModeRef.current ? (
                   <p className="font-medium text-[#4b4e55]">
-                    {activeChatJob?.progress ||
+                    {typingAssistant
+                      ? "Cheya is writing the reply…"
+                      : activeChatJob?.progress ||
                       thinkingSteps[thinkingSteps.length - 1] ||
                       "Reviewing the request…"}
                   </p>
                 ) : (
-                  <p>{activeChatJob?.progress || "Cheya is preparing a reply…"}</p>
+                  <p>
+                    {typingAssistant
+                      ? "Cheya is writing the reply…"
+                      : activeChatJob?.progress || "Cheya is preparing a reply…"}
+                  </p>
                 )}
               </div>
             )}
@@ -6956,7 +7959,7 @@ export function App() {
             {sendError && (
               <p
                 role="alert"
-                className="whitespace-pre-line rounded-2xl border border-red-100 bg-red-50 px-3 py-2 text-sm text-red-800"
+                className="chat-quick-panel whitespace-pre-line rounded-2xl border border-red-100 bg-red-50 px-3 py-2 text-sm text-red-800"
               >
                 {sendError}
               </p>
@@ -7070,13 +8073,36 @@ export function App() {
                         />
                       )}
                       {attachment.uploadError && !attachment.isBlocked && (
-                        <span
+                        <div
                           role="alert"
-                          className="absolute inset-x-0 bottom-0 truncate bg-red-700/90 px-1 py-1 text-center text-[9px] font-medium text-white"
+                          className="absolute inset-x-0 bottom-0 flex items-center justify-center gap-1 bg-red-700/90 px-1 py-1 text-white"
                           title={attachment.uploadError}
                         >
-                          Upload failed
-                        </span>
+                          <span className="truncate text-[9px] font-medium">Upload failed</span>
+                          <button
+                            type="button"
+                            aria-label={`Retry upload of ${file.name}`}
+                            title={`Retry upload: ${attachment.uploadError}`}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setAttachedMedia((current) =>
+                                current.map((item) =>
+                                  item.id === attachment.id
+                                    ? { ...item, isUploading: true, uploadError: null }
+                                    : item,
+                                ),
+                              );
+                              void uploadPendingAttachment({
+                                ...attachment,
+                                isUploading: true,
+                                uploadError: null,
+                              });
+                            }}
+                            className="flex size-4 shrink-0 items-center justify-center rounded hover:bg-white/20"
+                          >
+                            <RotateCw aria-hidden="true" className="size-3" />
+                          </button>
+                        </div>
                       )}
                       <button
                         type="button"
@@ -7132,7 +8158,26 @@ export function App() {
                     thinkingModeRef.current = enabled;
                   }}
                 />
-                {attachedMedia.length > 0 ? (
+                {isAssistantBusy ? (
+                  <>
+                    <button
+                      type="button"
+                      aria-label="Microphone unavailable while Cheya is responding"
+                      disabled
+                      className="chat-composer-idle-control flex size-9 shrink-0 items-center justify-center rounded-full border-0 bg-transparent text-[#34363b] opacity-35 blur-[1px] sm:size-10"
+                    >
+                      <Mic aria-hidden="true" className="size-[19px]" strokeWidth={1.8} />
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="Cheya is responding"
+                      disabled
+                      className="flex size-9 shrink-0 items-center justify-center rounded-full border border-[#17181b] bg-[#17181b] text-white sm:size-10"
+                    >
+                      <LoaderCircle aria-hidden="true" className="size-[18px] animate-spin" />
+                    </button>
+                  </>
+                ) : attachedMedia.length > 0 ? (
                   <button
                     type="button"
                     aria-label="Send message"
@@ -7141,7 +8186,7 @@ export function App() {
                     }}
                     onClick={sendMessage}
                     disabled={
-                      isSending ||
+                      isAssistantBusy ||
                       isRestoringDraftAttachments ||
                       isPreparingAttachments ||
                       !hasGeminiApiKey ||
@@ -7152,7 +8197,8 @@ export function App() {
                     }
                     className="flex size-9 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] sm:size-10"
                   >
-                    {isSending || isAttachmentUploadPending || isRestoringDraftAttachments ? (
+                    {isAttachmentUploadPending ||
+                    isRestoringDraftAttachments ? (
                       <LoaderCircle aria-hidden="true" className="size-[18px] animate-spin" />
                     ) : (
                       <Send aria-hidden="true" className="size-[18px]" strokeWidth={1.8} />
@@ -7182,14 +8228,14 @@ export function App() {
                       }}
                       onClick={sendMessage}
                       disabled={
-                        isSending ||
                         isRestoringDraftAttachments ||
                         isAttachmentUploadPending ||
                         !hasGeminiApiKey
                       }
                       className="chat-composer-send hidden size-9 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] disabled:opacity-40 sm:size-10"
                     >
-                      {isSending || isRestoringDraftAttachments || isAttachmentUploadPending ? (
+                      {isRestoringDraftAttachments ||
+                      isAttachmentUploadPending ? (
                         <LoaderCircle aria-hidden="true" className="size-[18px] animate-spin" />
                       ) : (
                         <Send aria-hidden="true" className="size-[18px]" strokeWidth={1.8} />
@@ -7296,7 +8342,7 @@ export function App() {
             aria-modal="true"
             aria-labelledby="delete-chat-branch-title"
             aria-describedby="delete-chat-branch-description"
-            className="w-full max-w-md rounded-3xl border border-[#e2e4e8] bg-white p-5 shadow-xl"
+            className="chat-quick-panel w-full max-w-md rounded-3xl border border-[#e2e4e8] bg-white p-5 shadow-xl"
           >
             <h2 id="delete-chat-branch-title" className="text-base font-semibold text-[#22242a]">
               Delete this conversation branch?
@@ -7359,7 +8405,7 @@ export function App() {
             event.preventDefault();
             void saveUserMessageEdit();
           }}
-          className="w-full rounded-3xl bg-white p-5 shadow-xl"
+          className="chat-quick-panel w-full rounded-3xl bg-white p-5 shadow-xl"
         >
           <h2 id="edit-user-message-title" className="text-base font-semibold text-[#22242a]">
             Edit message
@@ -7400,7 +8446,7 @@ export function App() {
 
       {reportTarget && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-5 py-8"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-3 py-5"
           onMouseDown={(event) => {
             if (event.target === event.currentTarget && !isSavingReport) {
               setReportTarget(null);
@@ -7411,52 +8457,80 @@ export function App() {
           <section
             role="dialog"
             aria-modal="true"
-            aria-labelledby="report-response-title"
-            className="w-full max-w-sm rounded-3xl border border-[#e2e4e8] bg-white p-5 shadow-xl"
+            aria-label="Send feedback"
+            className="chat-quick-panel feedback-construction-frame relative w-full max-w-3xl shadow-[0_20px_56px_rgba(0,0,0,0.22)]"
           >
-            <h2 id="report-response-title" className="text-base font-semibold text-[#22242a]">
-              Report this response
-            </h2>
-            <label htmlFor="response-report-details" className="mt-4 block text-sm text-[#43454b]">
-              What went wrong?
-            </label>
-            <textarea
-              id="response-report-details"
-              maxLength={2000}
-              rows={4}
-              defaultValue={reportDetailsRef.current}
-              onChange={(event) => {
-                reportDetailsRef.current = event.currentTarget.value;
-              }}
-              className="mt-2 w-full resize-y rounded-xl border border-[#e5e6e9] p-3 text-sm outline-none focus:border-[#229fe3]"
-            />
-            {reportError && (
-              <p role="alert" className="mt-2 text-sm text-red-700">
-                {reportError}
-              </p>
-            )}
-            <div className="mt-4 flex justify-end gap-2">
-              <button
-                type="button"
-                disabled={isSavingReport}
-                onClick={() => {
-                  setReportTarget(null);
-                  setReportError("");
-                }}
-                className="h-10 rounded-full border border-[#e5e6e9] px-4 text-sm font-medium text-[#34363b] hover:bg-[#f7f8fa] disabled:opacity-50"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                disabled={isSavingReport}
-                onClick={() => void submitAssistantReport()}
-                className="flex h-10 items-center gap-2 rounded-full bg-[#28292e] px-4 text-sm font-medium text-white hover:bg-[#3b3d43] disabled:opacity-50"
-              >
-                {isSavingReport && <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />}
-                Send report
-              </button>
+            <div aria-hidden="true" className="feedback-construction-stripe" />
+            <div className="feedback-construction-content">
+              <div className="bg-white px-1 py-1.5">
+                <textarea
+                  id="response-report-details"
+                  aria-label="Feedback details"
+                  aria-describedby="response-report-character-count"
+                  maxLength={2000}
+                  rows={4}
+                  placeholder="Describe the feedback…"
+                  defaultValue={reportDetailsRef.current}
+                  onChange={(event) => {
+                    const { currentTarget } = event;
+                    const characterCount = currentTarget.value.length;
+                    const isAtLimit = characterCount >= 2000;
+                    reportDetailsRef.current = currentTarget.value;
+                    currentTarget.classList.toggle("border-red-600", isAtLimit);
+                    currentTarget.classList.toggle("focus:border-red-600", isAtLimit);
+                    currentTarget.classList.toggle("focus:ring-red-200", isAtLimit);
+                    currentTarget.classList.toggle("border-[#343434]", !isAtLimit);
+                    currentTarget.classList.toggle("focus:border-[#b58a00]", !isAtLimit);
+                    currentTarget.classList.toggle("focus:ring-[#facc15]/50", !isAtLimit);
+                    if (reportCharacterCountRef.current) {
+                      reportCharacterCountRef.current.textContent = isAtLimit
+                        ? "0 characters remaining — limit reached; additional input is blocked."
+                        : `${2000 - characterCount} characters remaining`;
+                      reportCharacterCountRef.current.classList.toggle("font-semibold", isAtLimit);
+                      reportCharacterCountRef.current.classList.toggle("text-red-700", isAtLimit);
+                      reportCharacterCountRef.current.classList.toggle("text-[#777a82]", !isAtLimit);
+                    }
+                  }}
+                  className="min-h-24 w-full resize-y rounded-lg border-2 border-[#343434] bg-white px-2 py-1 text-sm leading-5 text-[#252525] outline-none placeholder:text-[#898989] focus:border-[#b58a00] focus:ring-2 focus:ring-[#facc15]/50"
+                />
+                <p
+                  ref={reportCharacterCountRef}
+                  id="response-report-character-count"
+                  aria-live="polite"
+                  className="mt-1 text-right text-xs text-[#777a82]"
+                >
+                  2000 characters remaining
+                </p>
+                {reportError && (
+                  <p role="alert" className="mt-2 text-xs font-medium text-red-700">
+                    {reportError}
+                  </p>
+                )}
+                <div className="mt-2 flex justify-end gap-2">
+                  <button
+                    type="button"
+                    disabled={isSavingReport}
+                    onClick={() => {
+                      setReportTarget(null);
+                      setReportError("");
+                    }}
+                    className="h-9 rounded-lg border border-[#4d4b42] bg-white px-3.5 text-xs font-semibold text-[#34332d] hover:bg-[#f5f1df] disabled:opacity-50"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isSavingReport}
+                    onClick={() => void submitAssistantReport()}
+                    className="flex h-9 items-center gap-2 rounded-lg border-2 border-[#252525] bg-[#facc15] px-3.5 text-xs font-bold text-[#252525] shadow-[0_2px_0_#252525] transition hover:bg-[#f4bd00] disabled:opacity-50"
+                  >
+                    {isSavingReport && <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />}
+                    Send feedback
+                  </button>
+                </div>
+              </div>
             </div>
+            <div aria-hidden="true" className="feedback-construction-stripe" />
           </section>
         </div>
       )}
@@ -7473,7 +8547,7 @@ export function App() {
             aria-modal="true"
             aria-labelledby="delete-confirmation-title"
             aria-describedby="delete-confirmation-description"
-            className="w-full max-w-sm rounded-3xl bg-white p-5 shadow-xl"
+            className="chat-quick-panel w-full max-w-sm rounded-3xl bg-white p-5 shadow-xl"
           >
             <h2 id="delete-confirmation-title" className="text-base font-semibold text-[#22242a]">
               Confirm deletion
@@ -7583,6 +8657,119 @@ export function App() {
           </section>
         </div>
       )}
+
+      {remoteAttachmentView &&
+        (() => {
+          const { attachment, signedUrl, textContent, isLoading } = remoteAttachmentView;
+          const isImage = attachment.mime_type.startsWith("image/");
+          const isVideo = attachment.mime_type.startsWith("video/");
+          const isPdf = attachment.mime_type === "application/pdf";
+          if (isImage || isVideo) {
+            return (
+              <MediaPreview
+                src={signedUrl}
+                fileName={attachment.file_name}
+                fileSize={attachment.size_bytes}
+                isVideo={isVideo}
+                isLoading={isLoading}
+                downloadHref={signedUrl}
+                onClose={closeRemoteAttachmentView}
+              />
+            );
+          }
+          const textLines = (textContent ?? "").split(/\r\n|\r|\n/);
+          const longestTextLine = textLines.reduce(
+            (longest, line) => Math.max(longest, line.length),
+            0,
+          );
+          return (
+            <main className="fixed inset-0 z-50 flex flex-col bg-[#17181c] text-white">
+              <header className="flex min-h-14 items-center justify-between gap-3 border-b border-white/10 px-4">
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-medium">{attachment.file_name}</p>
+                  <p className="text-xs text-white/60">{formatFileSize(attachment.size_bytes)}</p>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  {signedUrl && (
+                    <a
+                      href={signedUrl}
+                      download={attachment.file_name}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="rounded-full border border-white/20 px-3 py-1.5 text-xs font-medium hover:bg-white/10"
+                    >
+                      Download
+                    </a>
+                  )}
+                  <button
+                    type="button"
+                    aria-label="Close attachment"
+                    onClick={closeRemoteAttachmentView}
+                    className="flex size-9 items-center justify-center rounded-full hover:bg-white/10"
+                  >
+                    <X aria-hidden="true" className="size-5" />
+                  </button>
+                </div>
+              </header>
+              <div
+                className={`flex min-h-0 flex-1 items-center justify-center overflow-auto ${
+                  isTextAttachment(attachment.mime_type, attachment.file_name) ? "p-0" : "p-3 sm:p-6"
+                }`}
+              >
+                {isLoading ? (
+                  <div role="status" className="flex items-center gap-2 text-sm text-white/70">
+                    <LoaderCircle aria-hidden="true" className="size-5 animate-spin" />
+                    Preparing preview…
+                  </div>
+                ) : isPdf ? (
+                  <iframe
+                    src={signedUrl}
+                    title={attachment.file_name}
+                    className="size-full rounded-lg bg-white"
+                  />
+                ) : isTextAttachment(attachment.mime_type, attachment.file_name) ? (
+                  <section
+                    aria-label="File preview"
+                    className="relative size-full min-h-0 overflow-hidden bg-white text-[#24252a]"
+                  >
+                    <div className="absolute inset-0 overflow-auto overscroll-contain">
+                      <div className="flex min-h-full w-max min-w-full items-stretch font-mono text-[13px] leading-6">
+                        <div
+                          aria-hidden="true"
+                          className="sticky left-0 z-10 shrink-0 border-r border-[#eceef0] bg-[#fafafa] px-3 py-4 text-right text-[#a0a3aa] select-none"
+                        >
+                          {textLines.map((_, index) => (
+                            <div key={index} className="h-6 leading-6">
+                              {index + 1}
+                            </div>
+                          ))}
+                        </div>
+                        <textarea
+                          aria-label={`Preview ${attachment.file_name}`}
+                          readOnly
+                          spellCheck={false}
+                          wrap="off"
+                          value={textContent ?? ""}
+                          style={{
+                            width: `calc(${Math.max(40, longestTextLine)}ch + 1.5rem)`,
+                            minWidth: "calc(100vw - 56px)",
+                            height: `${Math.max(100, textLines.length * 24 + 32)}px`,
+                          }}
+                          className="m-0 block min-h-full shrink-0 resize-none overflow-hidden border-0 bg-white px-3 py-4 font-mono text-[13px] leading-6 text-[#25262a] outline-none"
+                        />
+                      </div>
+                    </div>
+                  </section>
+                ) : (
+                  <div className="text-center text-sm text-white/70">
+                    <Files aria-hidden="true" className="mx-auto mb-3 size-10" />
+                    <p>This file can be downloaded but does not have an in-app preview.</p>
+                  </div>
+                )}
+              </div>
+            </main>
+          );
+        })()}
 
       <input
         ref={fileInputRef}

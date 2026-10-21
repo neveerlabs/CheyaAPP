@@ -11,7 +11,7 @@ function Root() {
   if (pathname === "/terms") return <LegalPage kind="terms" />;
   if (
     pathname !== "/" &&
-    !/^\/settings(?:\/(?:personal|configure|memory|account|privacy|terms))?\/?$/.test(pathname)
+    !/^\/settings(?:\/(?:general|personal|configure|memory|messages|changelogs|account|privacy|terms))?\/?$/.test(pathname)
   ) {
     return (
       <ErrorPage

@@ -188,9 +188,9 @@ export type GeminiTtsAudioCache = {
   user_id: string;
   message_id: string;
   version_number: number;
-  voice: GeminiTtsVoice;
+  voice: GeminiTtsVoice | "id-ID";
   storage_path: string;
-  source: "gemini";
+  source: "gemini" | "soundoftext";
   created_at: string;
   expires_at: string;
 };
@@ -226,6 +226,8 @@ export type ChatMessageVersion = {
   user_id: string;
   message_id: string;
   version_number: number;
+  source_message_id: string | null;
+  source_message_version_number: number | null;
   content: string;
   embedding: string | null;
   thinking_summary: string | null;
@@ -293,6 +295,26 @@ export type Database = {
           status: ApiStatus;
           last_error: string | null;
         }>;
+        Relationships: never[];
+      };
+      retained_api_keys: {
+        Row: {
+          id: string;
+          user_id: string | null;
+          provider: "gemini" | "gemini_tts";
+          model: string;
+          api_key: string;
+          created_at: string;
+        };
+        Insert: {
+          id?: string;
+          user_id?: string | null;
+          provider: "gemini" | "gemini_tts";
+          model: string;
+          api_key: string;
+          created_at?: string;
+        };
+        Update: never;
         Relationships: never[];
       };
       account_profiles: {
@@ -496,6 +518,8 @@ export type Database = {
           user_id?: string;
           message_id: string;
           version_number: number;
+          source_message_id?: string | null;
+          source_message_version_number?: number | null;
           content: string;
           embedding?: string | null;
           thinking_summary?: string | null;
@@ -612,9 +636,9 @@ export type Database = {
           user_id?: string;
           message_id: string;
           version_number: number;
-          voice: GeminiTtsVoice;
+          voice: GeminiTtsVoice | "id-ID";
           storage_path: string;
-          source?: "gemini";
+          source?: "gemini" | "soundoftext";
           created_at?: string;
           expires_at?: string;
         };
@@ -738,6 +762,10 @@ export type Database = {
         };
         Returns: undefined;
       };
+      clear_chat_history: {
+        Args: Record<PropertyKey, never>;
+        Returns: number;
+      };
       delete_chat_branch_from_message: {
         Args: { p_message_id: string };
         Returns: number;
@@ -759,6 +787,9 @@ export type Database = {
           p_thinking_summary: string | null;
           p_revision_reason: ChatMessageVersion["revision_reason"];
           p_branch: boolean;
+          p_user_id?: string | null;
+          p_source_message_id?: string | null;
+          p_source_message_version_number?: number | null;
         };
         Returns: StoredChatMessage[];
       };
@@ -785,8 +816,9 @@ export type Database = {
           p_content: string;
           p_thinking_mode: boolean;
           p_attachment_ids: string[];
+          p_client_request_id: string;
         };
-        Returns: Array<{ job_id: string; message_id: string }>;
+        Returns: Array<{ job_id: string; message_id: string; created: boolean }>;
       };
       register_chat_attachment_reference: {
         Args: {

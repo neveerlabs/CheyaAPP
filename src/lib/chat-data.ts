@@ -10,9 +10,42 @@ import { CHAT_ATTACHMENT_BUCKET, type ChatAttachment } from "./chat-attachments"
 const EMBEDDING_MODEL = "gemini-embedding-001";
 const EMBEDDING_DIMENSIONS = 768;
 const SEARCH_RESULT_LIMIT = 8;
+const MAX_KEYWORD_TERMS = 8;
 type EmbeddingTaskType = "RETRIEVAL_DOCUMENT" | "RETRIEVAL_QUERY";
 
 type InsightDraft = Omit<MessageInsight, "id" | "user_id" | "message_id" | "created_at">;
+
+const retrievalStopWords = new Set([
+  "ada", "aja", "atau", "belum", "bisa", "buat", "dalam", "dan", "dari", "dengan", "dia",
+  "dimana", "guna", "ini", "itu", "juga", "kamu", "karena", "ke", "kenapa", "ketika",
+  "kok", "lagi", "lebih", "mau", "mereka", "oleh", "pada", "saja", "sama", "saya",
+  "sebagai", "seperti", "sudah", "susah", "tapi", "telah", "tentang", "terus", "tidak",
+  "untuk", "yang", "about", "after", "again", "also", "been", "being", "could", "from",
+  "have", "into", "just", "more", "most", "only", "other", "over", "same", "some",
+  "such", "than", "that", "them", "then", "there", "these", "they", "this", "what",
+  "when", "where", "which", "while", "with", "would", "your",
+  "di", "ga", "gak", "nya", "yg", "ya", "an", "as", "at", "be", "by", "do", "for",
+  "if", "in", "is", "it", "no", "of", "on", "or", "so", "to", "up", "we", "he",
+  "she", "my", "me",
+]);
+
+function retrievalKeywords(text: string): string[] {
+  const frequencies = new Map<string, number>();
+  for (const match of text.toLocaleLowerCase().matchAll(/[\p{L}\p{N}][\p{L}\p{N}'’-]{1,}/gu)) {
+    const term = match[0].replace(/['’-]/g, "");
+    if (term.length < 2 || retrievalStopWords.has(term)) continue;
+    frequencies.set(term, (frequencies.get(term) ?? 0) + 1);
+  }
+  return [...frequencies]
+    .sort(
+      ([firstTerm, firstCount], [secondTerm, secondCount]) =>
+        secondCount - firstCount ||
+        secondTerm.length - firstTerm.length ||
+        firstTerm.localeCompare(secondTerm),
+    )
+    .slice(0, MAX_KEYWORD_TERMS)
+    .map(([term]) => term);
+}
 
 export type RetrievedChatMessage = Pick<
   StoredChatMessage,
@@ -352,7 +385,7 @@ export async function loadMessageVersions(
   if (messageIds.length === 0) return {};
   let query = client
     .from("chat_message_versions")
-    .select("id, user_id, message_id, version_number, content, embedding, thinking_summary, revision_reason, created_at")
+    .select("id, user_id, message_id, version_number, source_message_id, source_message_version_number, content, embedding, thinking_summary, revision_reason, created_at")
     .in("message_id", messageIds)
     .order("version_number", { ascending: true });
   if (userId) query = query.eq("user_id", userId);
@@ -372,9 +405,14 @@ export async function findRelevantContext(
   excludeMessageId: string,
   beforeCreatedAt?: string,
   userId?: string,
+  keywordText = "",
 ): Promise<{ messages: RetrievedChatMessage[]; memories: RetrievedMemory[] }> {
   const queryEmbedding = serializeEmbedding(embedding);
-  const [messageResult, memoryResult] = await Promise.all([
+  const keywords = retrievalKeywords(keywordText);
+  const keywordFilter = keywords
+    .map((keyword) => `content.ilike.%${keyword}%`)
+    .join(",");
+  const [messageResult, memoryResult, keywordMessageResult, keywordMemoryResult] = await Promise.all([
     userId
       ? beforeCreatedAt
         ? client.rpc("match_chat_messages_before_for_user", {
@@ -412,6 +450,42 @@ export async function findRelevantContext(
           query_embedding: queryEmbedding,
           result_limit: SEARCH_RESULT_LIMIT,
         }),
+    keywords.length > 0
+      ? (async () => {
+          let query = client
+            .from("chat_messages")
+            .select("id, role, content, created_at")
+            .eq("is_active", true)
+            .neq("id", excludeMessageId)
+            .or(keywordFilter)
+            .order("created_at", { ascending: false })
+            .limit(SEARCH_RESULT_LIMIT * 2);
+          if (beforeCreatedAt) query = query.lt("created_at", beforeCreatedAt);
+          if (userId) query = query.eq("user_id", userId);
+          const { data, error } = await query;
+          if (error) throw new Error(`Could not search active chat history by keyword: ${error.message}`);
+          return data;
+        })()
+      : Promise.resolve([]),
+    keywords.length > 0
+      ? (async () => {
+          let query = client
+            .from("user_memories")
+            .select("id, category, content")
+            .or(
+              [
+                ...keywords.map((keyword) => `content.ilike.%${keyword}%`),
+                ...keywords.map((keyword) => `category.ilike.%${keyword}%`),
+              ].join(","),
+            )
+            .order("updated_at", { ascending: false })
+            .limit(SEARCH_RESULT_LIMIT * 2);
+          if (userId) query = query.eq("user_id", userId);
+          const { data, error } = await query;
+          if (error) throw new Error(`Could not search saved memories by keyword: ${error.message}`);
+          return data;
+        })()
+      : Promise.resolve([]),
   ]);
 
   if (messageResult.error) {
@@ -424,9 +498,47 @@ export async function findRelevantContext(
       `Could not retrieve related memories: ${memoryResult.error.message} Confirm the latest supabase/schema.sql has been run.`,
     );
   }
+  if (keywordMessageResult instanceof Error) throw keywordMessageResult;
+  if (keywordMemoryResult instanceof Error) throw keywordMemoryResult;
+
+  const messageMatches = new Map<string, RetrievedChatMessage>();
+  for (const row of messageResult.data) {
+    if (row.similarity >= 0.35) messageMatches.set(row.id, row);
+  }
+  for (const row of keywordMessageResult) {
+    const matchedTerms = keywords.filter((keyword) =>
+      row.content.toLocaleLowerCase().includes(keyword),
+    ).length;
+    if (!matchedTerms) continue;
+    const keywordScore = 0.52 + (matchedTerms / keywords.length) * 0.43;
+    const existing = messageMatches.get(row.id);
+    if (!existing || existing.similarity < keywordScore) {
+      messageMatches.set(row.id, { ...row, similarity: keywordScore });
+    }
+  }
+
+  const memoryMatches = new Map<string, RetrievedMemory>();
+  for (const row of memoryResult.data) {
+    if (row.similarity >= 0.35) memoryMatches.set(row.id, row);
+  }
+  for (const row of keywordMemoryResult) {
+    const searchableText = `${row.category} ${row.content}`.toLocaleLowerCase();
+    const matchedTerms = keywords.filter((keyword) => searchableText.includes(keyword)).length;
+    if (!matchedTerms) continue;
+    const keywordScore = 0.52 + (matchedTerms / keywords.length) * 0.43;
+    const existing = memoryMatches.get(row.id);
+    if (!existing || existing.similarity < keywordScore) {
+      memoryMatches.set(row.id, { ...row, similarity: keywordScore });
+    }
+  }
+
   return {
-    messages: messageResult.data.filter((row) => row.similarity >= 0.35),
-    memories: memoryResult.data.filter((row) => row.similarity >= 0.35),
+    messages: [...messageMatches.values()]
+      .sort((first, second) => second.similarity - first.similarity)
+      .slice(0, SEARCH_RESULT_LIMIT * 2),
+    memories: [...memoryMatches.values()]
+      .sort((first, second) => second.similarity - first.similarity)
+      .slice(0, SEARCH_RESULT_LIMIT * 2),
   };
 }
 
@@ -483,6 +595,7 @@ export async function loadInsightsForMessages(
   messageIds: string[],
   userId?: string,
   limit = 12,
+  activeBranchOnly = false,
 ): Promise<
   Array<
     Pick<
@@ -498,8 +611,23 @@ export async function loadInsightsForMessages(
     >
   >
 > {
-  const uniqueMessageIds = [...new Set(messageIds)];
+  let uniqueMessageIds = [...new Set(messageIds)];
   if (uniqueMessageIds.length === 0) return [];
+
+  if (activeBranchOnly) {
+    let activeMessagesQuery = client
+      .from("chat_messages")
+      .select("id")
+      .in("id", uniqueMessageIds)
+      .eq("is_active", true);
+    if (userId) activeMessagesQuery = activeMessagesQuery.eq("user_id", userId);
+    const { data: activeMessages, error: activeMessagesError } = await activeMessagesQuery;
+    if (activeMessagesError) {
+      throw new Error(`Could not verify active-branch insight messages: ${activeMessagesError.message}`);
+    }
+    uniqueMessageIds = activeMessages.map((item) => item.id);
+    if (uniqueMessageIds.length === 0) return [];
+  }
 
   let query = client
     .from("message_insights")
@@ -558,11 +686,15 @@ export async function saveAssistantReport(
   versionNumber: number,
   details: string,
 ): Promise<void> {
+  const normalizedDetails = details.trim();
+  if (!normalizedDetails || normalizedDetails.length > 2000) {
+    throw new Error("Feedback details must contain between 1 and 2000 characters.");
+  }
   const { error } = await client.from("message_feedback").insert({
     message_id: messageId,
     version_number: versionNumber,
     kind: "report",
-    details,
+    details: normalizedDetails,
   });
   if (error) throw new Error(`Could not save the response report: ${error.message}`);
 }
@@ -575,6 +707,8 @@ export async function updateChatMessage(
   thinkingSummary: string | null,
   revisionReason: "user_edit" | "regenerate" | "ai_update",
   branch = true,
+  userId?: string,
+  sourceMessage?: { id: string; versionNumber: number },
 ): Promise<StoredChatMessage | null> {
   const { data, error } = await client.rpc("revise_chat_message", {
     p_message_id: messageId,
@@ -583,6 +717,9 @@ export async function updateChatMessage(
     p_thinking_summary: thinkingSummary,
     p_revision_reason: revisionReason,
     p_branch: branch,
+    p_user_id: userId ?? null,
+    p_source_message_id: sourceMessage?.id ?? null,
+    p_source_message_version_number: sourceMessage?.versionNumber ?? null,
   });
   if (error) {
     const action =
@@ -618,6 +755,7 @@ export async function saveChatBranch(
   anchorMessageId: string,
   anchorVersionNumber: number,
   userId?: string,
+  messageVersionOverrides: Record<string, number> = {},
 ): Promise<void> {
   let ownerId = userId;
   if (!ownerId) {
@@ -642,6 +780,13 @@ export async function saveChatBranch(
   if (activeAnchor.version_number !== anchorVersionNumber) {
     throw new Error("The branch anchor version is no longer active.");
   }
+  if (
+    Object.keys(messageVersionOverrides).some(
+      (messageId) => !activeMessages.some((message) => message.id === messageId),
+    )
+  ) {
+    throw new Error("A requested message version is not active on this branch.");
+  }
 
   const activeIds = activeMessages.map((message) => message.id);
   const { data: versions, error: versionsError } = await client
@@ -656,9 +801,10 @@ export async function saveChatBranch(
   for (const version of versions) {
     versionCounts.set(version.message_id, (versionCounts.get(version.message_id) ?? 0) + 1);
   }
+
   const branchMessages = activeMessages.map((message) => ({
     message_id: message.id,
-    version_number: message.version_number,
+    version_number: messageVersionOverrides[message.id] ?? message.version_number,
   }));
   const snapshots = activeMessages
     .filter((message) => message.id === anchorMessageId || (versionCounts.get(message.id) ?? 0) > 1)
@@ -668,10 +814,9 @@ export async function saveChatBranch(
       anchor_version_number: message.version_number,
       messages: branchMessages,
     }));
-
-  const { error } = await client.from("chat_conversation_branches").upsert(snapshots, {
-    onConflict: "user_id,anchor_message_id,anchor_version_number",
-  });
+  const { error } = await client
+    .from("chat_conversation_branches")
+    .upsert(snapshots, { onConflict: "user_id,anchor_message_id,anchor_version_number" });
   if (error) throw new Error(`Could not save this conversation branch: ${error.message}`);
 }
 
@@ -836,6 +981,20 @@ function searchPattern(query: string): string {
   return `%${query.replace(/[\\%_]/g, "\\$&")}%`;
 }
 
+function keywordSearchConditions(fields: string[], query: string): string {
+  const keywords = retrievalKeywords(query);
+  return keywords.length
+    ? fields.flatMap((field) =>
+        keywords.map((keyword) => `${field}.ilike.%${keyword}%`),
+      ).join(",")
+    : fields.map((field) => `${field}.ilike.${searchPattern(query)}`).join(",");
+}
+
+function keywordMatchCount(value: string, query: string): number {
+  const searchableText = value.toLocaleLowerCase();
+  return retrievalKeywords(query).filter((keyword) => searchableText.includes(keyword)).length;
+}
+
 async function searchUserData(
   client: AppSupabaseClient,
   args: Record<string, unknown>,
@@ -865,14 +1024,24 @@ async function searchUserData(
     let search = client
       .from("chat_messages")
       .select("id, role, content, created_at")
-      .ilike("content", pattern)
+      .eq("is_active", true)
+      .or(keywordSearchConditions(["content"], query))
       .order("created_at", { ascending: false })
-      .limit(SEARCH_RESULT_LIMIT);
+      .limit(SEARCH_RESULT_LIMIT * 2);
     if (userId) search = search.eq("user_id", userId);
     searches.push(
       search.then(({ data, error }) => {
           if (error) throw new Error(`Could not search chat history: ${error.message}`);
-          return { category: "chat", records: data };
+          return {
+            category: "chat",
+            records: data
+              .sort(
+                (first, second) =>
+                  keywordMatchCount(second.content, query) - keywordMatchCount(first.content, query) ||
+                  second.created_at.localeCompare(first.created_at),
+              )
+              .slice(0, SEARCH_RESULT_LIMIT),
+          };
         }),
     );
   }
@@ -880,45 +1049,73 @@ async function searchUserData(
     let search = client
       .from("user_memories")
       .select("id, category, content, updated_at")
-      .ilike("content", pattern)
+      .or(keywordSearchConditions(["content", "category"], query))
       .order("updated_at", { ascending: false })
-      .limit(SEARCH_RESULT_LIMIT);
+      .limit(SEARCH_RESULT_LIMIT * 2);
     if (userId) search = search.eq("user_id", userId);
     searches.push(
       search.then(({ data, error }) => {
           if (error) throw new Error(`Could not search memories: ${error.message}`);
-          return { category: "memories", records: data };
+          return {
+            category: "memories",
+            records: data
+              .sort(
+                (first, second) =>
+                  keywordMatchCount(`${second.category} ${second.content}`, query) -
+                    keywordMatchCount(`${first.category} ${first.content}`, query) ||
+                  second.updated_at.localeCompare(first.updated_at),
+              )
+              .slice(0, SEARCH_RESULT_LIMIT),
+          };
         }),
     );
   }
   if (category === "all" || category === "insights") {
     searches.push((async () => {
-      const fields = ["summary", "mood", "communication_style", "situation", "support_needs"] as const;
-      const results = await Promise.all(
-        fields.map((field) =>
-          (async () => {
-            let search = client
-            .from("message_insights")
-            .select("id, message_id, mood, communication_style, situation, topics, support_needs, summary, created_at")
-            .ilike(field, pattern)
-            .order("created_at", { ascending: false })
-            .limit(SEARCH_RESULT_LIMIT);
-            if (userId) search = search.eq("user_id", userId);
-            return search;
-          })(),
-        ),
-      );
-      const failedResult = results.find((result) => result.error);
-      if (failedResult?.error) {
-        throw new Error(`Could not search insights: ${failedResult.error.message}`);
+      let search = client
+        .from("message_insights")
+        .select("id, message_id, mood, communication_style, situation, topics, support_needs, summary, created_at")
+        .or(
+          keywordSearchConditions(
+            ["summary", "mood", "communication_style", "situation", "support_needs"],
+            query,
+          ),
+        )
+        .order("created_at", { ascending: false })
+        .limit(SEARCH_RESULT_LIMIT * 4);
+      if (userId) search = search.eq("user_id", userId);
+      const { data: candidateInsights, error } = await search;
+      if (error) throw new Error(`Could not search insights: ${error.message}`);
+      if (candidateInsights.length === 0) {
+        return { category: "insights", records: [] };
       }
-      const uniqueInsights = new Map(
-        results.flatMap((result) => result.data ?? []).map((insight) => [insight.id, insight]),
-      );
+      let activeMessagesQuery = client
+        .from("chat_messages")
+        .select("id")
+        .in("id", [...new Set(candidateInsights.map((insight) => insight.message_id))])
+        .eq("is_active", true);
+      if (userId) activeMessagesQuery = activeMessagesQuery.eq("user_id", userId);
+      const { data: activeMessages, error: activeMessagesError } = await activeMessagesQuery;
+      if (activeMessagesError) {
+        throw new Error(`Could not verify active-branch insights: ${activeMessagesError.message}`);
+      }
+      const activeMessageIds = new Set(activeMessages.map((message) => message.id));
       return {
         category: "insights",
-        records: [...uniqueInsights.values()]
-          .sort((first, second) => second.created_at.localeCompare(first.created_at))
+        records: candidateInsights
+          .filter((insight) => activeMessageIds.has(insight.message_id))
+          .sort(
+            (first, second) =>
+              keywordMatchCount(
+                `${second.summary} ${second.mood} ${second.communication_style} ${second.situation} ${second.support_needs}`,
+                query,
+              ) -
+                keywordMatchCount(
+                  `${first.summary} ${first.mood} ${first.communication_style} ${first.situation} ${first.support_needs}`,
+                  query,
+                ) ||
+              second.created_at.localeCompare(first.created_at),
+          )
           .slice(0, SEARCH_RESULT_LIMIT),
       };
     })());
@@ -1168,18 +1365,24 @@ export async function executeChatDataTool(
   if (name === "update_chat_message") {
     const id = requiredId(args.id, "message ID");
     const content = requiredString(args.content, "message content", 50000);
-    const embedding = serializeEmbedding(await createEmbedding(apiKey, content, "RETRIEVAL_DOCUMENT"));
-    let update = client
-      .from("chat_messages")
-      .update({ content, embedding, revision_reason: "ai_update" })
-      .eq("id", id);
-    if (userId) update = update.eq("user_id", userId);
-    const { data, error } = await update
-      .select("id, role, content, created_at")
-      .maybeSingle();
-    if (error) throw new Error(`Could not update chat message: ${error.message}`);
-    if (!data) throw new Error("Chat message not found in this user's database.");
-    return data;
+    const embedding = await createEmbedding(apiKey, content, "RETRIEVAL_DOCUMENT");
+    const updated = await updateChatMessage(
+      client,
+      id,
+      content,
+      embedding,
+      null,
+      "ai_update",
+      false,
+      userId,
+    );
+    if (!updated) throw new Error("Chat message not found in this user's database.");
+    return {
+      id: updated.id,
+      role: updated.role,
+      content: updated.content,
+      created_at: updated.created_at,
+    };
   }
 
   if (name === "delete_chat_message") {
@@ -1206,13 +1409,22 @@ export async function executeChatDataTool(
     const id = requiredId(args.id, "insight ID");
     const updates: Partial<InsightDraft> = {};
     for (const field of ["mood", "communication_style", "situation", "support_needs", "summary"] as const) {
-      if (field in args) updates[field] = requiredString(args[field], field, 2000);
+      if (field in args) {
+        if (typeof args[field] !== "string" || args[field].length > 2000) {
+          throw new Error(`${field} must be text containing at most 2,000 characters.`);
+        }
+        updates[field] = args[field].trim();
+      }
     }
     if ("topics" in args) {
-      if (!Array.isArray(args.topics) || args.topics.some((topic) => typeof topic !== "string")) {
+      if (
+        !Array.isArray(args.topics) ||
+        args.topics.length > 20 ||
+        args.topics.some((topic) => typeof topic !== "string" || topic.length > 100)
+      ) {
         throw new Error("Insight topics must be a list of text values.");
       }
-      updates.topics = args.topics.slice(0, 20).map((topic) => topic.trim().slice(0, 100));
+      updates.topics = args.topics.map((topic) => topic.trim()).filter(Boolean);
     }
     if (Object.keys(updates).length === 0) throw new Error("Provide at least one insight field to update.");
     let update = client
