@@ -21,6 +21,56 @@ type CachedSpeech = {
 const inMemorySpeechCache = new Map<string, CachedSpeech>();
 const MAX_IN_MEMORY_SPEECH_CACHE_ENTRIES = 8;
 
+export function clearGeminiSpeechCache(messageIds?: readonly string[]): void {
+  const ids = messageIds ? new Set(messageIds) : null;
+  for (const key of inMemorySpeechCache.keys()) {
+    const [messageId, , source] = key.split(":");
+    if (source === "gemini" && (!ids || ids.has(messageId))) {
+      inMemorySpeechCache.delete(key);
+    }
+  }
+}
+
+export async function deleteChatWithGeminiSpeech(
+  accessToken: string,
+  scope: { scope: "all" } | { scope: "branch"; messageId: string },
+): Promise<{ messageIds: string[]; deletedMessageCount: number }> {
+  const response = await fetch("/api/chat-tts-audio-cache-delete", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(scope),
+  });
+  const payload: unknown = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message =
+      typeof payload === "object" &&
+      payload !== null &&
+      "statusMessage" in payload &&
+      typeof payload.statusMessage === "string"
+        ? payload.statusMessage
+        : `Could not delete generated Gemini speech (${response.status}).`;
+    throw new Error(message);
+  }
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    !("messageIds" in payload) ||
+    !Array.isArray(payload.messageIds) ||
+    !payload.messageIds.every((id) => typeof id === "string") ||
+    !("deletedMessageCount" in payload) ||
+    typeof payload.deletedMessageCount !== "number"
+  ) {
+    throw new Error("The generated speech cleanup returned an invalid response.");
+  }
+  return {
+    messageIds: payload.messageIds,
+    deletedMessageCount: payload.deletedMessageCount,
+  };
+}
+
 function readableErrorText(value: string, fallback: string): string {
   const trimmed = value.trim();
   if (!trimmed.startsWith("<")) {

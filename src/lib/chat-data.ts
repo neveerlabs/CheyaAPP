@@ -11,9 +11,21 @@ const EMBEDDING_MODEL = "gemini-embedding-001";
 const EMBEDDING_DIMENSIONS = 768;
 const SEARCH_RESULT_LIMIT = 8;
 const MAX_KEYWORD_TERMS = 8;
+const SCHEMA_ERROR_CODES = new Set(["PGRST202", "PGRST204", "PGRST205", "42703", "42883", "42P01"]);
 type EmbeddingTaskType = "RETRIEVAL_DOCUMENT" | "RETRIEVAL_QUERY";
 
 type InsightDraft = Omit<MessageInsight, "id" | "user_id" | "message_id" | "created_at">;
+
+function describeDatabaseError(error: { code?: string; message: string }): string {
+  const schemaError =
+    (error.code && SCHEMA_ERROR_CODES.has(error.code)) ||
+    /schema cache|could not find the function|relation .+ does not exist|column .+ does not exist/i.test(
+      error.message,
+    );
+  return schemaError
+    ? `${error.message} Confirm the latest supabase/schema.sql has been run.`
+    : error.message;
+}
 
 const retrievalStopWords = new Set([
   "ada", "aja", "atau", "belum", "bisa", "buat", "dalam", "dan", "dari", "dengan", "dia",
@@ -490,12 +502,12 @@ export async function findRelevantContext(
 
   if (messageResult.error) {
     throw new Error(
-      `Could not retrieve related chat history: ${messageResult.error.message} Confirm the latest supabase/schema.sql has been run.`,
+      `Could not retrieve related chat history: ${describeDatabaseError(messageResult.error)}`,
     );
   }
   if (memoryResult.error) {
     throw new Error(
-      `Could not retrieve related memories: ${memoryResult.error.message} Confirm the latest supabase/schema.sql has been run.`,
+      `Could not retrieve related memories: ${describeDatabaseError(memoryResult.error)}`,
     );
   }
   if (keywordMessageResult instanceof Error) throw keywordMessageResult;

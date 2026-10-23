@@ -27,6 +27,7 @@ import {
 import { useEffect, useRef, useState, type CSSProperties, type FormEvent } from "react";
 import { LegalPageContent } from "./LegalPage";
 import { ChangelogsPage } from "./ChangelogsPage";
+import { BugReportDialog } from "./components/BugReportDialog";
 import { ActionToast } from "./components/ActionToast";
 import {
   clearAccountSessionId,
@@ -66,6 +67,7 @@ import {
 } from "./lib/supabase";
 import { subscribeWithReconnect } from "./lib/realtime";
 import { executeAccountAiActionFromClient } from "./lib/account-ai-actions";
+import { clearGeminiSpeechCache, deleteChatWithGeminiSpeech } from "./lib/tts-playback";
 
 interface SettingsPageProps {
   pathname: string;
@@ -344,6 +346,7 @@ export function SettingsPage({
   onGeneralSettingsChange,
 }: SettingsPageProps) {
   const [activeSection, setActiveSection] = useState(() => sectionFromPath(pathname));
+  const [isBugReportOpen, setIsBugReportOpen] = useState(false);
   const [isDatabaseReady, setIsDatabaseReady] = useState(false);
   const [databaseSessionError, setDatabaseSessionError] = useState("");
   const [apiKeys, setApiKeys] = useState<GeminiApiKey[]>([]);
@@ -1595,12 +1598,19 @@ export function SettingsPage({
     clearMessages();
     setIsClearingChats(true);
     try {
-      const { data: deletedCount, error } = await client.rpc("clear_chat_history");
-      if (error) {
-        throw new Error(
-          `Could not clear chats. Apply the latest supabase/schema.sql and try again. ${error.message}`,
-        );
+      const {
+        data: { session },
+        error: sessionError,
+      } = await client.auth.getSession();
+      if (sessionError) throw sessionError;
+      if (!session?.access_token) {
+        throw new Error("Your account session has expired. Sign in again.");
       }
+      const { deletedMessageCount: deletedCount } = await deleteChatWithGeminiSpeech(
+        session.access_token,
+        { scope: "all" },
+      );
+      clearGeminiSpeechCache();
       setMemories((current) =>
         current.map((memory) => ({ ...memory, source_message_id: null })),
       );
@@ -1948,6 +1958,7 @@ export function SettingsPage({
               type="button"
               aria-label="Report a problem"
               title="Report a problem"
+              onClick={() => setIsBugReportOpen(true)}
               className="flex size-9 items-center justify-center rounded-full text-[#34363b] transition hover:bg-[#f7f8fa]"
             >
               <Bug aria-hidden="true" className="size-[21px]" strokeWidth={1.8} />
@@ -3599,6 +3610,17 @@ export function SettingsPage({
           }}
         />
       )}
+      <BugReportDialog
+        open={isBugReportOpen}
+        onClose={() => setIsBugReportOpen(false)}
+        onDiscard={() => setIsBugReportOpen(false)}
+        client={client}
+        accountUserId={accountUserId}
+        accountEmail={accountEmail}
+        accountProvider={accountProvider}
+        githubUsername={githubUsername}
+        accountRole={accountRole}
+      />
     </main>
   );
 }

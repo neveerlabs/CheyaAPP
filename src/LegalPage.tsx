@@ -1,13 +1,32 @@
-import { useEffect } from "react";
+import { Bug } from "lucide-react";
+import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
+import { BugReportDialog } from "./components/BugReportDialog";
+import type { AccountRole, AppSupabaseClient } from "./lib/supabase";
 
-type LegalPageKind = "privacy" | "terms";
+export type LegalPageKind = "privacy" | "terms";
 
 const contactEmail = "neverlabs4@gmail.com";
 
-export function LegalPage({ kind }: { kind: LegalPageKind }) {
+type LegalPageReporter = {
+  client: AppSupabaseClient;
+  accountUserId: string;
+  accountEmail: string | null;
+  accountProvider: "google" | "github";
+  githubUsername: string | null;
+  accountRole: AccountRole;
+};
+
+export function LegalPage({
+  kind,
+  reporter,
+}: {
+  kind: LegalPageKind;
+  reporter?: LegalPageReporter;
+}) {
   const isPrivacy = kind === "privacy";
   const title = isPrivacy ? "Privacy Policy" : "Terms of Service";
+  const [isBugReportOpen, setIsBugReportOpen] = useState(false);
 
   useEffect(() => {
     document.title = `${title} | CheyaAPP`;
@@ -18,11 +37,11 @@ export function LegalPage({ kind }: { kind: LegalPageKind }) {
       <article className="mx-auto max-w-5xl">
         <LegalPageContent kind={kind} />
 
-        <footer className="mt-2 flex flex-col gap-3 border-t border-[#e7e8eb] px-1 py-6 text-sm sm:flex-row sm:items-center sm:justify-between">
+        <footer className="mt-2 flex flex-col items-center gap-3 border-t border-[#e7e8eb] px-1 py-6 text-center text-sm">
           <a href="/" className="font-medium text-[#356d91] hover:underline">
             Back to home
           </a>
-          <nav aria-label="Legal information" className="flex flex-wrap items-center gap-x-4 gap-y-2">
+          <nav aria-label="Legal information" className="flex flex-wrap items-center justify-center gap-x-4 gap-y-2">
             <a href="/privacy" className="text-[#5f626a] hover:text-[#25262a] hover:underline">
               Privacy
             </a>
@@ -32,9 +51,28 @@ export function LegalPage({ kind }: { kind: LegalPageKind }) {
             <a href={`mailto:${contactEmail}`} className="text-[#5f626a] hover:text-[#25262a]">
               {contactEmail}
             </a>
+            {reporter && (
+              <button
+                type="button"
+                aria-label="Report a problem"
+                onClick={() => setIsBugReportOpen(true)}
+                className="inline-flex items-center gap-1.5 text-[#5f626a] hover:text-[#25262a]"
+              >
+                <Bug aria-hidden="true" className="size-4" />
+                Report a problem
+              </button>
+            )}
           </nav>
         </footer>
       </article>
+      {reporter && (
+        <BugReportDialog
+          open={isBugReportOpen}
+          onClose={() => setIsBugReportOpen(false)}
+          onDiscard={() => setIsBugReportOpen(false)}
+          {...reporter}
+        />
+      )}
     </main>
   );
 }
@@ -109,6 +147,18 @@ function PrivacyPolicy() {
           there until removed or browser site data is cleared, including after account deletion.
         </p>
         <p>
+          Bug reports, including their descriptions and any attached photos or videos, are sent by
+          email to our support mailbox and are not stored in the CheyaAPP database or file storage.
+          The report includes your account ID, sign-in provider, and role; your verified email may
+          be used as the reply address. Unsent report drafts are kept locally in your browser until
+          email delivery succeeds and the draft is cleared. The email provider and recipient mailbox
+          retain delivered reports according to their own policies.
+        </p>
+        <p>
+          New accounts may receive one transactional welcome email at their verified sign-in email
+          address. Existing accounts do not receive this message.
+        </p>
+        <p>
           If you enable push notifications, the service stores the browser push subscription for
           that account and device. Chat-related reminders and service notifications may also be
           stored in your account inbox.
@@ -159,9 +209,9 @@ function PrivacyPolicy() {
           Attachments are stored privately and are no longer available after their retention period,
           at most 24 hours after upload. The cleanup process removes expired files and their
           attachment metadata; technical delays may affect when cleanup completes. The web upload
-          limit is 25 MB per source file; each file sent to the AI must fit the 18 MB per-file limit
-          after processing, and a message may contain up to 10 files with a combined limit of 50 MB.
-          Files that cannot be processed within those limits are not sent.
+          limit is 18 MB per file, including the source file; a message may contain up to 10 files
+          with a combined limit of 50 MB. Files that cannot be processed within those limits are not
+          sent.
         </p>
         <p>
           Messages, versions, branches, insights, memories, settings, and feedback are not covered
@@ -256,11 +306,11 @@ function TermsOfService() {
           reliability.
         </p>
         <p>
-          The upload limit is 25 MB per source file, 18 MB per file sent to the AI after processing,
-          and 50 MB total across up to 10 files in one message. Some files between 18 MB and 25 MB
-          may be rejected if they cannot be processed within the AI limit while preserving usable
-          quality. Attachments are stored privately for at most 24 hours and scheduled for deletion;
-          related messages and conversation data remain until deleted separately.
+          The upload limit is 18 MB per file, including before processing, and 50 MB total across
+          up to 10 files in one message. Files that cannot be processed within the 18 MB per-file
+          limit while preserving usable quality are rejected. Attachments are stored privately for
+          at most 24 hours and scheduled for deletion; related messages and conversation data remain
+          until deleted separately.
         </p>
         <p>
           You are responsible for ensuring that you have permission to upload and process files

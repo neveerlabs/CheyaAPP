@@ -19,6 +19,7 @@
     "lucide-react": "^0.468.0",
     "mediabunny": "^1.61.6",
     "nitro": "^3.0.260903-beta",
+    "nodemailer": "^10.2.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-markdown": "^10.1.0",
@@ -30,6 +31,7 @@
   "devDependencies": {
     "@tailwindcss/vite": "^4.0.0",
     "@types/mdast": "^4.0.4",
+    "@types/nodemailer": "^8.0.2",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@types/web-push": "^3.6.4",

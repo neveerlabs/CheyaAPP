@@ -1,10 +1,11 @@
 export const CHAT_ATTACHMENT_BUCKET = "chat-attachments";
 export const MAX_CHAT_ATTACHMENT_BYTES = 18 * 1024 * 1024;
-export const MAX_CHAT_ATTACHMENT_SOURCE_BYTES = 25 * 1024 * 1024;
+export const MAX_CHAT_ATTACHMENT_SOURCE_BYTES = MAX_CHAT_ATTACHMENT_BYTES;
 export const MAX_CHAT_ATTACHMENT_COUNT = 10;
 export const MAX_CHAT_MESSAGE_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 export const CHAT_ATTACHMENT_RETENTION_MS = 24 * 60 * 60 * 1000;
 export const MAX_GEMINI_CONTEXT_ATTACHMENTS = 10;
+export const VOICE_NOTE_TRANSCRIPT_MARKER = "Voice note transcript:\n";
 
 const MIME_BY_EXTENSION: Record<string, string> = {
   c: "text/plain",
@@ -63,7 +64,7 @@ const MIME_BY_EXTENSION: Record<string, string> = {
   webp: "image/webp",
 };
 
-export const CHAT_ATTACHMENT_MIME_TYPES = Object.values(MIME_BY_EXTENSION);
+export const CHAT_ATTACHMENT_MIME_TYPES = [...Object.values(MIME_BY_EXTENSION), "audio/webm"];
 
 export function resolveChatAttachmentMimeType(file: Pick<File, "name" | "type">): string | null {
   const extension = file.name.split(".").pop()?.toLowerCase() ?? "";
@@ -95,6 +96,42 @@ export type ChatAttachmentRegistration = {
   uploadRequired: boolean;
   reused: boolean;
   attachment?: ChatAttachment;
+  storagePath?: string;
+}
+
+export async function getChatAttachmentIdentityHash(
+  file: File,
+  mimeType: string,
+): Promise<string> {
+  let bytes: ArrayBuffer;
+  if (mimeType.startsWith("image/")) {
+    let bitmap: ImageBitmap;
+    try {
+      bitmap = await createImageBitmap(file);
+    } catch {
+      throw new Error(`Could not read photo "${file.name}" to identify duplicates.`);
+    }
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      const context = canvas.getContext("2d", { willReadFrequently: true });
+      if (!context) throw new Error("This browser could not identify duplicate photos.");
+      context.drawImage(bitmap, 0, 0);
+      const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+      const canonicalPixels = new Uint8Array(8 + pixels.length);
+      new DataView(canonicalPixels.buffer).setUint32(0, canvas.width);
+      new DataView(canonicalPixels.buffer).setUint32(4, canvas.height);
+      canonicalPixels.set(pixels, 8);
+      bytes = canonicalPixels.buffer;
+    } finally {
+      bitmap.close();
+    }
+  } else {
+    bytes = await file.arrayBuffer();
+  }
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 export type ChatAttachmentDraft = {
@@ -103,6 +140,8 @@ export type ChatAttachmentDraft = {
   file: File;
   mimeType: string;
   savedAt: number;
+  identitySha256?: string;
+  processingStage?: "ai" | "upload";
 }
 
 const CHAT_ATTACHMENT_DRAFT_DB = "cheyaverse-chat-attachment-drafts";
@@ -133,6 +172,7 @@ export async function saveChatAttachmentDraft(
   file: File,
   mimeType: string,
   savedAt = Date.now(),
+  processing: Pick<ChatAttachmentDraft, "identitySha256" | "processingStage"> = {},
 ): Promise<void> {
   const database = await openChatAttachmentDraftDatabase();
   try {
@@ -145,6 +185,7 @@ export async function saveChatAttachmentDraft(
         file,
         mimeType,
         savedAt,
+        ...processing,
       });
       transaction.oncomplete = () => resolve();
       transaction.onerror = () =>
@@ -172,6 +213,8 @@ export async function loadChatAttachmentDrafts(userId: string): Promise<ChatAtta
           file: File;
           mimeType: string;
           savedAt: number;
+          identitySha256?: string;
+          processingStage?: "ai" | "upload";
         }>;
         resolve(
           records
@@ -181,12 +224,14 @@ export async function loadChatAttachmentDrafts(userId: string): Promise<ChatAtta
                 record.file instanceof File &&
                 typeof record.mimeType === "string",
             )
-            .map(({ id, userId: recordUserId, file, mimeType, savedAt }) => ({
+            .map(({ id, userId: recordUserId, file, mimeType, savedAt, identitySha256, processingStage }) => ({
               id,
               userId: recordUserId,
               file,
               mimeType,
               savedAt,
+              identitySha256,
+              processingStage,
             }))
             .sort((first, second) => first.savedAt - second.savedAt),
         );

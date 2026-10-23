@@ -16,10 +16,15 @@ import {
   generateThinkingSummary,
   GeminiFailoverError,
   prepareGeminiAttachments,
+  transcribeGeminiVoiceNote,
   type GeminiAttachmentReference,
   type GeminiAttempt,
 } from "../src/lib/gemini";
-import { CHAT_ATTACHMENT_BUCKET, MAX_GEMINI_CONTEXT_ATTACHMENTS } from "../src/lib/chat-attachments";
+import {
+  CHAT_ATTACHMENT_BUCKET,
+  MAX_GEMINI_CONTEXT_ATTACHMENTS,
+  VOICE_NOTE_TRANSCRIPT_MARKER,
+} from "../src/lib/chat-attachments";
 import type { AiBarcodeReading } from "../src/lib/chat-barcode";
 import { searchWebWithFallback } from "../src/lib/server-web-search";
 import { ACCOUNT_AI_ACTION_NAMES } from "../src/lib/account-ai-actions";
@@ -166,10 +171,77 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
   const warnings: string[] = [];
   const sharedAttachmentIds = new Set<string>();
   let adminMessageId: string | null = null;
+  let userMessageContent = userMessage.content;
+  let userMessageVersionNumber = userMessage.version_number;
+
+  const { data: currentAudioRows, error: currentAudioError } = await client
+    .from("chat_message_attachments")
+    .select("id, file_name, mime_type, storage_path, created_at")
+    .eq("message_id", userMessage.id)
+    .eq("user_id", job.user_id)
+    .is("deleted_at", null)
+    .gt("expires_at", new Date().toISOString());
+  if (currentAudioError) {
+    throw new Error(`Could not load the voice note for transcription: ${currentAudioError.message}`);
+  }
+  const voiceNotes = currentAudioRows
+    .filter((attachment) => attachment.mime_type.startsWith("audio/"))
+    .map<GeminiAttachmentReference>((attachment) => ({
+      id: attachment.id,
+      fileName: attachment.file_name,
+      mimeType: attachment.mime_type,
+      storagePath: attachment.storage_path,
+      messageCreatedAt: userMessage.created_at,
+    }));
+  if (voiceNotes.length > 0) {
+    await updateJob(jobId, job.user_id, {
+      progress: "Listening to your voice message…",
+    });
+    const transcription = await transcribeGeminiVoiceNote(
+      typedKeys,
+      voiceNotes,
+      async (attachment) => {
+        const { data, error } = await client.storage
+          .from(CHAT_ATTACHMENT_BUCKET)
+          .download(attachment.storagePath);
+        if (error) {
+          throw new Error(`Could not read the voice note from private storage: ${error.message}`);
+        }
+        return data;
+      },
+    );
+    attempts.push(...transcription.attempts);
+    const transcript = transcription.text.trim();
+    const transcriptMarker = `\n\n${VOICE_NOTE_TRANSCRIPT_MARKER}`;
+    const existingTranscriptIndex = userMessageContent.lastIndexOf(transcriptMarker);
+    userMessageContent =
+      userMessageContent === "Please listen to the attached voice note and respond to its content." ||
+      userMessageContent === "Please review the attached files."
+        ? `${VOICE_NOTE_TRANSCRIPT_MARKER}${transcript}`
+        : userMessageContent.startsWith(VOICE_NOTE_TRANSCRIPT_MARKER)
+          ? `${VOICE_NOTE_TRANSCRIPT_MARKER}${transcript}`
+        : existingTranscriptIndex >= 0
+          ? `${userMessageContent.slice(0, existingTranscriptIndex)}${transcriptMarker}${transcript}`
+          : `${userMessageContent}${transcriptMarker}${transcript}`;
+    if (userMessageContent.length > 50000) {
+      throw new Error("The voice note transcript is too long to store as a chat message.");
+    }
+    const { data: transcriptVersionNumber, error: messageUpdateError } = await client.rpc(
+      "save_chat_voice_note_transcript",
+      { p_message_id: userMessage.id, p_content: userMessageContent },
+    );
+    if (messageUpdateError) {
+      throw new Error(`Could not save the voice note transcript to the message: ${messageUpdateError.message}`);
+    }
+    if (typeof transcriptVersionNumber !== "number") {
+      throw new Error("The database did not return the voice note message version.");
+    }
+    userMessageVersionNumber = transcriptVersionNumber;
+  }
 
   const [documentEmbeddingResult, queryEmbeddingResult] = await Promise.allSettled([
-    createEmbedding(typedKeys[0].api_key, userMessage.content, "RETRIEVAL_DOCUMENT"),
-    createEmbedding(typedKeys[0].api_key, userMessage.content, "RETRIEVAL_QUERY"),
+    createEmbedding(typedKeys[0].api_key, userMessageContent, "RETRIEVAL_DOCUMENT"),
+    createEmbedding(typedKeys[0].api_key, userMessageContent, "RETRIEVAL_QUERY"),
   ]);
   const messageEmbedding: number[] | null =
     documentEmbeddingResult.status === "fulfilled" ? documentEmbeddingResult.value : null;
@@ -191,7 +263,7 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
         .update({ embedding: serialized })
         .eq("message_id", userMessage.id)
         .eq("user_id", job.user_id)
-        .eq("version_number", userMessage.version_number);
+        .eq("version_number", userMessageVersionNumber);
       if (versionUpdateError) throw versionUpdateError;
     } catch (error) {
       warnings.push(
@@ -229,23 +301,10 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
     (insights) => ({ insights, error: null }),
     (error: unknown) => ({ insights: [], error }),
   );
-  const insightAnalysisPromise = userMessage.content === "Please review the attached files."
-    ? Promise.resolve({ ok: true as const, result: null })
-    : priorInsightsPromise
-        .then(({ insights }) =>
-          analyzeGeminiMessage(
-            typedKeys,
-            userMessage.content,
-            0,
-            history.map(({ role, content, created_at }) => ({ role, content, created_at })),
-            userMessage.created_at,
-            insights,
-          ),
-        )
-        .then(
-          (result) => ({ ok: true as const, result }),
-          (error: unknown) => ({ ok: false as const, error }),
-        );
+  let insightAnalysisPromise: Promise<
+    | { ok: true; result: Awaited<ReturnType<typeof analyzeGeminiMessage>> | null }
+    | { ok: false; error: unknown }
+  > = Promise.resolve({ ok: true, result: null });
   const saveInsightAnalysis = async () => {
     const priorInsights = await priorInsightsPromise;
     if (priorInsights.error) {
@@ -283,7 +342,7 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
             userMessage.id,
             undefined,
             job.user_id,
-            userMessage.content,
+            userMessageContent,
           ),
         ]).then(([result]) => result)
       : {
@@ -343,7 +402,7 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
     (attachment) =>
       attachment.message_id !== null &&
       attachment.message_id !== userMessage.id &&
-      /^(image|video)\//i.test(attachment.mime_type),
+      /^(image|video|audio)\//i.test(attachment.mime_type),
   )
     .sort(
       (first, second) =>
@@ -372,6 +431,38 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
               ? relevantMessageTime.get(attachment.message_id)
               : undefined) ?? attachment.created_at,
     }));
+  const currentAudioAttachments = attachmentsForModel.filter((attachment) =>
+    attachment.mimeType.startsWith("audio/"),
+  );
+  if (userMessageContent !== "Please review the attached files." || currentAudioAttachments.length > 0) {
+    insightAnalysisPromise = priorInsightsPromise
+      .then(({ insights }) =>
+        analyzeGeminiMessage(
+              typedKeys,
+              userMessageContent,
+              0,
+              history.map(({ role, content, created_at }) => ({ role, content, created_at })),
+              userMessage.created_at,
+              insights,
+              currentAudioAttachments,
+              async (attachment) => {
+                const { data, error } = await client.storage
+                  .from(CHAT_ATTACHMENT_BUCKET)
+                  .download(attachment.storagePath);
+                if (error) {
+                  throw new Error(
+                    `Could not read "${attachment.fileName}" for conversation analysis: ${error.message}`,
+                  );
+                }
+                return data;
+              },
+        ),
+      )
+      .then(
+        (result) => ({ ok: true as const, result }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+  }
   const candidateMessageIds = [
     ...retrievedMessages.map((item) => item.id),
     ...history.map((item) => item.id),
@@ -442,7 +533,7 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
   });
   const result = await generateGeminiConversation(
     typedKeys,
-    userMessage.content,
+    userMessageContent,
     0,
     personalization,
     {
@@ -479,7 +570,13 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
       },
       executeTool: async (name, input, key) => {
         if (ACCOUNT_AI_ACTION_NAMES.has(name)) {
-          const toolResult = await executeAccountAiTool(job.user_id, name, input, userMessage.id);
+          const toolResult = await executeAccountAiTool(
+            job.user_id,
+            name,
+            input,
+            userMessage.id,
+            { rawProductHelpForServerModel: true },
+          );
           if (
             name === "send_message_to_admin" &&
             typeof toolResult === "object" &&
@@ -514,7 +611,7 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
           key.api_key,
           name,
           input,
-          async (label) => hasExplicitDeleteIntent(userMessage.content, label),
+          async (label) => hasExplicitDeleteIntent(userMessageContent, label),
           job.user_id,
           userMessage.id,
         );
@@ -538,7 +635,7 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
       }
     }
     try {
-      await saveChatBranch(client, userMessage.id, userMessage.version_number, job.user_id);
+      await saveChatBranch(client, userMessage.id, userMessageVersionNumber, job.user_id);
     } catch (error) {
       warnings.push(
         `The message was saved, but conversation history could not be snapshotted: ${
@@ -569,7 +666,7 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
     try {
       const summary = await generateThinkingSummary(
         typedKeys,
-        userMessage.content,
+        userMessageContent,
         result.text,
         {
           currentMessageAt: userMessage.created_at,
@@ -616,10 +713,7 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
   await updateJob(jobId, job.user_id, { progress: "Saving Cheya's response…" });
   const { data: savedResponses, error: completeError } = await client.rpc("complete_chat_job", {
     p_job_id: jobId,
-    p_content:
-      warnings.length > 0
-        ? `${result.text}\n\n> Note: ${warnings.join(" ")}`
-        : result.text,
+    p_content: result.text,
     p_embedding: assistantEmbedding ? `[${assistantEmbedding.join(",")}]` : null,
     p_thinking_summary: thinkingSummary,
     p_admin_message_id: adminMessageId,
@@ -687,7 +781,6 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
     const { error: warningError } = await client
       .from("chat_message_jobs")
       .update({
-        progress: warnings.join("\n").slice(0, 2000),
         error: warnings.join("\n").slice(0, 2000),
         updated_at: new Date().toISOString(),
       })

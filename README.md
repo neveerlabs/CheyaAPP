@@ -122,6 +122,20 @@ Do not delete the Supabase user, since its existing chat and account data are at
    `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, and `VAPID_SUBJECT` configure server-sent Web Push.
    Keep the private key server-only and use the same key pair in local, preview, and production
    environments that must deliver reminders. The app returns only the public key to the browser.
+   Bug reports are sent directly to `neverlabs4@gmail.com` over SMTP and are not written to the
+   application database or storage. Configure `SMTP_HOST`, `SMTP_PORT` (`587` for STARTTLS or `465`
+   for implicit TLS), `SMTP_USER`, `SMTP_PASSWORD`, and `SMTP_FROM` as server-only environment
+   variables. `SMTP_FROM` must be an address or sender identity allowed by the SMTP account. The
+   app's Vercel domain can stay `https://cheya-app.vercel.app`; the SMTP sender address/domain is
+   separately controlled by the mail provider and does not have to use the Vercel domain. The
+   authenticated user's account provider, role, and account identifier are included in the email;
+   their verified account email is used as Reply-To when available. A new account also receives
+   one transactional welcome email at its verified sign-in email; existing accounts do not receive
+   one. `WELCOME_EMAIL_SUBJECT` controls its subject and `WELCOME_EMAIL_FROM_NAME` controls the
+   sender label shown in the recipient's inbox (both default to `Welcome to CheyaAPP`). The welcome
+   email uses the authenticated SMTP account address as its sender, independently of the bug
+   report's `SMTP_FROM`. Rerun `supabase/schema.sql` to add the one-time delivery marker before
+   enabling this feature.
 
 ### Local development
 
@@ -138,7 +152,9 @@ npm run dev
 Restart Vite after changing environment variables. Keep `.env.local` private and never commit it.
 If you do not use the Vercel CLI, create `.env.local` with the four `VITE_*` values, the server-side
 `SUPABASE_*` values, `CRON_SECRET`, `APP_ACCESS_CODE`, `TURNSTILE_SECRET_KEY`, the three VAPID
-values, and any optional provider keys above. Keep this file private;
+values, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`,
+`WELCOME_EMAIL_SUBJECT`, `WELCOME_EMAIL_FROM_NAME`, and any optional provider keys above. Keep
+this file private;
 `.env.local` is ignored by Git.
 
 ### User setup and data

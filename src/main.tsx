@@ -2,15 +2,14 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { App } from "./App";
 import { AppErrorBoundary, ErrorPage } from "./ErrorPage";
-import { LegalPage } from "./LegalPage";
 import "./styles.css";
 
 function Root() {
   const pathname = window.location.pathname;
-  if (pathname === "/privacy") return <LegalPage kind="privacy" />;
-  if (pathname === "/terms") return <LegalPage kind="terms" />;
   if (
     pathname !== "/" &&
+    pathname !== "/privacy" &&
+    pathname !== "/terms" &&
     !/^\/settings(?:\/(?:general|personal|configure|memory|messages|changelogs|account|privacy|terms))?\/?$/.test(pathname)
   ) {
     return (

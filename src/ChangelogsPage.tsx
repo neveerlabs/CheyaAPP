@@ -563,38 +563,40 @@ export function ChangelogsPage() {
             <ExternalLink aria-hidden="true" className="size-3" />
           </a>
         </div>
-        <div className="ml-auto min-w-0 text-right">
-          <span className="block text-[9px] font-medium uppercase tracking-wide text-[#858890]">
-            Latest release
-          </span>
+        <div className="ml-auto min-w-0">
           {latestRelease ? (
             <a
               href={latestRelease.html_url}
               target="_blank"
               rel="noreferrer"
-              className="mt-0.5 inline-flex max-w-full items-center justify-end gap-1 text-xs font-medium text-[#34363b] hover:underline"
-              title={latestRelease.name || latestRelease.tag_name}
+              className="group inline-flex max-w-full items-center gap-2 rounded-full border border-[#dedcf8] bg-white py-1 pl-1 pr-2.5 shadow-[0_1px_3px_rgba(30,27,75,0.06)] transition-colors hover:border-[#c8c3ef] hover:bg-[#faf9ff]"
+              title={`${latestRelease.name || latestRelease.tag_name} · GitHub release`}
             >
-              <span className="max-w-32 truncate sm:max-w-52">
-                {latestRelease.name || latestRelease.tag_name}
+              <span className="flex size-7 shrink-0 items-center justify-center rounded-full bg-[#f0efff] text-[#5b52a3]">
+                <GitCommitHorizontal aria-hidden="true" className="size-3.5" />
               </span>
-              <ExternalLink aria-hidden="true" className="size-3 shrink-0" />
+              <span className="min-w-0">
+                <span className="block max-w-28 truncate text-[11px] font-semibold leading-4 text-[#29283d] sm:max-w-44">
+                  {latestRelease.name || latestRelease.tag_name}
+                </span>
+                {latestRelease.published_at && (
+                  <span className="block text-[9px] leading-3 text-[#858197]">
+                    {new Date(latestRelease.published_at).toLocaleDateString(undefined, {
+                      month: "short",
+                      day: "numeric",
+                      year: "numeric",
+                    })}
+                  </span>
+                )}
+              </span>
+              <ExternalLink aria-hidden="true" className="size-3 shrink-0 text-[#858197] transition-colors group-hover:text-[#5b52a3]" />
             </a>
           ) : (
             <span
-              className="mt-0.5 block max-w-40 truncate text-xs text-[#777a81]"
+              className="block max-w-40 truncate rounded-full border border-[#e5e6e9] bg-white px-3 py-2 text-[10px] text-[#777a81]"
               title={releaseError || (isLoading ? "Loading release…" : "No published release")}
             >
               {releaseError ? "Release unavailable" : isLoading ? "Loading…" : "No published release"}
-            </span>
-          )}
-          {latestRelease?.published_at && (
-            <span className="block text-[9px] text-[#96989e]">
-              {new Date(latestRelease.published_at).toLocaleDateString(undefined, {
-                month: "short",
-                day: "numeric",
-                year: "numeric",
-              })}
             </span>
           )}
         </div>
@@ -610,46 +612,65 @@ export function ChangelogsPage() {
         </div>
       ) : (
         <>
-          <dl className="grid grid-cols-2 overflow-hidden rounded-xl border border-[#e5e6e9] bg-white sm:grid-cols-4">
-            {[
-              { label: "Commits", value: isLoading ? "…" : commits.length.toLocaleString(), color: "text-[#25262a]" },
-              { label: "Lines added", value: statsAreComplete ? `+${totalStats.additions.toLocaleString()}` : "…", color: "text-emerald-700" },
-              { label: "Lines removed", value: statsAreComplete ? `−${totalStats.deletions.toLocaleString()}` : "…", color: "text-rose-700" },
-              { label: "File records", value: statsAreComplete ? totalStats.files.toLocaleString() : "…", color: "text-[#25262a]" },
-            ].map(({ label, value, color }, index) => (
-              <div
-                key={label}
-                className={`min-w-0 px-3 py-3 sm:px-4 ${
-                  index === 1 ? "border-l border-[#e5e6e9]" : ""
-                } ${index >= 2 ? "border-t border-[#e5e6e9] sm:border-l sm:border-t-0" : ""}`}
-              >
-                <dt className="text-[10px] text-[#777a81]">{label}</dt>
-                <dd className={`mt-1 truncate text-base font-semibold tabular-nums ${color}`}>{value}</dd>
-              </div>
-            ))}
-          </dl>
-
-          {!isLoading && (
-            <>
-              <p className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 px-0.5 text-[10px] text-[#858890]">
-                <span>{contributors.toLocaleString()} contributors on main</span>
-                <span>
+          <section aria-label="Lifetime commit statistics" className="space-y-2">
+            <div className="flex flex-wrap items-end justify-between gap-x-3 gap-y-1 px-0.5">
+              <div>
+                <h3 className="text-sm font-semibold text-[#25262a]">Commit history · all time</h3>
+                <p className="mt-0.5 text-[10px] text-[#858890]">
                   {oldestDate && newestDate
                     ? `${oldestDate.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })} — ${newestDate.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}`
-                    : "Full repository history"}
-                </span>
-                {statsAreComplete && (
-                  <span>Net line change: {totalStats.additions - totalStats.deletions > 0 ? "+" : ""}{(totalStats.additions - totalStats.deletions).toLocaleString()}</span>
-                )}
-              </p>
-              {statsAreComplete && (
-                <p className="text-[10px] leading-4 text-[#858890]">
-                  File records are counted as returned by GitHub (up to 300 per commit); line totals use GitHub&apos;s commit statistics.
+                    : "Complete main branch history"}
                 </p>
+              </div>
+              {!isLoading && (
+                <span className="text-[10px] text-[#777a81]">
+                  {contributors.toLocaleString()} {contributors === 1 ? "contributor" : "contributors"}
+                </span>
               )}
-              <ActivityChart commits={commits} details={detailBySha} progress={statsProgress} error={statsError} />
-            </>
-          )}
+            </div>
+
+            <dl className="grid w-full grid-cols-2 overflow-hidden rounded-xl border border-[#dfe2e7] bg-white shadow-[0_2px_8px_rgba(20,24,32,0.04)] sm:grid-cols-4">
+              {[
+                { label: "Commits", value: isLoading ? "…" : commits.length.toLocaleString(), icon: GitCommitHorizontal, color: "text-[#5551a8]", iconBg: "bg-[#f0efff]" },
+                { label: "Lines added", value: statsAreComplete ? `+${totalStats.additions.toLocaleString()}` : "…", icon: ArrowUp, color: "text-emerald-700", iconBg: "bg-emerald-50" },
+                { label: "Lines removed", value: statsAreComplete ? `−${totalStats.deletions.toLocaleString()}` : "…", icon: ArrowDown, color: "text-rose-700", iconBg: "bg-rose-50" },
+                { label: "File records", value: statsAreComplete ? totalStats.files.toLocaleString() : "…", icon: FileCode2, color: "text-[#45474e]", iconBg: "bg-[#f1f2f4]" },
+              ].map(({ label, value, icon: Icon, color, iconBg }, index) => (
+                <div
+                  key={label}
+                  className={`flex min-w-0 w-full items-center gap-2.5 px-3 py-3 sm:gap-3 sm:px-4 sm:py-4 ${
+                    index === 1 ? "border-l border-[#e9eaee]" : ""
+                  } ${index >= 2 ? "border-t border-[#e9eaee] sm:border-t-0" : ""} ${
+                    index >= 2 ? "sm:border-l sm:border-[#e9eaee]" : ""
+                  }`}
+                >
+                  <span className={`flex size-8 shrink-0 items-center justify-center rounded-lg ${iconBg}`}>
+                    <Icon aria-hidden="true" className={`size-4 ${color}`} />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <dt className="truncate text-[10px] font-medium text-[#777a81] sm:text-[11px]">{label}</dt>
+                    <dd className={`mt-0.5 truncate text-base font-semibold tabular-nums sm:text-lg ${color}`}>{value}</dd>
+                  </div>
+                </div>
+              ))}
+            </dl>
+
+            {!isLoading && statsAreComplete && (
+              <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 px-0.5 text-[10px] text-[#858890]">
+                <span>
+                  Net line change: {totalStats.additions - totalStats.deletions > 0 ? "+" : ""}
+                  {(totalStats.additions - totalStats.deletions).toLocaleString()}
+                </span>
+              </div>
+            )}
+            {!isLoading && statsAreComplete && (
+              <p className="px-0.5 text-[10px] leading-4 text-[#858890]">
+                File records are counted as returned by GitHub (up to 300 per commit); line totals use GitHub&apos;s commit-level statistics.
+              </p>
+            )}
+          </section>
+
+          {!isLoading && <ActivityChart commits={commits} details={detailBySha} progress={statsProgress} error={statsError} />}
 
           <div className="flex items-center gap-2 rounded-xl border border-[#e5e6e9] bg-white px-3">
             <Search aria-hidden="true" className="size-4 shrink-0 text-[#858890]" />

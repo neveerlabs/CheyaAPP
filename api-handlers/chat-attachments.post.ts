@@ -19,6 +19,7 @@ type RegisterAttachmentRequest = {
   mimeType?: unknown;
   sizeBytes?: unknown;
   sha256?: unknown;
+  identitySha256?: unknown;
 };
 
 function getErrorMessage(error: unknown, fallback: string): string {
@@ -78,7 +79,7 @@ export default defineEventHandler(async (event) => {
 
   const body = await readBody<RegisterAttachmentRequest>(event);
   if (
-    (body?.action !== "prepare" && body?.action !== "register") ||
+    (body?.action !== "lookup" && body?.action !== "prepare" && body?.action !== "register") ||
     typeof body.id !== "string" ||
     !uuidPattern.test(body.id) ||
     typeof body.fileName !== "string" ||
@@ -91,7 +92,9 @@ export default defineEventHandler(async (event) => {
     body.sizeBytes < 1 ||
     body.sizeBytes > MAX_CHAT_ATTACHMENT_BYTES ||
     typeof body.sha256 !== "string" ||
-    !sha256Pattern.test(body.sha256)
+    !sha256Pattern.test(body.sha256) ||
+    (body.identitySha256 !== undefined &&
+      (typeof body.identitySha256 !== "string" || !sha256Pattern.test(body.identitySha256)))
   ) {
     throw createError({ statusCode: 400, statusMessage: "Attachment metadata is invalid." });
   }
@@ -105,12 +108,14 @@ export default defineEventHandler(async (event) => {
   }
 
   const serviceClient = createServiceRoleClient();
+  const identitySha256 =
+    typeof body.identitySha256 === "string" ? body.identitySha256 : body.sha256;
   const storagePath = `${user.id}/${body.id}`;
   let uploadedTempObject = false;
 
   const { data: existingId, error: existingIdError } = await serviceClient
     .from("chat_message_attachments")
-    .select("id, user_id, message_id, file_name, mime_type, size_bytes, sha256, created_at, expires_at, deleted_at")
+    .select("id, user_id, message_id, file_name, mime_type, size_bytes, sha256, identity_sha256, storage_path, created_at, expires_at, deleted_at")
     .eq("id", body.id)
     .eq("user_id", user.id)
     .maybeSingle();
@@ -121,11 +126,16 @@ export default defineEventHandler(async (event) => {
     });
   }
   if (existingId) {
+    const sameIdentity =
+      body.action !== "register" && existingId.identity_sha256 === identitySha256;
     if (
-      existingId.sha256 !== body.sha256 ||
-      existingId.file_name !== body.fileName.trim() ||
-      existingId.mime_type !== mimeType ||
-      existingId.size_bytes !== body.sizeBytes ||
+      (existingId.sha256 !== body.sha256 && !sameIdentity) ||
+      (existingId.identity_sha256 !== null &&
+        existingId.identity_sha256 !== identitySha256) ||
+      (!sameIdentity &&
+        (existingId.file_name !== body.fileName.trim() ||
+          existingId.mime_type !== mimeType ||
+          existingId.size_bytes !== body.sizeBytes)) ||
       existingId.deleted_at ||
       existingId.expires_at <= new Date().toISOString()
     ) {
@@ -133,7 +143,8 @@ export default defineEventHandler(async (event) => {
     }
     return {
       uploadRequired: false,
-      reused: false,
+      reused: existingId.sha256 !== body.sha256,
+      storagePath: existingId.storage_path,
       attachment: {
         id: existingId.id,
         user_id: existingId.user_id,
@@ -246,6 +257,7 @@ export default defineEventHandler(async (event) => {
       p_id: body.id,
       p_user_id: user.id,
       p_sha256: body.sha256,
+      p_identity_sha256: identitySha256,
       p_storage_path: body.action === "register" ? storagePath : null,
       p_file_name: body.fileName.trim(),
       p_mime_type: mimeType,
@@ -316,5 +328,10 @@ export default defineEventHandler(async (event) => {
     expires_at: attachment.expires_at,
     deleted_at: attachment.deleted_at,
   };
-  return { uploadRequired: false, reused: attachment.reused, attachment: response };
+  return {
+    uploadRequired: false,
+    reused: attachment.reused,
+    storagePath: attachment.storage_path,
+    attachment: response,
+  };
 });

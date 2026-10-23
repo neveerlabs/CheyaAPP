@@ -81,7 +81,7 @@ export default defineEventHandler(async (event) => {
 
   const { data, error } = await serviceClient.storage
     .from(CHAT_ATTACHMENT_BUCKET)
-    .createSignedUrl(attachment.storage_path, Math.min(secondsUntilExpiry, 60));
+    .createSignedUrl(attachment.storage_path, Math.min(secondsUntilExpiry, 3600));
   if (error) {
     throw createError({
       statusCode: 502,

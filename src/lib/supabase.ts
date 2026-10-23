@@ -38,6 +38,8 @@ export type AccountProfile = {
   provider: string;
   email: string | null;
   github_username: string | null;
+  welcome_email_sent_at: string | null;
+  welcome_email_claimed_at: string | null;
   updated_at: string;
 };
 export type AccountInboxItem = {
@@ -79,6 +81,48 @@ export type AdminMessageFeedback = {
   kind: "like" | "dislike" | "report";
   details: string | null;
   updated_at: string;
+};
+
+export type ProductHelpRequest = {
+  id: string;
+  user_id: string;
+  source_message_id: string | null;
+  source_message_version_number: number | null;
+  admin_message_id: string | null;
+  question: string;
+  status: "pending" | "awaiting_confirmation" | "answered" | "withdrawn";
+  draft_title: string | null;
+  draft_answer: string | null;
+  draft_admin_user_id: string | null;
+  draft_created_at: string | null;
+  answer: string | null;
+  answer_message_id: string | null;
+  created_at: string;
+  answered_at: string | null;
+};
+
+export type PublicMemory = {
+  id: string;
+  category: string;
+  title: string;
+  content: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type AdminPublicMemoryRequest = {
+  id: string;
+  admin_user_id: string;
+  source_message_id: string;
+  source_message_version_number: number;
+  question: string;
+  status: "collecting" | "awaiting_confirmation" | "published" | "withdrawn";
+  draft_title: string | null;
+  draft_content: string | null;
+  draft_updated_at: string | null;
+  public_memory_id: string | null;
+  created_at: string;
+  published_at: string | null;
 };
 
 export type AiReminder = {
@@ -320,7 +364,10 @@ export type Database = {
       account_profiles: {
         Row: AccountProfile;
         Insert: never;
-        Update: never;
+        Update: {
+          welcome_email_sent_at?: string | null;
+          welcome_email_claimed_at?: string | null;
+        };
         Relationships: never[];
       };
       account_inbox: {
@@ -349,6 +396,58 @@ export type Database = {
           attachment_id?: string | null;
           created_at?: string;
         };
+        Update: never;
+        Relationships: never[];
+      };
+      product_help_requests: {
+        Row: ProductHelpRequest;
+        Insert: {
+          id?: string;
+          user_id: string;
+          source_message_id?: string | null;
+          source_message_version_number?: number | null;
+          admin_message_id?: string | null;
+          question: string;
+          status?: ProductHelpRequest["status"];
+          draft_title?: string | null;
+          draft_answer?: string | null;
+          draft_admin_user_id?: string | null;
+          draft_created_at?: string | null;
+          answer?: string | null;
+          answer_message_id?: string | null;
+          created_at?: string;
+          answered_at?: string | null;
+        };
+        Update: Partial<Pick<
+          ProductHelpRequest,
+          | "admin_message_id"
+          | "status"
+          | "draft_title"
+          | "draft_answer"
+          | "draft_admin_user_id"
+          | "draft_created_at"
+          | "answer"
+          | "answer_message_id"
+          | "answered_at"
+        >>;
+        Relationships: never[];
+      };
+      public_memories: {
+        Row: PublicMemory;
+        Insert: {
+          id?: string;
+          category?: string;
+          title: string;
+          content: string;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: Partial<Pick<PublicMemory, "category" | "title" | "content" | "updated_at">>;
+        Relationships: never[];
+      };
+      admin_public_memory_requests: {
+        Row: AdminPublicMemoryRequest;
+        Insert: never;
         Update: never;
         Relationships: never[];
       };
@@ -579,13 +678,18 @@ export type Database = {
         Relationships: never[];
       };
       chat_message_attachments: {
-        Row: ChatAttachment & { storage_path: string; sha256: string | null };
+        Row: ChatAttachment & {
+          storage_path: string;
+          sha256: string | null;
+          identity_sha256: string | null;
+        };
         Insert: {
           id?: string;
           user_id?: string;
           message_id?: string | null;
           storage_path: string;
           sha256?: string | null;
+          identity_sha256?: string | null;
           file_name: string;
           mime_type: string;
           size_bytes: number;
@@ -596,6 +700,7 @@ export type Database = {
         Update: Partial<{
           message_id: string | null;
           sha256: string | null;
+          identity_sha256: string | null;
           deleted_at: string | null;
         }>;
         Relationships: never[];
@@ -766,6 +871,101 @@ export type Database = {
         Args: Record<PropertyKey, never>;
         Returns: number;
       };
+      request_product_help_from_admin: {
+        Args: {
+          p_user_id: string;
+          p_source_message_id: string;
+          p_question: string;
+        };
+        Returns: Array<{
+          request_id: string;
+          admin_message_id: string;
+          was_existing: boolean;
+        }>;
+      };
+      prepare_product_help_answer: {
+        Args: {
+          p_admin_user_id: string;
+          p_request_id: string;
+          p_title: string;
+          p_answer: string;
+        };
+        Returns: Array<{
+          request_id: string;
+          draft_title: string;
+          draft_answer: string;
+          draft_created_at: string;
+        }>;
+      };
+      confirm_product_help_answer: {
+        Args: {
+          p_admin_user_id: string;
+          p_request_id: string;
+          p_confirmation_message_id: string;
+        };
+        Returns: Array<{
+          user_id: string;
+          answer_message_id: string;
+          was_existing: boolean;
+          answer: string;
+        }>;
+      };
+      search_product_help_memories: {
+        Args: {
+          p_query: string;
+          p_limit?: number;
+        };
+        Returns: Array<{
+          title: string;
+          content: string;
+        }>;
+      };
+      start_admin_public_memory_request: {
+        Args: {
+          p_admin_user_id: string;
+          p_source_message_id: string;
+          p_question: string;
+        };
+        Returns: Array<{ request_id: string; was_existing: boolean }>;
+      };
+      search_admin_public_memory_requests: {
+        Args: { p_admin_user_id: string; p_query: string };
+        Returns: Array<{
+          id: string;
+          question: string;
+          status: AdminPublicMemoryRequest["status"];
+          draft_title: string | null;
+          draft_content: string | null;
+          created_at: string;
+        }>;
+      };
+      prepare_admin_public_memory: {
+        Args: {
+          p_admin_user_id: string;
+          p_request_id: string;
+          p_title: string;
+          p_content: string;
+        };
+        Returns: Array<{
+          request_id: string;
+          draft_title: string;
+          draft_content: string;
+          draft_updated_at: string;
+        }>;
+      };
+      confirm_admin_public_memory: {
+        Args: {
+          p_admin_user_id: string;
+          p_request_id: string;
+          p_confirmation_message_id: string;
+        };
+        Returns: Array<{
+          public_memory_id: string;
+          title: string;
+          content: string;
+          was_existing: boolean;
+        }>;
+      };
       delete_chat_branch_from_message: {
         Args: { p_message_id: string };
         Returns: number;
@@ -820,11 +1020,16 @@ export type Database = {
         };
         Returns: Array<{ job_id: string; message_id: string; created: boolean }>;
       };
+      save_chat_voice_note_transcript: {
+        Args: { p_message_id: string; p_content: string };
+        Returns: number;
+      };
       register_chat_attachment_reference: {
         Args: {
           p_id: string;
           p_user_id: string;
           p_sha256: string;
+          p_identity_sha256: string;
           p_storage_path: string | null;
           p_file_name: string;
           p_mime_type: string;

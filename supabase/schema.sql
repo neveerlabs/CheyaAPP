@@ -4,11 +4,17 @@ create table if not exists public.account_profiles (
   provider text not null default 'google',
   email text,
   github_username text,
+  welcome_email_sent_at timestamptz default now(),
+  welcome_email_claimed_at timestamptz,
   updated_at timestamptz not null default now()
 );
 
 alter table public.account_profiles
   add column if not exists email text;
+alter table public.account_profiles
+  add column if not exists welcome_email_sent_at timestamptz default now();
+alter table public.account_profiles
+  add column if not exists welcome_email_claimed_at timestamptz;
 
 alter table public.account_profiles enable row level security;
 drop policy if exists "Users can read their own account profile" on public.account_profiles;
@@ -74,6 +80,7 @@ begin
     provider,
     email,
     github_username,
+    welcome_email_sent_at,
     updated_at
   )
   values (
@@ -82,6 +89,7 @@ begin
     account_provider,
     account_email,
     github_username,
+    null,
     now()
   )
   on conflict (user_id) do update
@@ -391,6 +399,755 @@ $$;
 revoke all on function public.finalize_admin_message_request(uuid, boolean) from public, anon;
 grant execute on function public.finalize_admin_message_request(uuid, boolean) to authenticated;
 
+create table if not exists public.product_help_requests (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users (id) on delete cascade,
+  source_message_id uuid,
+  source_message_version_number integer,
+  admin_message_id uuid unique references public.admin_messages (id) on delete set null,
+  question text not null check (length(trim(question)) between 1 and 10000),
+  status text not null default 'pending' check (status in ('pending', 'awaiting_confirmation', 'answered', 'withdrawn')),
+  draft_title text,
+  draft_answer text,
+  draft_admin_user_id uuid references auth.users (id) on delete set null,
+  draft_created_at timestamptz,
+  answer text,
+  answer_message_id uuid,
+  created_at timestamptz not null default now(),
+  answered_at timestamptz,
+  constraint product_help_answer_check check (
+    (status in ('pending', 'withdrawn') and answer is null and answer_message_id is null and answered_at is null)
+    or (status = 'awaiting_confirmation' and draft_answer is not null and answer is null and answer_message_id is null and answered_at is null)
+    or (status = 'answered' and answer is not null and answered_at is not null)
+  )
+);
+alter table public.product_help_requests
+  add column if not exists draft_answer text,
+  add column if not exists draft_title text,
+  add column if not exists draft_admin_user_id uuid references auth.users (id) on delete set null,
+  add column if not exists draft_created_at timestamptz,
+  add column if not exists source_message_version_number integer;
+alter table public.product_help_requests
+  drop constraint if exists product_help_requests_status_check;
+alter table public.product_help_requests
+  add constraint product_help_requests_status_check
+  check (status in ('pending', 'awaiting_confirmation', 'answered', 'withdrawn'));
+alter table public.product_help_requests
+  drop constraint if exists product_help_answer_check;
+alter table public.product_help_requests
+  add constraint product_help_answer_check check (
+    (status in ('pending', 'withdrawn') and answer is null and answer_message_id is null and answered_at is null)
+    or (status = 'awaiting_confirmation' and draft_answer is not null and answer is null and answer_message_id is null and answered_at is null)
+    or (status = 'answered' and answer is not null and answered_at is not null)
+  );
+
+create table if not exists public.public_memories (
+  id uuid primary key default gen_random_uuid(),
+  category text not null default 'product_help' check (length(trim(category)) between 1 and 80),
+  title text not null check (length(trim(title)) between 1 and 160),
+  content text not null check (length(trim(content)) between 1 and 10000),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create unique index if not exists public_memories_category_title_idx
+  on public.public_memories (lower(category), lower(title));
+create index if not exists public_memories_updated_idx
+  on public.public_memories (updated_at desc);
+alter table public.public_memories enable row level security;
+drop policy if exists "Authenticated accounts can read public memory" on public.public_memories;
+revoke all on public.public_memories from public, anon;
+revoke all on public.public_memories from authenticated;
+
+create table if not exists public.admin_public_memory_requests (
+  id uuid primary key default gen_random_uuid(),
+  admin_user_id uuid not null references auth.users (id) on delete cascade,
+  source_message_id uuid not null,
+  source_message_version_number integer not null,
+  question text not null check (length(trim(question)) between 1 and 10000),
+  status text not null default 'collecting'
+    check (status in ('collecting', 'awaiting_confirmation', 'published', 'withdrawn')),
+  draft_title text,
+  draft_content text,
+  draft_updated_at timestamptz,
+  public_memory_id uuid references public.public_memories (id) on delete set null,
+  created_at timestamptz not null default now(),
+  published_at timestamptz
+);
+alter table public.admin_public_memory_requests enable row level security;
+revoke all on public.admin_public_memory_requests from public, anon, authenticated;
+grant select, insert, update, delete on public.admin_public_memory_requests to service_role;
+create unique index if not exists admin_public_memory_requests_source_idx
+  on public.admin_public_memory_requests (admin_user_id, source_message_id, source_message_version_number);
+create index if not exists admin_public_memory_requests_pending_idx
+  on public.admin_public_memory_requests (admin_user_id, created_at desc)
+  where status in ('collecting', 'awaiting_confirmation');
+
+create or replace function public.start_admin_public_memory_request(
+  p_admin_user_id uuid,
+  p_source_message_id uuid,
+  p_question text
+)
+returns table (request_id uuid, was_existing boolean)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  source_version integer;
+  request_row public.admin_public_memory_requests%rowtype;
+begin
+  if auth.role() is distinct from 'service_role'
+     or not exists (
+       select 1 from public.account_profiles
+       where user_id = p_admin_user_id and role = 'admin'
+     ) then
+    raise exception 'Only the account service acting for an administrator can start a public-memory request.';
+  end if;
+  if length(trim(p_question)) not between 1 and 10000 then
+    raise exception 'The product question must contain 1 to 10000 characters.';
+  end if;
+  select message.version_number into source_version
+  from public.chat_messages as message
+  where message.id = p_source_message_id
+    and message.user_id = p_admin_user_id
+    and message.role = 'user'
+    and message.is_active;
+  if not found or source_version is null then
+    raise exception 'The administrator question could not be verified.';
+  end if;
+
+  insert into public.admin_public_memory_requests (
+    admin_user_id, source_message_id, source_message_version_number, question
+  )
+  values (p_admin_user_id, p_source_message_id, source_version, trim(p_question))
+  on conflict (admin_user_id, source_message_id, source_message_version_number) do nothing;
+  select * into request_row
+  from public.admin_public_memory_requests as request
+  where request.admin_user_id = p_admin_user_id
+    and request.source_message_id = p_source_message_id
+    and request.source_message_version_number = source_version;
+  if not found then
+    raise exception 'Could not save the administrator''s product question.';
+  end if;
+  return query select request_row.id, request_row.status <> 'withdrawn';
+end;
+$$;
+revoke all on function public.start_admin_public_memory_request(uuid, uuid, text) from public, anon, authenticated;
+grant execute on function public.start_admin_public_memory_request(uuid, uuid, text) to service_role;
+
+create or replace function public.search_admin_public_memory_requests(
+  p_admin_user_id uuid,
+  p_query text
+)
+returns table (
+  id uuid,
+  question text,
+  status text,
+  draft_title text,
+  draft_content text,
+  created_at timestamptz
+)
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select request.id, request.question, request.status,
+         request.draft_title, request.draft_content, request.created_at
+  from public.admin_public_memory_requests as request
+  where auth.role() = 'service_role'
+    and exists (
+      select 1 from public.account_profiles as profile
+      where profile.user_id = p_admin_user_id and profile.role = 'admin'
+    )
+    and request.admin_user_id = p_admin_user_id
+    and request.status in ('collecting', 'awaiting_confirmation')
+    and (
+      nullif(trim(p_query), '') is null
+      or request.question ilike '%' || replace(replace(replace(trim(p_query), E'\\', E'\\\\'), '%', E'\\%'), '_', E'\\_') || '%'
+    )
+  order by request.created_at desc
+  limit 20;
+$$;
+revoke all on function public.search_admin_public_memory_requests(uuid, text) from public, anon, authenticated;
+grant execute on function public.search_admin_public_memory_requests(uuid, text) to service_role;
+
+create or replace function public.prepare_admin_public_memory(
+  p_admin_user_id uuid,
+  p_request_id uuid,
+  p_title text,
+  p_content text
+)
+returns table (request_id uuid, draft_title text, draft_content text, draft_updated_at timestamptz)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  request_row public.admin_public_memory_requests%rowtype;
+  saved_at timestamptz := now();
+begin
+  if auth.role() is distinct from 'service_role'
+     or not exists (
+       select 1 from public.account_profiles
+       where user_id = p_admin_user_id and role = 'admin'
+     ) then
+    raise exception 'Only the account service acting for an administrator can prepare public memory.';
+  end if;
+  if length(trim(p_title)) not between 1 and 160
+     or length(trim(p_content)) not between 1 and 10000 then
+    raise exception 'The public-memory title or content length is invalid.';
+  end if;
+  select * into request_row
+  from public.admin_public_memory_requests as request
+  where request.id = p_request_id
+    and request.admin_user_id = p_admin_user_id
+  for update;
+  if not found or request_row.status not in ('collecting', 'awaiting_confirmation') then
+    raise exception 'This public-memory request is not available for a draft.';
+  end if;
+  if not exists (
+    select 1 from public.chat_messages as source
+    where source.id = request_row.source_message_id
+      and source.user_id = p_admin_user_id
+      and source.role = 'user'
+      and source.is_active
+      and source.version_number = request_row.source_message_version_number
+  ) then
+    raise exception 'The administrator question changed; start a new public-memory request for its current version.';
+  end if;
+
+  update public.admin_public_memory_requests
+  set status = 'awaiting_confirmation',
+      draft_title = trim(p_title),
+      draft_content = trim(p_content),
+      draft_updated_at = saved_at
+  where id = p_request_id;
+  return query select p_request_id, trim(p_title), trim(p_content), saved_at;
+end;
+$$;
+revoke all on function public.prepare_admin_public_memory(uuid, uuid, text, text) from public, anon, authenticated;
+grant execute on function public.prepare_admin_public_memory(uuid, uuid, text, text) to service_role;
+
+create or replace function public.confirm_admin_public_memory(
+  p_admin_user_id uuid,
+  p_request_id uuid,
+  p_confirmation_message_id uuid
+)
+returns table (public_memory_id uuid, title text, content text, was_existing boolean)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  request_row public.admin_public_memory_requests%rowtype;
+  confirmation_text text;
+  saved_memory_id uuid;
+begin
+  if auth.role() is distinct from 'service_role'
+     or not exists (
+       select 1 from public.account_profiles
+       where user_id = p_admin_user_id and role = 'admin'
+     ) then
+    raise exception 'Only the account service acting for an administrator can publish public memory.';
+  end if;
+  select message.content into confirmation_text
+  from public.chat_messages as message
+  where message.id = p_confirmation_message_id
+    and message.user_id = p_admin_user_id
+    and message.role = 'user'
+    and message.is_active;
+  if not found then
+    raise exception 'The administrator confirmation message could not be verified.';
+  end if;
+  if (
+       lower(trim(confirmation_text)) !~ '^(yes|yeah|yep|correct|approved|confirm|send|ok|okay|sure|ya|iya|yap|betul|benar|pas|sip|oke|setuju|silakan|kirim|lanjut|boleh|gas|lanjutkan|cocok|sesuai)([[:space:],.!?]|$)'
+       and lower(trim(confirmation_text)) !~ '^(udah|sudah)[[:space:]]+(pas|benar|tepat|oke|cocok|sesuai)([[:space:],.!?]|$)'
+     )
+     or lower(confirmation_text) ~ '\m(jangan|belum|nanti|revisi|ubah|koreksi|tunggu|tidak|nggak|gak|kurang|tapi)\M' then
+    raise exception 'The administrator message is not an unambiguous confirmation.';
+  end if;
+
+  select * into request_row
+  from public.admin_public_memory_requests as request
+  where request.id = p_request_id
+    and request.admin_user_id = p_admin_user_id
+  for update;
+  if found and request_row.status = 'published' then
+    return query select request_row.public_memory_id,
+                        request_row.draft_title,
+                        request_row.draft_content,
+                        true;
+    return;
+  end if;
+  if not found or request_row.status <> 'awaiting_confirmation'
+     or request_row.draft_title is null or request_row.draft_content is null then
+    raise exception 'There is no public-memory draft awaiting confirmation.';
+  end if;
+  if not exists (
+    select 1 from public.chat_messages as source
+    where source.id = request_row.source_message_id
+      and source.user_id = p_admin_user_id
+      and source.role = 'user'
+      and source.is_active
+      and source.version_number = request_row.source_message_version_number
+  ) then
+    raise exception 'The administrator question changed; this public-memory draft cannot be published.';
+  end if;
+  if not exists (
+    select 1 from public.chat_messages as review
+    where review.user_id = p_admin_user_id
+      and review.role = 'assistant'
+      and review.created_at >= request_row.draft_updated_at
+      and review.created_at < (
+        select confirmation.created_at from public.chat_messages as confirmation
+        where confirmation.id = p_confirmation_message_id
+      )
+      and position(request_row.draft_title in review.content) > 0
+      and position(request_row.draft_content in review.content) > 0
+      and lower(review.content) ~ '(confirm|accurate|correct|tepat|akurat|benar|sudah pas|simpan|publikasi)'
+  ) then
+    raise exception 'The current public-memory draft was not shown for confirmation.';
+  end if;
+
+  insert into public.public_memories (category, title, content)
+  values ('product_help', request_row.draft_title, request_row.draft_content)
+  on conflict (lower(category), lower(title)) do update
+  set content = excluded.content,
+      updated_at = now()
+  returning id into saved_memory_id;
+  update public.admin_public_memory_requests
+  set status = 'published',
+      public_memory_id = saved_memory_id,
+      published_at = now()
+  where id = p_request_id;
+  return query select saved_memory_id, request_row.draft_title, request_row.draft_content, false;
+end;
+$$;
+revoke all on function public.confirm_admin_public_memory(uuid, uuid, uuid) from public, anon, authenticated;
+grant execute on function public.confirm_admin_public_memory(uuid, uuid, uuid) to service_role;
+
+create or replace function public.search_product_help_memories(
+  p_query text,
+  p_limit integer default 3
+)
+returns table (title text, content text)
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  with query_tokens as (
+    select distinct token
+    from regexp_split_to_table(lower(coalesce(p_query, '')), '[^[:alnum:]]+') as token
+    where length(token) > 2
+  )
+  select memory.title, memory.content
+  from public.public_memories as memory
+  where auth.role() = 'service_role'
+    and memory.category = 'product_help'
+    and exists (
+    select 1
+    from query_tokens
+    where lower(memory.title || ' ' || memory.content) like '%' || query_tokens.token || '%'
+  )
+  order by (
+    select count(*)
+    from query_tokens
+    where lower(memory.title || ' ' || memory.content) like '%' || query_tokens.token || '%'
+  ) desc, memory.updated_at desc
+  limit greatest(1, least(coalesce(p_limit, 3), 5));
+$$;
+revoke all on function public.search_product_help_memories(text, integer) from public, anon, authenticated;
+grant execute on function public.search_product_help_memories(text, integer) to service_role;
+
+create or replace function public.sync_product_help_question_edit()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  request_row public.product_help_requests%rowtype;
+  relay_body text;
+begin
+  if new.role <> 'user'
+     or new.revision_reason <> 'user_edit'
+     or old.content is not distinct from new.content then
+    return new;
+  end if;
+
+  for request_row in
+    update public.product_help_requests
+    set question = left(trim(new.content), 10000),
+        status = 'withdrawn',
+        draft_title = null,
+        draft_answer = null,
+        draft_admin_user_id = null,
+        draft_created_at = null
+    where source_message_id = new.id
+      and status in ('pending', 'awaiting_confirmation')
+    returning *
+  loop
+    relay_body := format(
+      E'The user edited their product-help question. The previous request and any answer draft are withdrawn. The edited question will be forwarded only if it still needs an administrator.\n\nEdited question:\n%s',
+      request_row.question
+    );
+    insert into public.chat_messages (user_id, role, content, revision_reason)
+    select profile.user_id, 'assistant', relay_body, 'initial'
+    from public.account_profiles as profile
+    where profile.role = 'admin';
+  end loop;
+  return new;
+end;
+$$;
+revoke all on function public.sync_product_help_question_edit() from public, anon, authenticated;
+
+create or replace function public.withdraw_product_help_question_on_delete()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  update public.product_help_requests
+  set status = 'withdrawn',
+      draft_title = null,
+      draft_answer = null,
+      draft_admin_user_id = null,
+      draft_created_at = null
+  where source_message_id = old.id
+    and status in ('pending', 'awaiting_confirmation');
+  update public.admin_public_memory_requests
+  set status = 'withdrawn',
+      draft_title = null,
+      draft_content = null,
+      draft_updated_at = null
+  where source_message_id = old.id
+    and status in ('collecting', 'awaiting_confirmation');
+  return old;
+end;
+$$;
+revoke all on function public.withdraw_product_help_question_on_delete() from public, anon, authenticated;
+
+create or replace function public.withdraw_admin_public_memory_on_edit()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if new.role = 'user'
+     and new.revision_reason = 'user_edit'
+     and old.content is distinct from new.content
+     and exists (
+       select 1 from public.account_profiles as profile
+       where profile.user_id = new.user_id and profile.role = 'admin'
+     ) then
+    update public.admin_public_memory_requests
+    set status = 'withdrawn',
+        draft_title = null,
+        draft_content = null,
+        draft_updated_at = null
+    where admin_user_id = new.user_id
+      and source_message_id = new.id
+      and status in ('collecting', 'awaiting_confirmation');
+  end if;
+  return new;
+end;
+$$;
+revoke all on function public.withdraw_admin_public_memory_on_edit() from public, anon, authenticated;
+
+drop index if exists public.product_help_requests_user_source_idx;
+create unique index if not exists product_help_requests_user_source_version_idx
+  on public.product_help_requests (user_id, source_message_id, source_message_version_number)
+  where source_message_id is not null;
+drop index if exists public.product_help_requests_pending_idx;
+create index product_help_requests_pending_idx
+  on public.product_help_requests (created_at desc)
+  where status in ('pending', 'awaiting_confirmation');
+alter table public.product_help_requests enable row level security;
+revoke all on public.product_help_requests from public, anon, authenticated;
+grant select, insert, update, delete on public.product_help_requests to service_role;
+
+create or replace function public.request_product_help_from_admin(
+  p_user_id uuid,
+  p_source_message_id uuid,
+  p_question text
+)
+returns table (request_id uuid, admin_message_id uuid, was_existing boolean)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  existing_request public.product_help_requests%rowtype;
+  created_request_id uuid;
+  created_admin_message_id uuid;
+  source_version_number integer;
+  account_name text;
+  account_email text;
+  relay_body text;
+begin
+  if auth.role() is distinct from 'service_role' then
+    raise exception 'Only the account service can ask an administrator for product help.';
+  end if;
+  if length(trim(p_question)) not between 1 and 10000 then
+    raise exception 'The product-help question must contain 1 to 10000 characters.';
+  end if;
+  if not exists (
+    select 1 from public.account_profiles as profile
+    where profile.user_id = p_user_id and profile.role = 'user'
+  ) then
+    raise exception 'Only user accounts can ask for product help.';
+  end if;
+  select message.version_number into source_version_number
+  from public.chat_messages as message
+  where message.id = p_source_message_id
+    and message.user_id = p_user_id
+    and message.role = 'user'
+    and message.is_active;
+  if not found then
+    raise exception 'The source question could not be verified.';
+  end if;
+  if source_version_number is null then
+    raise exception 'The source question version could not be verified.';
+  end if;
+  if not exists (select 1 from public.account_profiles where role = 'admin') then
+    raise exception 'No administrator account is available to receive this question.';
+  end if;
+
+  select * into existing_request
+  from public.product_help_requests as request
+  where request.user_id = p_user_id
+    and request.source_message_id = p_source_message_id
+    and request.source_message_version_number = source_version_number;
+  if found then
+    if existing_request.status in ('pending', 'awaiting_confirmation') then
+      return query select existing_request.id, existing_request.admin_message_id, true;
+      return;
+    end if;
+    raise exception 'This question has already been answered.';
+  end if;
+
+  select nullif(trim(settings.display_name), ''), profile.email
+  into account_name, account_email
+  from public.account_profiles as profile
+  left join public.user_settings as settings on settings.user_id = profile.user_id
+  where profile.user_id = p_user_id;
+  relay_body := format(
+    E'Product-help question from %s:\n\n%s\n\nUse the product-help tools in this chat to find the request, synthesize a user-ready answer draft from the admin discussion, and ask for confirmation. Do not send it to the user until the admin explicitly confirms the draft.',
+    coalesce(account_name, account_email, 'a CheyaAPP user'),
+    trim(p_question)
+  );
+
+  insert into public.product_help_requests (
+    user_id,
+    source_message_id,
+    source_message_version_number,
+    question
+  )
+  values (p_user_id, p_source_message_id, source_version_number, trim(p_question))
+  on conflict (user_id, source_message_id, source_message_version_number)
+    where source_message_id is not null
+  do nothing
+  returning id into created_request_id;
+  if not found then
+    select * into existing_request
+    from public.product_help_requests as request
+    where request.user_id = p_user_id
+      and request.source_message_id = p_source_message_id
+      and request.source_message_version_number = source_version_number;
+    if found and existing_request.status in ('pending', 'awaiting_confirmation') then
+      return query select existing_request.id, existing_request.admin_message_id, true;
+      return;
+    end if;
+    raise exception 'This question has already been answered.';
+  end if;
+
+  insert into public.admin_messages (sender_user_id, source_message_id, body)
+  values (p_user_id, p_source_message_id, relay_body)
+  returning id into created_admin_message_id;
+
+  update public.product_help_requests
+  set admin_message_id = created_admin_message_id
+  where id = created_request_id;
+
+  insert into public.chat_messages (user_id, role, content, revision_reason, admin_message_id)
+  select profile.user_id, 'assistant', relay_body, 'initial', created_admin_message_id
+  from public.account_profiles as profile
+  where profile.role = 'admin';
+
+  return query select created_request_id, created_admin_message_id, false;
+end;
+$$;
+
+revoke all on function public.request_product_help_from_admin(uuid, uuid, text) from public, anon, authenticated;
+grant execute on function public.request_product_help_from_admin(uuid, uuid, text) to service_role;
+
+drop function if exists public.answer_product_help_request(uuid, uuid, text);
+drop function if exists public.confirm_product_help_answer(uuid, uuid);
+
+create or replace function public.confirm_product_help_answer(
+  p_admin_user_id uuid,
+  p_request_id uuid,
+  p_confirmation_message_id uuid
+)
+returns table (user_id uuid, answer_message_id uuid, was_existing boolean, answer text)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  help_request public.product_help_requests%rowtype;
+  created_answer_message_id uuid;
+  confirmed_answer text;
+  confirmation_text text;
+begin
+  if auth.role() is distinct from 'service_role' then
+    raise exception 'Only the account service can deliver product-help answers.';
+  end if;
+  if not exists (
+    select 1 from public.account_profiles as profile
+    where profile.user_id = p_admin_user_id and profile.role = 'admin'
+  ) then
+    raise exception 'Only an administrator can answer a product-help question.';
+  end if;
+  if not exists (
+    select 1 from public.chat_messages as message
+    where message.id = p_confirmation_message_id
+      and message.user_id = p_admin_user_id
+      and message.role = 'user'
+      and message.is_active
+  )
+  then
+    raise exception 'The administrator confirmation message could not be verified.';
+  end if;
+  select message.content into confirmation_text
+  from public.chat_messages as message
+  where message.id = p_confirmation_message_id;
+  if (
+       lower(trim(confirmation_text)) !~ '^(yes|yeah|yep|correct|approved|confirm|send|ok|okay|sure|ya|iya|yap|betul|benar|pas|sip|oke|setuju|silakan|kirim|lanjut|boleh|gas|lanjutkan|cocok|sesuai)([[:space:],.!?]|$)'
+       and lower(trim(confirmation_text)) !~ '^(udah|sudah)[[:space:]]+(pas|benar|tepat|oke|cocok|sesuai)([[:space:],.!?]|$)'
+     )
+     or lower(confirmation_text) ~ '\m(jangan|belum|nanti|revisi|ubah|koreksi|tunggu|tidak|nggak|gak|kurang|tapi)\M' then
+    raise exception 'The administrator message is not an unambiguous confirmation.';
+  end if;
+  select * into help_request
+  from public.product_help_requests as request
+  where request.id = p_request_id
+  for update;
+  if not found then
+    raise exception 'The product-help request was not found or was removed.';
+  end if;
+  if help_request.status = 'answered' then
+    return query select help_request.user_id, help_request.answer_message_id, true, help_request.answer;
+    return;
+  end if;
+  if help_request.status <> 'awaiting_confirmation'
+     or help_request.draft_admin_user_id is distinct from p_admin_user_id
+     or help_request.draft_title is null
+     or help_request.draft_answer is null
+     or length(trim(help_request.draft_answer)) not between 1 and 10000 then
+    raise exception 'There is no answer draft awaiting administrator confirmation.';
+  end if;
+  if not exists (
+    select 1
+    from public.chat_messages as draft_review
+    where draft_review.user_id = p_admin_user_id
+      and draft_review.role = 'assistant'
+      and draft_review.created_at >= help_request.draft_created_at
+      and draft_review.created_at < (
+        select confirmation.created_at
+        from public.chat_messages as confirmation
+        where confirmation.id = p_confirmation_message_id
+      )
+      and position(help_request.draft_title in draft_review.content) > 0
+      and position(help_request.draft_answer in draft_review.content) > 0
+      and lower(draft_review.content) ~ '(confirm|accurate|correct|tepat|sudah pas|kirim|mengirim)'
+  ) then
+    raise exception 'The current draft was not shown to the administrator for confirmation.';
+  end if;
+  confirmed_answer := trim(help_request.draft_answer);
+
+  insert into public.chat_messages (user_id, role, content, revision_reason)
+  values (help_request.user_id, 'assistant', confirmed_answer, 'initial')
+  returning id into created_answer_message_id;
+
+  update public.product_help_requests
+  set status = 'answered',
+      answer = confirmed_answer,
+      answer_message_id = created_answer_message_id,
+      answered_at = now()
+  where id = p_request_id;
+
+  insert into public.public_memories (category, title, content)
+  values ('product_help', help_request.draft_title, confirmed_answer)
+  on conflict (lower(category), lower(title)) do update
+  set content = excluded.content,
+      updated_at = now();
+
+  return query select help_request.user_id, created_answer_message_id, false, confirmed_answer;
+end;
+$$;
+
+revoke all on function public.confirm_product_help_answer(uuid, uuid, uuid) from public, anon, authenticated;
+grant execute on function public.confirm_product_help_answer(uuid, uuid, uuid) to service_role;
+
+create or replace function public.prepare_product_help_answer(
+  p_admin_user_id uuid,
+  p_request_id uuid,
+  p_title text,
+  p_answer text
+)
+returns table (request_id uuid, draft_title text, draft_answer text, draft_created_at timestamptz)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  help_request public.product_help_requests%rowtype;
+  saved_at timestamptz := now();
+begin
+  if auth.role() is distinct from 'service_role' then
+    raise exception 'Only the account service can prepare product-help answers.';
+  end if;
+  if not exists (
+    select 1 from public.account_profiles as profile
+    where profile.user_id = p_admin_user_id and profile.role = 'admin'
+  ) then
+    raise exception 'Only an administrator can prepare a product-help answer.';
+  end if;
+  if length(trim(p_title)) not between 1 and 160 then
+    raise exception 'The public-memory title must contain 1 to 160 characters.';
+  end if;
+  if length(trim(p_answer)) not between 1 and 10000 then
+    raise exception 'The answer draft must contain 1 to 10000 characters.';
+  end if;
+
+  select * into help_request
+  from public.product_help_requests as request
+  where request.id = p_request_id
+  for update;
+  if not found or help_request.status = 'answered' then
+    raise exception 'The product-help request is not available for a draft.';
+  end if;
+
+  update public.product_help_requests
+  set status = 'awaiting_confirmation',
+      draft_title = trim(p_title),
+      draft_answer = trim(p_answer),
+      draft_admin_user_id = p_admin_user_id,
+      draft_created_at = saved_at
+  where id = p_request_id;
+
+  return query select p_request_id, trim(p_title), trim(p_answer), saved_at;
+end;
+$$;
+
+revoke all on function public.prepare_product_help_answer(uuid, uuid, text, text) from public, anon, authenticated;
+grant execute on function public.prepare_product_help_answer(uuid, uuid, text, text) to service_role;
+
 create table if not exists public.ai_reminders (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null references auth.users (id) on delete cascade,
@@ -638,6 +1395,36 @@ create table if not exists public.chat_messages (
   constraint chat_messages_user_id_id_key unique (user_id, id)
 );
 
+alter table public.product_help_requests
+  drop constraint if exists product_help_requests_source_message_id_fkey,
+  drop constraint if exists product_help_requests_answer_message_id_fkey;
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint
+    where conrelid = 'public.product_help_requests'::regclass
+      and conname = 'product_help_requests_source_message_fk'
+  ) then
+    alter table public.product_help_requests
+      add constraint product_help_requests_source_message_fk
+      foreign key (source_message_id)
+      references public.chat_messages (id)
+      on delete set null;
+  end if;
+  if not exists (
+    select 1 from pg_constraint
+    where conrelid = 'public.product_help_requests'::regclass
+      and conname = 'product_help_requests_answer_message_fk'
+  ) then
+    alter table public.product_help_requests
+      add constraint product_help_requests_answer_message_fk
+      foreign key (answer_message_id)
+      references public.chat_messages (id)
+      on delete set null;
+  end if;
+end;
+$$;
+
 do $$
 begin
   if not exists (
@@ -679,6 +1466,26 @@ alter table public.chat_messages
   add column if not exists is_active boolean not null default true,
   add column if not exists revision_reason text not null default 'initial'
     check (revision_reason in ('initial', 'user_edit', 'regenerate', 'ai_update'));
+
+update public.product_help_requests as request
+set source_message_version_number = message.version_number
+from public.chat_messages as message
+where request.source_message_id = message.id
+  and request.source_message_version_number is null;
+
+drop trigger if exists withdraw_admin_public_memory_on_edit on public.chat_messages;
+create trigger withdraw_admin_public_memory_on_edit
+  after update of content, revision_reason on public.chat_messages
+  for each row execute function public.withdraw_admin_public_memory_on_edit();
+
+drop trigger if exists sync_product_help_question_edit on public.chat_messages;
+create trigger sync_product_help_question_edit
+  after update of content, revision_reason on public.chat_messages
+  for each row execute function public.sync_product_help_question_edit();
+drop trigger if exists withdraw_product_help_question_on_delete on public.chat_messages;
+create trigger withdraw_product_help_question_on_delete
+  before delete on public.chat_messages
+  for each row execute function public.withdraw_product_help_question_on_delete();
 
 create index if not exists chat_messages_user_active_created_idx
   on public.chat_messages (user_id, is_active, created_at, id);
@@ -1024,6 +1831,7 @@ create table if not exists public.chat_message_attachments (
   message_id uuid,
   storage_path text not null,
   sha256 text check (sha256 is null or sha256 ~ '^[0-9a-f]{64}$'),
+  identity_sha256 text check (identity_sha256 is null or identity_sha256 ~ '^[0-9a-f]{64}$'),
   file_name text not null check (length(trim(file_name)) between 1 and 255),
   mime_type text not null,
   size_bytes bigint not null check (size_bytes between 1 and 18874368),
@@ -1041,12 +1849,18 @@ alter table public.chat_message_attachments
 alter table public.chat_message_attachments
   add column if not exists sha256 text
   check (sha256 is null or sha256 ~ '^[0-9a-f]{64}$');
+alter table public.chat_message_attachments
+  add column if not exists identity_sha256 text
+  check (identity_sha256 is null or identity_sha256 ~ '^[0-9a-f]{64}$');
 
 create index if not exists chat_message_attachments_user_message_idx
   on public.chat_message_attachments (user_id, message_id, created_at);
 create index if not exists chat_message_attachments_dedupe_idx
   on public.chat_message_attachments (user_id, sha256, expires_at)
   where deleted_at is null and sha256 is not null;
+create index if not exists chat_message_attachments_identity_dedupe_idx
+  on public.chat_message_attachments (user_id, identity_sha256, expires_at)
+  where deleted_at is null and identity_sha256 is not null;
 
 alter table public.chat_message_attachments enable row level security;
 
@@ -1122,7 +1936,7 @@ values (
     'image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/heic', 'image/heif',
     'video/mp4', 'video/mpeg', 'video/quicktime', 'video/x-msvideo', 'video/x-flv',
     'video/webm', 'video/3gpp', 'video/x-matroska',
-    'audio/flac', 'audio/mp4', 'audio/mpeg', 'audio/ogg', 'audio/wav',
+    'audio/flac', 'audio/mp4', 'audio/mpeg', 'audio/ogg', 'audio/wav', 'audio/webm',
     'application/pdf', 'application/json', 'application/xml',
     'text/plain', 'text/csv', 'text/markdown', 'text/html'
   ]
@@ -1176,10 +1990,12 @@ create policy "Users can delete their own chat attachments"
     and (storage.foldername(name))[1] = auth.uid()::text
   );
 
+drop function if exists public.register_chat_attachment_reference(uuid, uuid, text, text, text, text, bigint);
 create or replace function public.register_chat_attachment_reference(
   p_id uuid,
   p_user_id uuid,
   p_sha256 text,
+  p_identity_sha256 text,
   p_storage_path text,
   p_file_name text,
   p_mime_type text,
@@ -1204,6 +2020,8 @@ set search_path = ''
 as $$
 declare
   canonical_path text;
+  canonical_sha256 text;
+  canonical_file_name text;
   canonical_mime_type text;
   canonical_size bigint;
   did_reuse boolean := false;
@@ -1212,6 +2030,8 @@ begin
     or p_user_id is null
     or p_sha256 is null
     or p_sha256 !~ '^[0-9a-f]{64}$'
+    or p_identity_sha256 is null
+    or p_identity_sha256 !~ '^[0-9a-f]{64}$'
     or p_size_bytes not between 1 and 18874368
     or p_file_name is null
     or length(trim(p_file_name)) not between 1 and 255
@@ -1226,14 +2046,21 @@ begin
   end if;
 
   perform pg_advisory_xact_lock(
-    hashtextextended(p_user_id::text || ':' || p_sha256, 0)
+    hashtextextended(p_user_id::text || ':' || least(p_sha256, p_identity_sha256), 0)
   );
+  if p_sha256 <> p_identity_sha256 then
+    perform pg_advisory_xact_lock(
+      hashtextextended(p_user_id::text || ':' || greatest(p_sha256, p_identity_sha256), 0)
+    );
+  end if;
 
-  select attachment.storage_path, attachment.mime_type, attachment.size_bytes
-  into canonical_path, canonical_mime_type, canonical_size
+  select attachment.storage_path, attachment.sha256, attachment.file_name,
+    attachment.mime_type, attachment.size_bytes
+  into canonical_path, canonical_sha256, canonical_file_name,
+    canonical_mime_type, canonical_size
   from public.chat_message_attachments as attachment
   where attachment.user_id = p_user_id
-    and attachment.sha256 = p_sha256
+    and (attachment.sha256 = p_sha256 or attachment.identity_sha256 = p_identity_sha256)
     and attachment.expires_at > now()
     and attachment.deleted_at is null
   order by attachment.created_at desc
@@ -1241,11 +2068,21 @@ begin
 
   if canonical_path is not null then
     did_reuse := true;
-    if canonical_size <> p_size_bytes then
+    if canonical_size <> p_size_bytes
+      and exists (
+        select 1
+        from public.chat_message_attachments as attachment
+        where attachment.user_id = p_user_id
+          and attachment.sha256 = p_sha256
+          and attachment.expires_at > now()
+          and attachment.deleted_at is null
+      ) then
       raise exception 'Attachment hash matched a file with a different size.';
     end if;
   elsif p_storage_path is not null then
     canonical_path := p_storage_path;
+    canonical_sha256 := p_sha256;
+    canonical_file_name := trim(p_file_name);
     canonical_mime_type := p_mime_type;
     canonical_size := p_size_bytes;
   else
@@ -1254,10 +2091,11 @@ begin
 
   return query
   insert into public.chat_message_attachments as attachment (
-    id, user_id, storage_path, sha256, file_name, mime_type, size_bytes
+    id, user_id, storage_path, sha256, identity_sha256, file_name, mime_type, size_bytes
   )
   values (
-    p_id, p_user_id, canonical_path, p_sha256, trim(p_file_name),
+    p_id, p_user_id, canonical_path, canonical_sha256, p_identity_sha256,
+    canonical_file_name,
     canonical_mime_type, canonical_size
   )
   returning
@@ -1288,10 +2126,12 @@ as $$
 declare
   target_path text;
   target_hash text;
+  target_identity_hash text;
   target_expiry timestamptz;
 begin
-  select attachment.storage_path, attachment.sha256, attachment.expires_at
-  into target_path, target_hash, target_expiry
+  select attachment.storage_path, attachment.sha256,
+    coalesce(attachment.identity_sha256, attachment.sha256), attachment.expires_at
+  into target_path, target_hash, target_identity_hash, target_expiry
   from public.chat_message_attachments as attachment
   where attachment.id = p_attachment_id
     and attachment.user_id = p_user_id
@@ -1303,8 +2143,19 @@ begin
   end if;
 
   perform pg_advisory_xact_lock(
-    hashtextextended(p_user_id::text || ':' || coalesce(target_hash, target_path), 0)
+    hashtextextended(
+      p_user_id::text || ':' || least(coalesce(target_hash, target_path), coalesce(target_identity_hash, target_path)),
+      0
+    )
   );
+  if coalesce(target_hash, target_path) <> coalesce(target_identity_hash, target_path) then
+    perform pg_advisory_xact_lock(
+      hashtextextended(
+        p_user_id::text || ':' || greatest(coalesce(target_hash, target_path), coalesce(target_identity_hash, target_path)),
+        0
+      )
+    );
+  end if;
 
   update public.chat_message_attachments
   set deleted_at = coalesce(deleted_at, now())
@@ -1364,13 +2215,13 @@ begin
 end;
 $$;
 
-revoke all on function public.register_chat_attachment_reference(uuid, uuid, text, text, text, text, bigint)
+revoke all on function public.register_chat_attachment_reference(uuid, uuid, text, text, text, text, text, bigint)
   from public, anon, authenticated;
 revoke all on function public.release_chat_attachment_reference(uuid, uuid, boolean)
   from public, anon, authenticated;
 revoke all on function public.purge_released_chat_attachment_references(uuid, text)
   from public, anon, authenticated;
-grant execute on function public.register_chat_attachment_reference(uuid, uuid, text, text, text, text, bigint)
+grant execute on function public.register_chat_attachment_reference(uuid, uuid, text, text, text, text, text, bigint)
   to service_role;
 grant execute on function public.release_chat_attachment_reference(uuid, uuid, boolean)
   to service_role;
@@ -1389,6 +2240,10 @@ begin
   end if;
   if current_setting('cheyaverse.revise_chat_message', true) = 'on' then
     new.version_number := old.version_number + 1;
+    return new;
+  end if;
+  if current_setting('cheyaverse.transcribe_voice_note', true) = 'on' then
+    new.version_number := old.version_number;
     return new;
   end if;
   if tg_op = 'UPDATE' then
@@ -1466,6 +2321,57 @@ drop trigger if exists chat_messages_store_version on public.chat_messages;
 create trigger chat_messages_store_version
   after insert or update on public.chat_messages
   for each row execute function public.store_chat_message_version();
+
+create or replace function public.save_chat_voice_note_transcript(
+  p_message_id uuid,
+  p_content text
+)
+returns integer
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+declare
+  message_user_id uuid;
+  message_version_number integer;
+  updated_version_count integer;
+begin
+  if auth.role() is distinct from 'service_role' then
+    raise exception 'Only the chat workflow can save a voice note transcript.';
+  end if;
+  if p_message_id is null or p_content is null
+    or length(trim(p_content)) = 0 or length(p_content) > 50000 then
+    raise exception 'Voice note transcript content is invalid.';
+  end if;
+
+  perform set_config('cheyaverse.transcribe_voice_note', 'on', true);
+  update public.chat_messages
+  set content = p_content
+  where id = p_message_id
+    and role = 'user'
+  returning user_id, version_number
+  into message_user_id, message_version_number;
+  if message_user_id is null then
+    raise exception 'The voice note message could not be found.';
+  end if;
+
+  update public.chat_message_versions
+  set content = p_content
+  where user_id = message_user_id
+    and message_id = p_message_id
+    and version_number = message_version_number;
+  get diagnostics updated_version_count = row_count;
+  if updated_version_count <> 1 then
+    raise exception 'The voice note message version could not be updated.';
+  end if;
+  return message_version_number;
+end;
+$$;
+
+revoke all on function public.save_chat_voice_note_transcript(uuid, text)
+  from public, anon, authenticated;
+grant execute on function public.save_chat_voice_note_transcript(uuid, text)
+  to service_role;
 
 drop function if exists public.relay_user_message_to_admin(uuid, text);
 create or replace function public.relay_user_message_to_admin(
@@ -3205,6 +4111,15 @@ begin
         where (branch_message ->> 'message_id')::uuid = any(removed_message_ids)
       )
     );
+
+  update public.user_memories
+  set source_message_id = null
+  where user_id = auth.uid()
+    and source_message_id = any(removed_message_ids);
+
+  delete from public.message_insights
+  where user_id = auth.uid()
+    and message_id = any(removed_message_ids);
 
   delete from public.chat_messages
   where user_id = auth.uid()

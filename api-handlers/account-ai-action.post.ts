@@ -6,6 +6,16 @@ import {
 import { createAuthenticatedServerClient } from "../src/lib/server-supabase";
 
 const supportedActions = new Set([
+  "search_product_help",
+  "ask_admin_product_question",
+  "check_product_help_status",
+  "search_pending_product_questions",
+  "prepare_product_help_answer",
+  "confirm_product_help_answer",
+  "start_admin_public_memory_request",
+  "search_admin_public_memory_requests",
+  "prepare_admin_public_memory",
+  "confirm_admin_public_memory",
   "send_message_to_admin",
   "search_all_account_data",
   "share_chat_attachment",

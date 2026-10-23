@@ -153,14 +153,26 @@ body {
   touch-action: pan-x;
 }
 
-.user-message-action-group:hover .user-message-actions,
+.user-message-action-group:has(.user-message-bubble:hover) .user-message-actions,
+.user-message-action-group:has(.user-message-actions:hover) .user-message-actions,
 .user-message-action-group:focus-within .user-message-actions {
   height: 20px;
   margin-top: 2px;
 }
 
-.user-message-action-group:hover .user-message-actions button,
+.user-message-action-group:has(.user-message-bubble:hover) .user-message-actions button,
+.user-message-action-group:has(.user-message-actions:hover) .user-message-actions button,
 .user-message-action-group:focus-within .user-message-actions button {
+  pointer-events: auto;
+  opacity: 1;
+}
+
+.voice-message-action-group:has(.user-message-bubble:hover) .user-message-actions {
+  height: 20px;
+  margin-top: 2px;
+}
+
+.voice-message-action-group:has(.user-message-bubble:hover) .user-message-actions button {
   pointer-events: auto;
   opacity: 1;
 }

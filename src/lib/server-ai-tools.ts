@@ -1,8 +1,16 @@
 import { start } from "workflow/api";
-import type { AccountRole, AiReminder, AppSupabaseClient } from "./supabase";
+import {
+  saveApiStatus,
+  type AccountRole,
+  type AiReminder,
+  type AppSupabaseClient,
+  type GeminiApiKey,
+} from "./supabase";
+import { generateProductHelpAnswer } from "./gemini";
 import { createServiceRoleClient, getServerEnvironmentVariable } from "./server-supabase";
 import { createAiReminderWorkflow } from "../../workflows/ai-reminder";
 import { sendPushToAccount, sendPushToAccounts } from "./server-push";
+import { searchProductHelp } from "./product-help";
 
 const uuidPattern = /^[\da-f]{8}-[\da-f]{4}-[1-8][\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i;
 
@@ -32,6 +40,34 @@ function requiredText(value: unknown, name: string, maxLength: number): string {
 
 function searchPattern(query: string): string {
   return query === "all" ? "%" : `%${query.replace(/[\\%_]/g, "\\$&")}%`;
+}
+
+async function getAdminPresence(
+  client: AppSupabaseClient,
+): Promise<{ adminIds: string[]; activeAdminIds: Set<string> | null }> {
+  const { data: admins, error: adminsError } = await client
+    .from("account_profiles")
+    .select("user_id")
+    .eq("role", "admin");
+  if (adminsError) {
+    console.error("Could not check admin presence for product-help request.", adminsError);
+    return { adminIds: [], activeAdminIds: null };
+  }
+  const adminIds = admins.map((admin) => admin.user_id);
+  if (adminIds.length === 0) return { adminIds, activeAdminIds: new Set() };
+
+  const { data: activeSessions, error: sessionsError } = await client
+    .from("account_sessions")
+    .select("user_id")
+    .in("user_id", adminIds)
+    .eq("path", "/")
+    .eq("is_active", true)
+    .gt("last_seen_at", new Date(Date.now() - 45_000).toISOString());
+  if (sessionsError) {
+    console.error("Could not check active admin chat sessions for product-help request.", sessionsError);
+    return { adminIds, activeAdminIds: null };
+  }
+  return { adminIds, activeAdminIds: new Set(activeSessions.map((session) => session.user_id)) };
 }
 
 function isReminderUnit(value: unknown): value is NonNullable<AiReminder["repeat_unit"]> {
@@ -347,8 +383,363 @@ async function executeAuthorizedAction(
   name: string,
   value: unknown,
   sourceMessageId?: string,
+  rawProductHelpForServerModel = false,
 ): Promise<unknown> {
   const args = objectArgs(value);
+  if (name === "search_product_help") {
+    const query = requiredText(args.query, "Product-help query", 500);
+    const help = await searchProductHelp(client, query);
+    if (!help.found) return { found: false };
+    if (rawProductHelpForServerModel) return help;
+
+    const { data: storedKeys, error: keysError } = await client
+      .from("ai_api_keys")
+      .select("id, model, api_key, status, last_error, created_at")
+      .eq("user_id", actorId)
+      .order("created_at", { ascending: true })
+      .order("id", { ascending: true });
+    if (keysError) throw new Error(`Could not load Gemini keys to answer product help: ${keysError.message}`);
+    if (storedKeys.length === 0) {
+      throw new AccountAiToolError("Add a Gemini API key in Settings before asking about CheyaAPP.", 400);
+    }
+
+    const typedKeys: GeminiApiKey[] = storedKeys;
+    const result = await generateProductHelpAnswer(
+      typedKeys,
+      query,
+      help.articles,
+    );
+    await Promise.all(
+      result.attempts.map(async (attempt) => {
+        try {
+          await saveApiStatus(client, attempt, actorId);
+        } catch (error) {
+          console.warn(
+            "The product-help Gemini API status could not be saved.",
+            error,
+          );
+        }
+      }),
+    );
+    return {
+      found: result.answer !== null,
+      ...(result.answer !== null ? { answer: result.answer } : {}),
+    };
+  }
+
+  if (name === "start_admin_public_memory_request") {
+    if (role !== "admin") {
+      throw new AccountAiToolError("Only administrators can start public-memory requests.", 403);
+    }
+    if (!sourceMessageId || !uuidPattern.test(sourceMessageId)) {
+      throw new AccountAiToolError("The administrator question could not be verified.", 400);
+    }
+    const question = redactSensitiveText(requiredText(args.question, "Question", 10000));
+    const { data, error } = await client.rpc("start_admin_public_memory_request", {
+      p_admin_user_id: actorId,
+      p_source_message_id: sourceMessageId,
+      p_question: question,
+    });
+    if (error) throw new Error(`Could not save the administrator's product question: ${error.message}`);
+    const request = data[0];
+    if (!request) throw new Error("The public-memory request service returned no result.");
+    return { requestId: request.request_id, alreadyExists: request.was_existing };
+  }
+
+  if (name === "search_admin_public_memory_requests") {
+    if (role !== "admin") {
+      throw new AccountAiToolError("Only administrators can search their public-memory requests.", 403);
+    }
+    const query = typeof args.query === "string" ? args.query.trim().slice(0, 200) : "";
+    const { data, error } = await client.rpc("search_admin_public_memory_requests", {
+      p_admin_user_id: actorId,
+      p_query: query,
+    });
+    if (error) throw new Error(`Could not search public-memory requests: ${error.message}`);
+    return data;
+  }
+
+  if (name === "prepare_admin_public_memory") {
+    if (role !== "admin") {
+      throw new AccountAiToolError("Only administrators can prepare public-memory drafts.", 403);
+    }
+    const requestId = requiredText(args.request_id, "Request ID", 36);
+    if (!uuidPattern.test(requestId)) {
+      throw new AccountAiToolError("The public-memory request ID is invalid.", 400);
+    }
+    const title = redactSensitiveText(requiredText(args.title, "Title", 160));
+    const content = redactSensitiveText(requiredText(args.content, "Content", 10000));
+    const { data, error } = await client.rpc("prepare_admin_public_memory", {
+      p_admin_user_id: actorId,
+      p_request_id: requestId,
+      p_title: title,
+      p_content: content,
+    });
+    if (error) throw new Error(`Could not save the public-memory draft: ${error.message}`);
+    const draft = data[0];
+    if (!draft) throw new Error("The public-memory service did not confirm the draft.");
+    return {
+      requestId: draft.request_id,
+      title: draft.draft_title,
+      content: draft.draft_content,
+      requiresAdminConfirmation: true,
+      published: false,
+    };
+  }
+
+  if (name === "confirm_admin_public_memory") {
+    if (role !== "admin") {
+      throw new AccountAiToolError("Only administrators can confirm public memory.", 403);
+    }
+    if (!sourceMessageId || !uuidPattern.test(sourceMessageId)) {
+      throw new AccountAiToolError("The administrator confirmation could not be verified.", 400);
+    }
+    const requestId = requiredText(args.request_id, "Request ID", 36);
+    if (!uuidPattern.test(requestId)) {
+      throw new AccountAiToolError("The public-memory request ID is invalid.", 400);
+    }
+    const { data, error } = await client.rpc("confirm_admin_public_memory", {
+      p_admin_user_id: actorId,
+      p_request_id: requestId,
+      p_confirmation_message_id: sourceMessageId,
+    });
+    if (error) throw new Error(`Could not publish the confirmed public-memory article: ${error.message}`);
+    const published = data[0];
+    if (!published) throw new Error("The public-memory service did not confirm publication.");
+    return {
+      published: true,
+      alreadyPublished: published.was_existing,
+      title: published.title,
+      memoryId: published.public_memory_id,
+    };
+  }
+
+  if (name === "ask_admin_product_question") {
+    if (role !== "user") {
+      throw new AccountAiToolError("Only user accounts can ask for product-help answers.", 403);
+    }
+    if (!sourceMessageId || !uuidPattern.test(sourceMessageId)) {
+      throw new AccountAiToolError("The source chat question could not be verified.", 400);
+    }
+    const question = redactSensitiveText(requiredText(args.question, "Question", 10000));
+    const { data: created, error: requestError } = await client.rpc(
+      "request_product_help_from_admin",
+      {
+        p_user_id: actorId,
+        p_source_message_id: sourceMessageId,
+        p_question: question,
+      },
+    );
+    if (requestError) {
+      throw new Error(`Could not forward the product-help question: ${requestError.message}`);
+    }
+    const request = created[0];
+    if (!request) throw new Error("The product-help service did not return the new request.");
+    const { adminIds, activeAdminIds } = await getAdminPresence(client);
+    if (request.was_existing) {
+      return {
+        delivered: true,
+        alreadyForwarded: true,
+        requestId: request.request_id,
+        adminActive: activeAdminIds === null ? null : activeAdminIds.size > 0,
+      };
+    }
+
+    if (activeAdminIds === null) {
+      return {
+        delivered: true,
+        requestId: request.request_id,
+        adminActive: null,
+        pushWarning: "Admin availability could not be verified.",
+      };
+    }
+    const pushRecipientIds = adminIds
+      .filter((userId) => !activeAdminIds.has(userId));
+    if (pushRecipientIds.length === 0) {
+      return {
+        delivered: true,
+        requestId: request.request_id,
+        adminActive: activeAdminIds.size > 0,
+        pushSent: false,
+      };
+    }
+    try {
+      const push = await sendPushToAccounts(
+        pushRecipientIds,
+        "CheyaAPP user needs help",
+        question.slice(0, 280),
+      );
+      return {
+        delivered: true,
+        requestId: request.request_id,
+        adminActive: false,
+        push,
+      };
+    } catch (error) {
+      console.error("Product-help question was delivered to admin chats, but push delivery failed.", error);
+      return {
+        delivered: true,
+        requestId: request.request_id,
+        adminActive: false,
+        pushWarning: error instanceof Error ? error.message : "Unknown push service error.",
+      };
+    }
+  }
+
+  if (name === "check_product_help_status") {
+    if (role !== "user") {
+      throw new AccountAiToolError("Only user accounts can check their product-help requests.", 403);
+    }
+    const query = typeof args.query === "string" ? args.query.trim().slice(0, 200) : "";
+    let request = client
+      .from("product_help_requests")
+      .select("id, question, status, created_at")
+      .eq("user_id", actorId)
+      .in("status", ["pending", "awaiting_confirmation", "answered"])
+      .order("created_at", { ascending: false })
+      .limit(10);
+    if (query) request = request.ilike("question", `%${query.replace(/[\\%_]/g, "\\$&")}%`);
+    const { data, error } = await request;
+    if (error) throw new Error(`Could not check product-help request status: ${error.message}`);
+    const presence = await getAdminPresence(client);
+    return {
+      requests: data.map(({ id, question, status, created_at }) => ({
+        id,
+        question,
+        status,
+        created_at,
+      })),
+      adminActive:
+        presence.activeAdminIds === null
+          ? null
+          : presence.activeAdminIds.size > 0,
+    };
+  }
+
+  if (name === "search_pending_product_questions") {
+    if (role !== "admin") {
+      throw new AccountAiToolError("Only administrators can search pending product-help questions.", 403);
+    }
+    const query = typeof args.query === "string" ? args.query.trim().slice(0, 200) : "";
+    let request = client
+      .from("product_help_requests")
+      .select("id, user_id, question, status, draft_title, draft_answer, draft_created_at, created_at")
+      .in("status", ["pending", "awaiting_confirmation"])
+      .order("created_at", { ascending: false })
+      .limit(20);
+    if (query) request = request.ilike("question", `%${query.replace(/[\\%_]/g, "\\$&")}%`);
+    const { data, error } = await request;
+    if (error) {
+      throw new Error(`Could not search pending product-help questions: ${error.message}`);
+    }
+    return data;
+  }
+
+  if (name === "prepare_product_help_answer") {
+    if (role !== "admin") {
+      throw new AccountAiToolError("Only administrators can prepare product-help answers.", 403);
+    }
+    const requestId = requiredText(args.request_id, "Request ID", 36);
+    if (!uuidPattern.test(requestId)) {
+      throw new AccountAiToolError("The product-help request ID is invalid.", 400);
+    }
+    const answer = redactSensitiveText(requiredText(args.answer, "Answer", 10000));
+    const title = redactSensitiveText(requiredText(args.title, "Title", 160));
+    const { data: prepared, error: prepareError } = await client.rpc(
+      "prepare_product_help_answer",
+      {
+        p_admin_user_id: actorId,
+        p_request_id: requestId,
+        p_title: title,
+        p_answer: answer,
+      },
+    );
+    if (prepareError) {
+      throw new Error(`Could not save the product-help answer draft: ${prepareError.message}`);
+    }
+    const draft = prepared[0];
+    if (!draft) throw new Error("The product-help service did not confirm the saved draft.");
+    return {
+      prepared: true,
+      requestId: draft.request_id,
+      draftTitle: draft.draft_title,
+      draftAnswer: draft.draft_answer,
+      draftCreatedAt: draft.draft_created_at,
+      requiresAdminConfirmation: true,
+      sentToUser: false,
+    };
+  }
+
+  if (name === "confirm_product_help_answer") {
+    if (role !== "admin") {
+      throw new AccountAiToolError("Only administrators can confirm product-help answers.", 403);
+    }
+    if (!sourceMessageId || !uuidPattern.test(sourceMessageId)) {
+      throw new AccountAiToolError("The administrator confirmation message could not be verified.", 400);
+    }
+    const requestId = requiredText(args.request_id, "Request ID", 36);
+    if (!uuidPattern.test(requestId)) {
+      throw new AccountAiToolError("The product-help request ID is invalid.", 400);
+    }
+    const { data: answered, error: answerError } = await client.rpc(
+      "confirm_product_help_answer",
+      {
+        p_admin_user_id: actorId,
+        p_request_id: requestId,
+        p_confirmation_message_id: sourceMessageId,
+      },
+    );
+    if (answerError) {
+      throw new Error(`Could not deliver the confirmed product-help answer: ${answerError.message}`);
+    }
+    const delivery = answered[0];
+    if (!delivery) throw new Error("The answer service did not confirm delivery.");
+    if (delivery.was_existing) {
+      return {
+        delivered: true,
+        alreadyAnswered: true,
+        answerMessageId: delivery.answer_message_id,
+      };
+    }
+    if (typeof delivery.answer !== "string" || !delivery.answer.trim()) {
+      throw new Error("The confirmed answer service returned an invalid answer.");
+    }
+
+    const { data: activeSessions, error: sessionsError } = await client
+      .from("account_sessions")
+      .select("user_id")
+      .eq("user_id", delivery.user_id)
+      .eq("path", "/")
+      .eq("is_active", true)
+      .gt("last_seen_at", new Date(Date.now() - 45_000).toISOString());
+    if (sessionsError) {
+      console.error("Product-help answer was delivered to the user's chat, but their active session could not be checked.", sessionsError);
+      return {
+        delivered: true,
+        answerMessageId: delivery.answer_message_id,
+        pushWarning: sessionsError.message,
+      };
+    }
+    if (activeSessions.length > 0) {
+      return { delivered: true, answerMessageId: delivery.answer_message_id, pushSent: false };
+    }
+    try {
+      const push = await sendPushToAccount(
+        delivery.user_id,
+        "CheyaAPP support answered",
+        delivery.answer.slice(0, 280),
+      );
+      return { delivered: true, answerMessageId: delivery.answer_message_id, push };
+    } catch (error) {
+      console.error("Product-help answer was delivered to the user's chat, but push delivery failed.", error);
+      return {
+        delivered: true,
+        answerMessageId: delivery.answer_message_id,
+        pushWarning: error instanceof Error ? error.message : "Unknown push service error.",
+      };
+    }
+  }
+
   if (name === "send_message_to_admin") {
     if (role !== "user") {
       throw new AccountAiToolError("Only user accounts can send a message to the administrator.", 403);
@@ -744,8 +1135,17 @@ export async function executeAccountAiTool(
   name: string,
   input: unknown,
   sourceMessageId?: string,
+  options: { rawProductHelpForServerModel?: boolean } = {},
 ): Promise<unknown> {
   const serviceClient = createServiceRoleClient();
   const role = await accountRole(serviceClient, actorId);
-  return executeAuthorizedAction(serviceClient, actorId, role, name, input, sourceMessageId);
+  return executeAuthorizedAction(
+    serviceClient,
+    actorId,
+    role,
+    name,
+    input,
+    sourceMessageId,
+    options.rawProductHelpForServerModel,
+  );
 }

@@ -13,6 +13,7 @@ import {
   ChevronDown,
   ChevronRight,
   Copy,
+  Crop,
   Flashlight,
   FlashlightOff,
   Files,
@@ -50,7 +51,10 @@ import sendMessageSound from "../assets/sounds/send.mp3";
 import receivedMessageSound from "../assets/sounds/received.mp3";
 import { AccountLogin } from "./AccountLogin";
 import { ErrorPage } from "./ErrorPage";
+import { LegalPage } from "./LegalPage";
 import { ActionToast } from "./components/ActionToast";
+import { BugReportDialog } from "./components/BugReportDialog";
+import { ImageCropper } from "./components/ImageCropper";
 import { LinkPreviews } from "./components/LinkPreviews";
 import { PublicHome } from "./PublicHome";
 import {
@@ -61,12 +65,14 @@ import {
   MAX_CHAT_MESSAGE_ATTACHMENT_BYTES,
   CHAT_ATTACHMENT_RETENTION_MS,
   MAX_GEMINI_CONTEXT_ATTACHMENTS,
+  VOICE_NOTE_TRANSCRIPT_MARKER,
   formatChatAttachmentSize,
   isChatAttachmentExpired,
   loadChatAttachmentDrafts,
   removeChatAttachmentDraft,
   resolveChatAttachmentMimeType,
   saveChatAttachmentDraft,
+  getChatAttachmentIdentityHash,
   type ChatAttachmentRegistration,
 } from "./lib/chat-attachments";
 import { preprocessChatAttachment } from "./lib/chat-attachment-processing";
@@ -103,6 +109,8 @@ import {
 } from "./lib/account-ai-actions";
 import { getSharedAttachmentId } from "./lib/chat-attachment-sharing";
 import {
+  clearGeminiSpeechCache,
+  deleteChatWithGeminiSpeech,
   prepareAssistantSpeech,
 } from "./lib/tts-playback";
 import {
@@ -293,6 +301,57 @@ function formatMediaTime(seconds: number): string {
   return `${Math.floor(wholeSeconds / 60)}:${String(wholeSeconds % 60).padStart(2, "0")}`;
 }
 
+const VOICE_NOTE_SAMPLE_RATE = 24_000;
+
+function encodeVoiceNoteWav(chunks: Int16Array[]): Blob {
+  const sampleCount = chunks.reduce((total, chunk) => total + chunk.length, 0);
+  if (sampleCount === 0) {
+    throw new Error("The recording is empty. Please try recording again.");
+  }
+
+  const sampleRate = VOICE_NOTE_SAMPLE_RATE;
+  const dataSize = sampleCount * 2;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+  const writeAscii = (offset: number, value: string) => {
+    for (let index = 0; index < value.length; index += 1) {
+      view.setUint8(offset + index, value.charCodeAt(index));
+    }
+  };
+
+  writeAscii(0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeAscii(8, "WAVE");
+  writeAscii(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeAscii(36, "data");
+  view.setUint32(40, dataSize, true);
+
+  let peak = 0;
+  for (const chunk of chunks) {
+    for (const sample of chunk) {
+      peak = Math.max(peak, Math.abs(sample));
+    }
+  }
+  const gain = peak > 0 ? 32767 / peak : 1;
+  let outputOffset = 44;
+  for (const chunk of chunks) {
+    for (const sample of chunk) {
+      const normalizedSample = Math.max(-32768, Math.min(32767, Math.round(sample * gain)));
+      view.setInt16(outputOffset, normalizedSample, true);
+      outputOffset += 2;
+    }
+  }
+
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
 function MediaPreview({
   src,
   fileName,
@@ -300,6 +359,7 @@ function MediaPreview({
   isVideo,
   isLoading = false,
   downloadHref,
+  onCrop,
   onClose,
 }: {
   src: string;
@@ -308,6 +368,7 @@ function MediaPreview({
   isVideo: boolean;
   isLoading?: boolean;
   downloadHref?: string;
+  onCrop?: () => void;
   onClose: () => void;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -575,6 +636,16 @@ function MediaPreview({
           <p className="text-xs text-white/60">{formatChatAttachmentSize(fileSize)}</p>
         </div>
         <div className="flex shrink-0 items-center gap-2">
+          {!isVideo && onCrop && (
+            <button
+              type="button"
+              onClick={onCrop}
+              className="flex h-9 items-center gap-2 rounded-full border border-white/20 px-3 text-xs font-medium hover:bg-white/10"
+            >
+              <Crop aria-hidden="true" className="size-4" />
+              Crop
+            </button>
+          )}
           {downloadHref && (
             <a
               href={downloadHref}
@@ -708,15 +779,188 @@ function MediaPreview({
   );
 }
 
+const ChatMessageAudioNote = memo(function ChatMessageAudioNote({
+  attachment,
+  expired,
+  isProcessing = false,
+  getPreviewUrl,
+  size = "default",
+}: {
+  attachment: ChatAttachment;
+  expired: boolean;
+  isProcessing?: boolean;
+  getPreviewUrl: (attachment: ChatAttachment, refresh?: boolean) => Promise<string>;
+  size?: "default" | "large";
+}) {
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const [audioUrl, setAudioUrl] = useState("");
+  const [duration, setDuration] = useState(0);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const lastRefreshedSourceRef = useRef("");
+  const pendingPlaybackRef = useRef(false);
+
+  useEffect(() => {
+    if (expired) return;
+    let cancelled = false;
+    setIsLoading(true);
+    void getPreviewUrl(attachment)
+      .then((url) => {
+        if (!cancelled) {
+          setAudioUrl(url);
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) console.warn("Could not load voice note playback URL.", error);
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+      audioRef.current?.pause();
+    };
+  }, [attachment.id, expired, getPreviewUrl]);
+
+  async function togglePlayback() {
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (audio.paused) {
+      try {
+        if (!audioUrl) {
+          setIsLoading(true);
+          pendingPlaybackRef.current = true;
+          const refreshedUrl = await getPreviewUrl(attachment, true);
+          setAudioUrl(refreshedUrl);
+          return;
+        }
+        await audio.play();
+      } catch (error) {
+        console.warn("Could not play the voice note.", error);
+        void refreshAudioUrl(true);
+      }
+    } else {
+      audio.pause();
+    }
+  }
+
+  async function refreshAudioUrl(resumePlayback = false) {
+    if (expired || lastRefreshedSourceRef.current === audioUrl) return;
+    lastRefreshedSourceRef.current = audioUrl;
+    setIsLoading(true);
+    pendingPlaybackRef.current = resumePlayback;
+    try {
+      const refreshedUrl = await getPreviewUrl(attachment, true);
+      setAudioUrl(refreshedUrl);
+    } catch (error) {
+      console.warn("Could not refresh the voice note playback URL.", error);
+    } finally {
+      setIsLoading(false);
+    }
+  }
+
+  const waveform = [8, 15, 10, 22, 14, 29, 18, 25, 12, 20, 31, 16, 24, 11, 19, 28, 14, 23, 9, 17, 26, 13, 21, 30, 12, 18, 25, 10, 22, 15, 28, 12, 20, 9, 24, 16];
+  const progress = duration > 0 ? currentTime / duration : 0;
+
+  return (
+    <div
+      dir="ltr"
+      className={`user-message-bubble col-span-full flex w-full ${
+        size === "large" ? "max-w-[360px]" : "max-w-[320px]"
+      } items-center gap-2 rounded-2xl bg-[#28292e] px-2.5 py-2 text-white shadow-sm ${
+        expired ? "opacity-65" : ""
+      }`}
+      aria-label={`Voice message, ${formatChatAttachmentSize(attachment.size_bytes)}`}
+    >
+      {audioUrl && (
+        <audio
+          ref={audioRef}
+          src={audioUrl}
+          preload="metadata"
+          className="hidden"
+          onLoadedMetadata={(event) => {
+            event.currentTarget.volume = 1;
+            setDuration(event.currentTarget.duration || 0);
+          }}
+          onDurationChange={(event) => setDuration(event.currentTarget.duration || 0)}
+          onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
+          onPlay={() => setIsPlaying(true)}
+          onPause={() => setIsPlaying(false)}
+          onEnded={() => {
+            setIsPlaying(false);
+            setCurrentTime(0);
+          }}
+          onCanPlay={() => {
+            setIsLoading(false);
+            if (!pendingPlaybackRef.current) return;
+            pendingPlaybackRef.current = false;
+            void audioRef.current?.play().catch((error: unknown) => {
+              console.warn("Could not start voice note playback.", error);
+            });
+          }}
+          onError={() => void refreshAudioUrl(isPlaying)}
+        />
+      )}
+      <button
+        type="button"
+        aria-label={
+          isProcessing
+            ? "Sending voice message"
+            : isLoading
+            ? "Loading voice message"
+            : isPlaying
+              ? "Pause voice message"
+              : "Play voice message"
+        }
+        disabled={expired || isLoading || isProcessing}
+        onClick={() => void togglePlayback()}
+        className="flex size-9 shrink-0 items-center justify-center rounded-full bg-[#a77bd0] text-white transition hover:bg-[#b78ce0] disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        {isLoading || isProcessing ? (
+          <LoaderCircle aria-hidden="true" className="size-5 animate-spin" />
+        ) : isPlaying ? (
+          <Pause aria-hidden="true" className="size-5 fill-current" />
+        ) : (
+          <Play aria-hidden="true" className="size-5 fill-current" />
+        )}
+      </button>
+      <div className="min-w-0 flex-1">
+        <div
+          role="img"
+          aria-label="Audio waveform"
+          className="flex h-7 items-center gap-[3px] overflow-hidden"
+        >
+          {waveform.map((height, index) => (
+            <span
+              key={index}
+              className={`w-[3px] shrink-0 rounded-full ${
+                index / waveform.length <= progress ? "bg-[#c39ae8]" : "bg-white/45"
+              }`}
+              style={{ height: `${Math.round(height * 0.75)}px` }}
+            />
+          ))}
+        </div>
+        <div className="mt-1 flex items-center justify-between gap-2 text-xs text-white/75">
+          <span className="tabular-nums">{formatMediaTime(isPlaying ? currentTime : duration)}</span>
+          <span>{formatChatAttachmentSize(attachment.size_bytes)}</span>
+        </div>
+      </div>
+    </div>
+  );
+});
+
 const ChatMessageAttachmentTile = memo(function ChatMessageAttachmentTile({
   attachment,
   expired,
+  isProcessing = false,
   onOpen,
   getPreviewUrl,
   size = "default",
 }: {
   attachment: ChatAttachment;
   expired: boolean;
+  isProcessing?: boolean;
   onOpen: (attachment: ChatAttachment) => void;
   getPreviewUrl: (attachment: ChatAttachment) => Promise<string>;
   size?: "default" | "large";
@@ -725,7 +969,20 @@ const ChatMessageAttachmentTile = memo(function ChatMessageAttachmentTile({
   const [previewError, setPreviewError] = useState(false);
   const isImage = attachment.mime_type.startsWith("image/");
   const isVideo = attachment.mime_type.startsWith("video/");
+  const isAudio = attachment.mime_type.startsWith("audio/");
   const isMedia = isImage || isVideo;
+
+  if (isAudio) {
+    return (
+      <ChatMessageAudioNote
+        attachment={attachment}
+        expired={expired}
+        isProcessing={isProcessing}
+        getPreviewUrl={getPreviewUrl}
+        size={size}
+      />
+    );
+  }
 
   useEffect(() => {
     if (!isMedia || expired) return;
@@ -1019,6 +1276,13 @@ interface ChatSubmissionPayload {
   barcodeReadings: AiBarcodeReading[];
 }
 
+const VOICE_NOTE_MESSAGE_TEXT =
+  "Please listen to the attached voice note and respond to its content.";
+
+function isVoiceNoteMessage(message: ChatMessage): boolean {
+  return Boolean(message.attachments?.some((attachment) => attachment.mime_type.startsWith("audio/")));
+}
+
 interface FailedChatSubmission {
   error: string;
   retryable: boolean;
@@ -1054,7 +1318,25 @@ function loadChatNotificationSound(source: string): Promise<AudioBuffer> {
       if (!response.ok) throw new Error(`Could not load notification sound (${response.status}).`);
       return response.arrayBuffer();
     })
-    .then((data) => context.decodeAudioData(data));
+    .then((data) => context.decodeAudioData(data))
+    .then((buffer) => {
+      let peak = 0;
+      for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
+        for (const sample of buffer.getChannelData(channel)) {
+          peak = Math.max(peak, Math.abs(sample));
+        }
+      }
+      if (peak > 0) {
+        const normalizationGain = 0.95 / peak;
+        for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
+          const samples = buffer.getChannelData(channel);
+          for (let index = 0; index < samples.length; index += 1) {
+            samples[index] = Math.max(-0.95, Math.min(0.95, samples[index] * normalizationGain));
+          }
+        }
+      }
+      return buffer;
+    });
   chatNotificationAudioBuffers.set(source, buffer);
   void buffer.catch(() => chatNotificationAudioBuffers.delete(source));
   return buffer;
@@ -1098,17 +1380,20 @@ interface PendingChatAttachment {
   id: string;
   file: File;
   mimeType: string;
+  isAutoSentVoiceNote?: boolean;
   draftSavedAt?: number;
   isUploading: boolean;
   isBlocked: boolean;
   isPreprocessed?: boolean;
+  identitySha256?: string;
+  processingStage?: "upload";
   uploadError: string | null;
   uploaded: ChatAttachment | null;
 }
 
 interface AttachmentView {
   index: number;
-  mode: "media" | "editor";
+  mode: "media" | "editor" | "crop";
 }
 
 function messageDraftStorageKey(userId: string): string {
@@ -1415,6 +1700,7 @@ export function App() {
   const [ttsPlayback, setTtsPlayback] = useState<TtsPlayback | null>(null);
   const [isTtsErrorExpanded, setIsTtsErrorExpanded] = useState(false);
   const [isTtsWarningCopied, setIsTtsWarningCopied] = useState(false);
+  const [isBugReportOpen, setIsBugReportOpen] = useState(false);
   const [reportTarget, setReportTarget] = useState<ReportTarget | null>(null);
   const reportDetailsRef = useRef("");
   const reportCharacterCountRef = useRef<HTMLParagraphElement>(null);
@@ -1461,6 +1747,11 @@ export function App() {
   }
   const [isPreparingAttachments, setIsPreparingAttachments] = useState(false);
   const [isCameraOpen, setIsCameraOpen] = useState(false);
+  const [isRecordingVoice, setIsRecordingVoice] = useState(false);
+  const [voiceRecordingSeconds, setVoiceRecordingSeconds] = useState(0);
+  const [voiceRecordingWaveform, setVoiceRecordingWaveform] = useState<number[]>(
+    () => Array.from({ length: 36 }, () => 4),
+  );
   const [cameraFacing, setCameraFacing] = useState<"environment" | "user">("environment");
   const [isCameraSwitchSupported, setIsCameraSwitchSupported] = useState(false);
   const [isCameraTorchSupported, setIsCameraTorchSupported] = useState(false);
@@ -1501,6 +1792,18 @@ export function App() {
   const jobRefreshTimerRef = useRef<number | null>(null);
   const cameraVideoRef = useRef<HTMLVideoElement>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
+  const voiceRecorderRef = useRef<{ stop: () => void } | null>(null);
+  const voiceRecordingStreamRef = useRef<MediaStream | null>(null);
+  const voiceRecordingAudioContextRef = useRef<AudioContext | null>(null);
+  const voiceRecordingAnalyserRef = useRef<AnalyserNode | null>(null);
+  const voiceRecordingProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const voiceRecordingGainRef = useRef<GainNode | null>(null);
+  const voiceRecordingPcmChunksRef = useRef<Int16Array[]>([]);
+  const voiceRecordingStartAtRef = useRef(0);
+  const voiceRecordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const voiceRecordingCancelledRef = useRef(false);
+  const autoSendVoiceMessageIdRef = useRef<string | null>(null);
+  const localVoicePreviewUrlsRef = useRef(new Map<string, string>());
   const preparingAttachmentsRef = useRef(false);
   const cameraHistoryEntryRef = useRef(false);
   const messageDraftRef = useRef("");
@@ -1571,6 +1874,7 @@ export function App() {
   const deleteConfirmationResolverRef = useRef<((approved: boolean) => void) | null>(null);
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const longPressStartRef = useRef<{ x: number; y: number } | null>(null);
+  const longPressTriggeredRef = useRef(false);
   const wasSettingsRef = useRef(window.location.pathname === "/settings");
   const activeChatJob =
     chatJobs.find((job) => job.status === "queued" || job.status === "processing") ??
@@ -2780,6 +3084,15 @@ export function App() {
     () => () => {
       for (const url of mediaPreviewUrlsRef.current.values()) URL.revokeObjectURL(url);
       mediaPreviewUrlsRef.current.clear();
+      for (const url of localVoicePreviewUrlsRef.current.values()) URL.revokeObjectURL(url);
+      localVoicePreviewUrlsRef.current.clear();
+      voiceRecordingCancelledRef.current = true;
+      if (voiceRecordingTimerRef.current) clearInterval(voiceRecordingTimerRef.current);
+      voiceRecorderRef.current?.stop();
+      voiceRecordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+      void voiceRecordingAudioContextRef.current?.close().catch((error: unknown) => {
+        console.warn("Could not close the voice recording audio context.", error);
+      });
     },
     [],
   );
@@ -2826,9 +3139,20 @@ export function App() {
 
   function displayedMessageText(chatMessage: ChatMessage): string {
     const versionNumber = displayedVersionNumber(chatMessage);
-    const content =
+    let content =
       messageVersions[chatMessage.id]?.find((item) => item.version_number === versionNumber)
         ?.content ?? chatMessage.text;
+    if (isVoiceNoteMessage(chatMessage)) {
+      if (content === VOICE_NOTE_MESSAGE_TEXT) return "";
+      const transcriptStart = content.lastIndexOf(`\n\n${VOICE_NOTE_TRANSCRIPT_MARKER}`);
+      if (transcriptStart >= 0) {
+        content = `${content.slice(0, transcriptStart)}\n${content.slice(
+          transcriptStart + 2 + VOICE_NOTE_TRANSCRIPT_MARKER.length,
+        )}`;
+      } else if (content.startsWith(VOICE_NOTE_TRANSCRIPT_MARKER)) {
+        content = content.slice(VOICE_NOTE_TRANSCRIPT_MARKER.length);
+      }
+    }
     return chatMessage.role === "assistant"
       ? normalizeUserFacingMarkdown(content)
       : content;
@@ -3133,11 +3457,7 @@ export function App() {
               : item,
           ),
         );
-        void uploadPendingAttachment({
-          ...attachment,
-          isUploading: true,
-          uploadError: null,
-        });
+        void retryPendingAttachment(attachment);
       }
     };
     window.addEventListener("online", retryFailedUploads);
@@ -3232,7 +3552,7 @@ export function App() {
 
   useEffect(() => {
     const anchorId = pendingAssistantAnchorRef.current;
-    if (!anchorId) return;
+    if (!anchorId || isSending) return;
     const anchorIndex = messages.findIndex((item) => item.id === anchorId);
     if (anchorIndex < 0) return;
     const response = messages.slice(anchorIndex + 1).find((item) => item.role === "assistant");
@@ -3243,7 +3563,7 @@ export function App() {
       playChatSound(receivedMessageSound);
     }
     setTypingAssistant({ id: response.id, content: displayedMessageText(response) });
-  }, [messages]);
+  }, [isSending, messages]);
 
   useEffect(() => {
     let isMounted = true;
@@ -3333,6 +3653,33 @@ export function App() {
           githubUsername,
           role: accountProfile.role,
         });
+        const accountAge = Date.now() - Date.parse(session.user.created_at);
+        if (Number.isFinite(accountAge) && accountAge >= 0 && accountAge <= 24 * 60 * 60 * 1000) {
+          const { access_token: authToken } = session;
+          void fetch("/api/account-welcome-email", {
+            method: "POST",
+            headers: { Authorization: "Bearer " + authToken },
+          })
+            .then(async (response) => {
+              if (!response.ok) {
+                const payload: unknown = await response.json().catch(() => null);
+                const message =
+                  typeof payload === "object" &&
+                  payload !== null &&
+                  "statusMessage" in payload &&
+                  typeof payload.statusMessage === "string"
+                    ? payload.statusMessage
+                    : `Welcome email request failed (${response.status}).`;
+                console.error(message);
+              }
+            })
+            .catch((error: unknown) => {
+              console.error(
+                "Could not request the new-account welcome email.",
+                error instanceof Error ? error.message : "Network request failed.",
+              );
+            });
+        }
         clearPendingAuthProvider();
       } catch (error) {
         if (!isMounted) return;
@@ -3595,7 +3942,7 @@ export function App() {
           loadChatAttachmentDrafts(authenticatedUserId),
           authClient
             .from("chat_message_attachments")
-            .select("id, user_id, message_id, storage_path, file_name, mime_type, size_bytes, created_at, expires_at, deleted_at")
+            .select("id, user_id, message_id, storage_path, file_name, mime_type, size_bytes, identity_sha256, created_at, expires_at, deleted_at")
             .is("message_id", null)
             .is("deleted_at", null)
             .gt("expires_at", new Date().toISOString())
@@ -3611,7 +3958,7 @@ export function App() {
           localIds.length > 0
             ? await authClient
                 .from("chat_message_attachments")
-                .select("id, user_id, message_id, storage_path, file_name, mime_type, size_bytes, created_at, expires_at, deleted_at")
+                .select("id, user_id, message_id, storage_path, file_name, mime_type, size_bytes, identity_sha256, created_at, expires_at, deleted_at")
                 .in("id", localIds)
             : { data: [], error: null };
         if (localReferencesResult.error) {
@@ -3658,6 +4005,8 @@ export function App() {
             file: draft.file,
             mimeType: draft.mimeType,
             draftSavedAt: draft.savedAt,
+            identitySha256: draft.identitySha256 ?? uploaded?.identity_sha256 ?? undefined,
+            processingStage: uploaded ? undefined : "upload",
             isUploading: !uploaded,
             isBlocked: false,
             uploadError: null,
@@ -3693,6 +4042,7 @@ export function App() {
             file,
             mimeType: row.mime_type,
             draftSavedAt: Date.parse(row.created_at),
+            identitySha256: row.identity_sha256 ?? undefined,
             isUploading: false,
             isBlocked: false,
             uploadError: null,
@@ -3709,7 +4059,9 @@ export function App() {
         setAttachedMedia(drafts);
         drafts
           .filter((attachment) => attachment.isUploading)
-          .forEach((attachment) => void uploadPendingAttachment(attachment));
+          .forEach((attachment) => {
+            void uploadPendingAttachment(attachment);
+          });
       } catch (error) {
         if (isMounted) {
           setSendError(
@@ -4495,7 +4847,14 @@ export function App() {
   }
 
   async function markAllInboxItemsRead() {
-    if (!authClient || !authenticatedUserId || isMarkingInboxRead || unreadInboxCount === 0) return;
+    if (
+      !authClient ||
+      !authenticatedUserId ||
+      isMarkingInboxRead ||
+      unreadInboxMessageCount === 0
+    ) {
+      return;
+    }
     setIsMarkingInboxRead(true);
     setInboxError("");
     const readAt = new Date().toISOString();
@@ -4670,10 +5029,12 @@ export function App() {
   }
 
   const getAttachmentPreviewUrl = useCallback(
-    async (attachment: ChatAttachment): Promise<string> => {
+    async (attachment: ChatAttachment, refresh = false): Promise<string> => {
+      const localPreview = localVoicePreviewUrlsRef.current.get(attachment.id);
+      if (localPreview) return localPreview;
       const cached = attachmentPreviewUrlCacheRef.current.get(attachment.id);
-      if (cached && cached.expiresAt > Date.now()) return cached.url;
-      const pending = attachmentPreviewRequestRef.current.get(attachment.id);
+      if (!refresh && cached && cached.expiresAt > Date.now()) return cached.url;
+      const pending = refresh ? undefined : attachmentPreviewRequestRef.current.get(attachment.id);
       if (pending) return pending;
 
       const request = (async () => {
@@ -4725,7 +5086,7 @@ export function App() {
 
   async function registerChatAttachment(
     attachment: PendingChatAttachment,
-  ): Promise<ChatAttachment> {
+  ): Promise<ChatAttachmentRegistration> {
     if (!authClient) throw new Error("Sign in before uploading attachments.");
     const {
       data: { user },
@@ -4755,6 +5116,7 @@ export function App() {
           mimeType: attachment.mimeType,
           sizeBytes: attachment.file.size,
           sha256,
+          identitySha256: attachment.identitySha256 ?? sha256,
         }),
       });
       const payload: unknown = await response.json().catch(() => null);
@@ -4782,10 +5144,14 @@ export function App() {
       if (!("attachment" in payload) || !isChatAttachment(payload.attachment)) {
         throw new Error("The attachment service returned invalid attachment metadata.");
       }
+      if (!("storagePath" in payload) || typeof payload.storagePath !== "string") {
+        throw new Error("The attachment service did not return a stored-file location.");
+      }
       return {
         uploadRequired: false,
         reused: payload.reused,
         attachment: payload.attachment,
+        storagePath: payload.storagePath,
       };
     }
 
@@ -4812,7 +5178,204 @@ export function App() {
     if (registration.uploadRequired || !registration.attachment) {
       throw new Error("The attachment service did not finish registering the file.");
     }
-    return registration.attachment;
+    return registration;
+  }
+
+  async function findReusableAttachment(
+    attachment: PendingChatAttachment,
+    identitySha256: string,
+  ): Promise<ChatAttachmentRegistration> {
+    if (!authClient) throw new Error("Sign in before looking up uploaded attachments.");
+    const {
+      data: { user },
+      error: userError,
+    } = await authClient.auth.getUser();
+    if (userError) throw userError;
+    if (!user || user.is_anonymous) throw new Error("Sign in before looking up uploaded attachments.");
+    const digest = await crypto.subtle.digest("SHA-256", await attachment.file.arrayBuffer());
+    const sha256 = Array.from(new Uint8Array(digest), (byte) =>
+      byte.toString(16).padStart(2, "0"),
+    ).join("");
+    const accessToken = await getAccessToken();
+    const response = await fetch("/api/chat-attachments", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        action: "lookup",
+        id: attachment.id,
+        fileName: attachment.file.name,
+        mimeType: attachment.mimeType,
+        sizeBytes: attachment.file.size,
+        sha256,
+        identitySha256,
+      }),
+    });
+    const payload: unknown = await response.json().catch(() => null);
+    if (!response.ok) {
+      const message =
+        typeof payload === "object" &&
+        payload !== null &&
+        "statusMessage" in payload &&
+        typeof payload.statusMessage === "string"
+          ? payload.statusMessage
+          : `Could not check for a previously uploaded file (${response.status}).`;
+      throw new Error(message);
+    }
+    if (
+      typeof payload !== "object" ||
+      payload === null ||
+      !("uploadRequired" in payload) ||
+      typeof payload.uploadRequired !== "boolean" ||
+      !("reused" in payload) ||
+      typeof payload.reused !== "boolean"
+    ) {
+      throw new Error("The attachment service returned an invalid duplicate lookup.");
+    }
+    if (payload.uploadRequired) return { uploadRequired: true, reused: false };
+    if (
+      !("attachment" in payload) ||
+      !isChatAttachment(payload.attachment) ||
+      !("storagePath" in payload) ||
+      typeof payload.storagePath !== "string"
+    ) {
+      throw new Error("The attachment service returned invalid reused-file metadata.");
+    }
+    return {
+      uploadRequired: false,
+      reused: payload.reused,
+      attachment: payload.attachment,
+      storagePath: payload.storagePath,
+    };
+  }
+
+  async function retryPendingAttachment(attachment: PendingChatAttachment) {
+    void uploadPendingAttachment({ ...attachment, isUploading: true, uploadError: null });
+  }
+
+  async function uploadImageAttachment(attachment: PendingChatAttachment) {
+    const updateDraft = (update: Partial<PendingChatAttachment>) => {
+      setAttachedMedia((current) =>
+        current.map((item) => (item.id === attachment.id ? { ...item, ...update } : item)),
+      );
+    };
+    try {
+      if (cancelledAttachmentsRef.current.has(attachment.id)) {
+        cancelledAttachmentsRef.current.delete(attachment.id);
+        return;
+      }
+      const identitySha256 =
+        attachment.identitySha256 ??
+        (await getChatAttachmentIdentityHash(attachment.file, attachment.mimeType));
+      const identified = {
+        ...attachment,
+        identitySha256,
+        processingStage: "upload" as const,
+      };
+      if (cancelledAttachmentsRef.current.has(attachment.id)) {
+        cancelledAttachmentsRef.current.delete(attachment.id);
+        return;
+      }
+      updateDraft({ identitySha256, processingStage: "upload" });
+      if (!authUser) throw new Error("Sign in before saving a photo.");
+      await saveChatAttachmentDraft(
+        authUser.id,
+        attachment.id,
+        attachment.file,
+        attachment.mimeType,
+        attachment.draftSavedAt,
+        { identitySha256, processingStage: "upload" },
+      );
+      prepareAiBarcodeRead(attachment);
+
+      const reusable = await findReusableAttachment(identified, identitySha256);
+      if (cancelledAttachmentsRef.current.has(attachment.id)) {
+        if (!reusable.uploadRequired) {
+          await deleteStoredAttachments([attachment.id]);
+          if (authUser) await removeChatAttachmentDraft(authUser.id, attachment.id);
+        }
+        cancelledAttachmentsRef.current.delete(attachment.id);
+        return;
+      }
+      if (!reusable.uploadRequired) {
+        if (!authClient || !reusable.attachment || !reusable.storagePath) {
+          throw new Error("The attachment service returned incomplete reused-photo data.");
+        }
+        const { data: storedBlob, error } = await authClient.storage
+          .from(CHAT_ATTACHMENT_BUCKET)
+          .download(reusable.storagePath);
+        if (error) throw new Error(`Could not load the previously saved photo: ${error.message}`);
+        if (storedBlob.size !== reusable.attachment.size_bytes) {
+          throw new Error("The previously saved photo did not match its stored size.");
+        }
+        if (cancelledAttachmentsRef.current.has(attachment.id)) {
+          await deleteStoredAttachments([attachment.id]);
+          await removeChatAttachmentDraft(authUser.id, attachment.id);
+          cancelledAttachmentsRef.current.delete(attachment.id);
+          return;
+        }
+        const storedFile = new File([storedBlob], reusable.attachment.file_name, {
+          type: reusable.attachment.mime_type,
+          lastModified: Date.parse(reusable.attachment.created_at) || Date.now(),
+        });
+        await saveChatAttachmentDraft(
+          authUser.id,
+          attachment.id,
+          storedFile,
+          reusable.attachment.mime_type,
+          attachment.draftSavedAt,
+          { identitySha256 },
+        );
+        updateDraft({
+          file: storedFile,
+          mimeType: reusable.attachment.mime_type,
+          isPreprocessed: true,
+          processingStage: undefined,
+          isUploading: false,
+          uploadError: null,
+          uploaded: reusable.attachment,
+        });
+        return;
+      }
+
+      const ready = {
+        ...identified,
+        isPreprocessed: false,
+        processingStage: "upload" as const,
+        isUploading: true,
+        uploadError: null,
+      };
+      updateDraft(ready);
+      await saveChatAttachmentDraft(
+        authUser.id,
+        attachment.id,
+        attachment.file,
+        attachment.mimeType,
+        attachment.draftSavedAt,
+        { identitySha256, processingStage: "upload" },
+      );
+      await uploadPendingAttachment(ready);
+    } catch (error) {
+      if (cancelledAttachmentsRef.current.has(attachment.id)) {
+        cancelledAttachmentsRef.current.delete(attachment.id);
+        setSendError(
+          error instanceof Error
+            ? `The removed photo could not be fully cleaned up: ${error.message}`
+            : "The removed photo could not be fully cleaned up.",
+        );
+        return;
+      }
+      const message =
+        error instanceof Error ? error.message : `Could not save "${attachment.file.name}".`;
+      updateDraft({
+        isUploading: false,
+        processingStage: "upload",
+        uploadError: message,
+      });
+      setSendError(message);
+    }
   }
 
   async function uploadPendingAttachment(
@@ -4836,7 +5399,7 @@ export function App() {
           throw new Error("The attachment was removed from the composer.");
         }
         if (processed.oversized) {
-          const message = `This file cannot be safely reduced to the AI's ${formatChatAttachmentSize(MAX_CHAT_ATTACHMENT_BYTES)} per-file limit without risking media quality, so it was not uploaded.`;
+          const message = `This file cannot be safely reduced to the ${formatChatAttachmentSize(MAX_CHAT_ATTACHMENT_BYTES)} per-file upload limit without risking media quality, so it was not uploaded.`;
           setAttachedMedia((current) =>
             current.map((item) =>
               item.id === attachment.id
@@ -4868,6 +5431,22 @@ export function App() {
           ),
         );
       }
+      if (uploadable.mimeType.startsWith("image/") && !uploadable.identitySha256) {
+        uploadable = {
+          ...uploadable,
+          identitySha256: await getChatAttachmentIdentityHash(
+            uploadable.file,
+            uploadable.mimeType,
+          ),
+        };
+        setAttachedMedia((current) =>
+          current.map((item) =>
+            item.id === uploadable.id
+              ? { ...item, identitySha256: uploadable.identitySha256 }
+              : item,
+          ),
+        );
+      }
       prepareAiBarcodeRead(uploadable);
       await saveChatAttachmentDraft(
         authUser.id,
@@ -4875,11 +5454,59 @@ export function App() {
         uploadable.file,
         uploadable.mimeType,
         uploadable.draftSavedAt,
+        {
+          identitySha256: uploadable.identitySha256,
+          processingStage: "upload",
+        },
       );
       if (cancelledAttachmentsRef.current.has(uploadable.id)) {
         throw new Error("The attachment was removed from the composer.");
       }
-      const uploaded = await registerChatAttachment(uploadable);
+      const registration = await registerChatAttachment(uploadable);
+      if (registration.uploadRequired || !registration.attachment || !registration.storagePath) {
+        throw new Error("The attachment service did not finish registering the file.");
+      }
+      let storedFile = uploadable.file;
+      let storedMimeType = uploadable.mimeType;
+      if (
+        registration.reused &&
+        uploadable.mimeType.startsWith("image/") &&
+        registration.storagePath !== `${authUser.id}/${uploadable.id}`
+      ) {
+        if (!authClient) throw new Error("The account service is not available.");
+        const { data: blob, error: downloadError } = await authClient.storage
+          .from(CHAT_ATTACHMENT_BUCKET)
+          .download(registration.storagePath);
+        if (downloadError) {
+          throw new Error(`Could not load the previously stored photo: ${downloadError.message}`);
+        }
+        storedMimeType = registration.attachment.mime_type;
+        storedFile = new File([blob], registration.attachment.file_name, {
+          type: storedMimeType,
+          lastModified: Date.parse(registration.attachment.created_at) || Date.now(),
+        });
+        await saveChatAttachmentDraft(
+          authUser.id,
+          uploadable.id,
+          storedFile,
+          storedMimeType,
+          uploadable.draftSavedAt,
+          {
+            identitySha256: uploadable.identitySha256,
+          },
+        );
+      }
+      await saveChatAttachmentDraft(
+        authUser.id,
+        uploadable.id,
+        storedFile,
+        storedMimeType,
+        uploadable.draftSavedAt,
+        {
+          identitySha256: uploadable.identitySha256,
+        },
+      );
+      const uploaded = registration.attachment;
       if (cancelledAttachmentsRef.current.has(uploadable.id)) {
         await deleteStoredAttachments([uploadable.id]);
         await removeChatAttachmentDraft(authUser.id, uploadable.id);
@@ -4889,7 +5516,16 @@ export function App() {
       setAttachedMedia((current) =>
         current.map((item) =>
           item.id === uploadable.id
-            ? { ...item, isUploading: false, isBlocked: false, uploadError: null, uploaded }
+            ? {
+                ...item,
+                file: storedFile,
+                mimeType: storedMimeType,
+                isUploading: false,
+                isBlocked: false,
+                processingStage: undefined,
+                uploadError: null,
+                uploaded,
+              }
             : item,
         ),
       );
@@ -4932,7 +5568,13 @@ export function App() {
       setAttachedMedia((current) =>
         current.map((item) =>
           item.id === attachment.id
-            ? { ...item, isUploading: false, isBlocked: false, uploadError: message }
+            ? {
+                ...item,
+                isUploading: false,
+                isBlocked: false,
+                processingStage: "upload",
+                uploadError: message,
+              }
             : item,
         ),
       );
@@ -5049,7 +5691,12 @@ export function App() {
     }
   }
 
-  function addPickedFiles(fileList: FileList | File[] | null, alreadyProcessed = false) {
+  function addPickedFiles(
+    fileList: FileList | File[] | null,
+    alreadyProcessed = false,
+    attachmentIds: string[] = [],
+    autoSendVoiceNote = false,
+  ) {
     const files = Array.from(fileList ?? []);
     if (files.length === 0) return;
     if (preparingAttachmentsRef.current) {
@@ -5084,12 +5731,14 @@ export function App() {
         continue;
       }
       acceptedFiles.push({
-        id: crypto.randomUUID(),
+        id: attachmentIds[acceptedFiles.length] ?? crypto.randomUUID(),
         file,
         mimeType,
+        isAutoSentVoiceNote: autoSendVoiceNote && mimeType.startsWith("audio/"),
         isUploading: true,
         isBlocked: false,
         isPreprocessed: alreadyProcessed,
+        processingStage: "upload",
         uploadError: null,
         uploaded: null,
       });
@@ -5108,6 +5757,10 @@ export function App() {
             continue;
           }
           try {
+            if (attachment.mimeType.startsWith("image/") && !alreadyProcessed) {
+              await uploadImageAttachment(attachment);
+              continue;
+            }
             const processed = alreadyProcessed
               ? {
                   file: attachment.file,
@@ -5119,7 +5772,7 @@ export function App() {
               continue;
             }
             if (processed.oversized) {
-              const message = `This file cannot be safely reduced to the AI's ${formatChatAttachmentSize(MAX_CHAT_ATTACHMENT_BYTES)} per-file limit without risking media quality, so it was not uploaded.`;
+              const message = `This file cannot be safely reduced to the ${formatChatAttachmentSize(MAX_CHAT_ATTACHMENT_BYTES)} per-file upload limit without risking media quality, so it was not uploaded.`;
               setAttachedMedia((current) =>
                 current.map((item) =>
                   item.id === attachment.id
@@ -5132,7 +5785,7 @@ export function App() {
                     : item,
                 ),
               );
-              rejectionReasons.push(`"${attachment.file.name}" cannot be safely reduced to the AI's per-file limit.`);
+              rejectionReasons.push(`"${attachment.file.name}" cannot be safely reduced to the per-file upload limit.`);
               continue;
             }
 
@@ -5163,6 +5816,7 @@ export function App() {
               file: processed.file,
               mimeType: processedMimeType,
               isPreprocessed: true,
+              processingStage: "upload",
             };
             setAttachedMedia((current) =>
               current.map((item) =>
@@ -5172,6 +5826,7 @@ export function App() {
                       file: processed.file,
                       mimeType: processedMimeType,
                       isPreprocessed: true,
+                      processingStage: "upload",
                     }
                   : item,
               ),
@@ -5311,6 +5966,226 @@ export function App() {
     }
   }
 
+  async function releaseVoiceRecording() {
+    if (voiceRecordingTimerRef.current) {
+      clearInterval(voiceRecordingTimerRef.current);
+      voiceRecordingTimerRef.current = null;
+    }
+    const processor = voiceRecordingProcessorRef.current;
+    if (processor) {
+      processor.onaudioprocess = null;
+      processor.disconnect();
+      voiceRecordingProcessorRef.current = null;
+    }
+    voiceRecordingGainRef.current?.disconnect();
+    voiceRecordingGainRef.current = null;
+    voiceRecordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+    voiceRecordingStreamRef.current = null;
+    voiceRecordingAnalyserRef.current = null;
+    const audioContext = voiceRecordingAudioContextRef.current;
+    voiceRecordingAudioContextRef.current = null;
+    try {
+      if (audioContext && audioContext.state !== "closed") await audioContext.close();
+    } finally {
+      voiceRecorderRef.current = null;
+      setIsRecordingVoice(false);
+      setVoiceRecordingSeconds(0);
+      setVoiceRecordingWaveform(Array.from({ length: 36 }, () => 4));
+    }
+  }
+
+  async function finishVoiceRecording() {
+    const elapsedSeconds = Math.floor((Date.now() - voiceRecordingStartAtRef.current) / 1000);
+    try {
+      await releaseVoiceRecording();
+    } catch (error) {
+      voiceRecordingPcmChunksRef.current = [];
+      setSendError(
+        error instanceof Error
+          ? `Could not finish voice recording: ${error.message}`
+          : "Could not finish voice recording. Please try again.",
+      );
+      return;
+    }
+    const chunks = voiceRecordingPcmChunksRef.current;
+    voiceRecordingPcmChunksRef.current = [];
+    if (voiceRecordingCancelledRef.current) return;
+    if (elapsedSeconds < 1) {
+      setSendError("Record a little longer before stopping the voice message.");
+      return;
+    }
+
+    let blob: Blob;
+    try {
+      blob = encodeVoiceNoteWav(chunks);
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : "Could not prepare the voice message.");
+      return;
+    }
+    if (blob.size > MAX_CHAT_ATTACHMENT_SOURCE_BYTES) {
+      setSendError(
+        `The recording exceeds the ${formatChatAttachmentSize(MAX_CHAT_ATTACHMENT_SOURCE_BYTES)} file limit. Record a shorter voice message.`,
+      );
+      return;
+    }
+    const file = new File([blob], `voice-message-${Date.now()}.wav`, {
+      type: "audio/wav",
+      lastModified: Date.now(),
+    });
+    const id = crypto.randomUUID();
+    const createdAt = new Date();
+    const localPreviewUrl = URL.createObjectURL(file);
+    localVoicePreviewUrlsRef.current.set(id, localPreviewUrl);
+    autoSendVoiceMessageIdRef.current = id;
+    setMessages((current) => [
+      ...current,
+      {
+        id,
+        role: "user",
+        text: VOICE_NOTE_MESSAGE_TEXT,
+        createdAt: createdAt.toISOString(),
+        versionNumber: 1,
+        thinkingSummary: null,
+        attachments: [{
+          id,
+          user_id: authUser?.id ?? "",
+          message_id: null,
+          file_name: file.name,
+          mime_type: "audio/wav",
+          size_bytes: file.size,
+          created_at: createdAt.toISOString(),
+          expires_at: new Date(createdAt.getTime() + CHAT_ATTACHMENT_RETENTION_MS).toISOString(),
+          deleted_at: null,
+        }],
+      },
+    ]);
+    addPickedFiles([file], false, [id], true);
+  }
+
+  async function startVoiceRecording() {
+    if (isRecordingVoice || isAssistantBusy || isAttachmentUploadPending) return;
+    if (!authUser) {
+      setSendError("Sign in before recording a voice message.");
+      return;
+    }
+    if (attachedMedia.length > 0) {
+      setSendError("Send or remove the current attachments before recording a voice message.");
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia || typeof AudioContext === "undefined") {
+      setSendError("Voice recording is not available in this browser.");
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+        },
+      });
+      const audioContext = new AudioContext();
+      const source = audioContext.createMediaStreamSource(stream);
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 512;
+      source.connect(analyser);
+      const processor = audioContext.createScriptProcessor(4096, 1, 1);
+      const silentGain = audioContext.createGain();
+      silentGain.gain.value = 0;
+      source.connect(processor);
+      processor.connect(silentGain);
+      silentGain.connect(audioContext.destination);
+      processor.onaudioprocess = (event) => {
+        const input = event.inputBuffer.getChannelData(0);
+        const ratio = audioContext.sampleRate / VOICE_NOTE_SAMPLE_RATE;
+        const output = new Int16Array(Math.floor(input.length / ratio));
+        for (let outputIndex = 0; outputIndex < output.length; outputIndex += 1) {
+          const start = Math.floor(outputIndex * ratio);
+          const end = Math.min(input.length, Math.floor((outputIndex + 1) * ratio));
+          let sum = 0;
+          for (let inputIndex = start; inputIndex < end; inputIndex += 1) {
+            sum += input[inputIndex];
+          }
+          const sample = Math.max(-1, Math.min(1, sum / Math.max(1, end - start)));
+          output[outputIndex] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+        }
+        voiceRecordingPcmChunksRef.current.push(output);
+      };
+      voiceRecordingStreamRef.current = stream;
+      voiceRecordingAudioContextRef.current = audioContext;
+      voiceRecordingAnalyserRef.current = analyser;
+      voiceRecordingProcessorRef.current = processor;
+      voiceRecordingGainRef.current = silentGain;
+      voiceRecordingPcmChunksRef.current = [];
+      voiceRecorderRef.current = { stop: () => void finishVoiceRecording() };
+      voiceRecordingCancelledRef.current = false;
+      voiceRecordingStartAtRef.current = Date.now();
+      await audioContext.resume();
+      setIsRecordingVoice(true);
+      setSendError("");
+      voiceRecordingTimerRef.current = setInterval(() => {
+        const elapsedSeconds = Math.floor((Date.now() - voiceRecordingStartAtRef.current) / 1000);
+        setVoiceRecordingSeconds(elapsedSeconds);
+        const maxRecordingSeconds = Math.floor(
+          MAX_CHAT_ATTACHMENT_SOURCE_BYTES / (VOICE_NOTE_SAMPLE_RATE * 2),
+        );
+        if (elapsedSeconds >= maxRecordingSeconds) {
+          stopVoiceRecording(true);
+          setSendError(
+            `Voice recordings are limited to ${formatMediaTime(maxRecordingSeconds)}. Please record a shorter message.`,
+          );
+          return;
+        }
+        const currentAnalyser = voiceRecordingAnalyserRef.current;
+        if (!currentAnalyser) return;
+        const samples = new Uint8Array(currentAnalyser.fftSize);
+        currentAnalyser.getByteTimeDomainData(samples);
+        const bars = Array.from({ length: 36 }, (_, index) => {
+          const start = Math.floor((index * samples.length) / 36);
+          const end = Math.floor(((index + 1) * samples.length) / 36);
+          let energy = 0;
+          for (let sampleIndex = start; sampleIndex < end; sampleIndex += 1) {
+            const amplitude = (samples[sampleIndex] - 128) / 128;
+            energy += amplitude * amplitude;
+          }
+          const rms = Math.sqrt(energy / Math.max(1, end - start));
+          return Math.max(4, Math.min(30, Math.round(4 + rms * 90)));
+        });
+        setVoiceRecordingWaveform(bars);
+      }, 250);
+    } catch (error) {
+      voiceRecordingPcmChunksRef.current = [];
+      await releaseVoiceRecording().catch((releaseError: unknown) => {
+        console.warn("Could not clean up a failed voice recording.", releaseError);
+      });
+      setSendError(
+        error instanceof Error
+          ? `Could not start voice recording: ${error.message}`
+          : "Could not start voice recording. Check microphone permission and try again.",
+      );
+    }
+  }
+
+  function stopVoiceRecording(cancel = false) {
+    const recorder = voiceRecorderRef.current;
+    voiceRecordingCancelledRef.current = cancel;
+    if (cancel) {
+      voiceRecordingPcmChunksRef.current = [];
+      void releaseVoiceRecording().catch((error: unknown) => {
+        console.warn("Could not cancel the voice recording cleanly.", error);
+      });
+    } else if (recorder) {
+      recorder.stop();
+    } else {
+      voiceRecordingPcmChunksRef.current = [];
+      void releaseVoiceRecording().catch((error: unknown) => {
+        console.warn("Could not stop the voice recording cleanly.", error);
+      });
+    }
+  }
+
   async function removeAttachedFile(indexToRemove: number) {
     const attachment = attachedMedia[indexToRemove];
     if (!attachment) return;
@@ -5335,7 +6210,15 @@ export function App() {
   async function openAttachment(index: number) {
     const pending = attachedMedia[index];
     const file = pending?.file;
-    if (!pending || !file) return;
+    if (
+      !pending ||
+      !file ||
+      pending.isUploading ||
+      pending.isBlocked ||
+      pending.uploadError
+    ) {
+      return;
+    }
 
     const requestId = ++attachmentViewRequestRef.current;
     const isMedia = pending.mimeType.startsWith("image/") || pending.mimeType.startsWith("video/");
@@ -5465,6 +6348,83 @@ export function App() {
       return;
     }
     closeAttachmentView();
+  }
+
+  async function saveProcessedDraftImage(
+    original: PendingChatAttachment,
+    processedFile: File,
+    successMessage: string,
+  ) {
+    if (!attachmentView || attachedMedia[attachmentView.index]?.id !== original.id) {
+      throw new Error("The selected photo changed before the edit could be saved.");
+    }
+    const mimeType = resolveChatAttachmentMimeType(processedFile);
+    if (!mimeType || !mimeType.startsWith("image/")) {
+      throw new Error("The processed file is not a supported photo format.");
+    }
+    if (processedFile.size > MAX_CHAT_ATTACHMENT_BYTES) {
+      throw new Error(
+        `The processed photo exceeds the ${formatChatAttachmentSize(MAX_CHAT_ATTACHMENT_BYTES)} upload limit. The original is unchanged.`,
+      );
+    }
+    const replacement: PendingChatAttachment = {
+      id: crypto.randomUUID(),
+      file: processedFile,
+      mimeType,
+      isUploading: true,
+      isBlocked: false,
+      uploadError: null,
+      uploaded: null,
+    };
+    const attachmentIndex = attachmentView.index;
+    setAttachedMedia((current) =>
+      current.map((item, index) => (index === attachmentIndex ? replacement : item)),
+    );
+    const uploaded = await uploadPendingAttachment(replacement);
+    if (!uploaded) {
+      setAttachedMedia((current) =>
+        current.map((item) => (item.id === replacement.id ? original : item)),
+      );
+      try {
+        await deleteStoredAttachments([replacement.id]);
+        if (authUser) await removeChatAttachmentDraft(authUser.id, replacement.id);
+      } catch (cleanupError) {
+        throw new Error(
+          `The processed photo could not be uploaded; the original is unchanged. Cleanup of the incomplete file also failed: ${
+            cleanupError instanceof Error ? cleanupError.message : "Unknown cleanup error."
+          }`,
+        );
+      }
+      throw new Error("The processed photo could not be uploaded. The original is unchanged.");
+    }
+
+    barcodeReadsRef.current.delete(original.id);
+    attachmentPreviewUrlCacheRef.current.delete(original.id);
+    try {
+      await deleteStoredAttachments([original.id]);
+      if (authUser) await removeChatAttachmentDraft(authUser.id, original.id);
+    } catch (error) {
+      setSendError(
+        error instanceof Error
+          ? `The processed photo was saved, but the original upload could not be removed: ${error.message}`
+          : "The processed photo was saved, but the original upload could not be removed.",
+      );
+    }
+    closeAttachmentView();
+    showActionToast(successMessage);
+  }
+
+  async function commitImageCrop(croppedFile: File) {
+    if (!attachmentView || attachmentView.mode !== "crop") return;
+    const original = attachedMedia[attachmentView.index];
+    if (!original || original.isUploading) {
+      throw new Error("Wait for the current upload to finish before cropping this photo.");
+    }
+    await saveProcessedDraftImage(
+      original,
+      croppedFile,
+      "Cropped photo saved to attachments.",
+    );
   }
 
   function formatFileSize(size: number): string {
@@ -5652,7 +6612,7 @@ export function App() {
     }
   }
 
-  async function sendMessage() {
+  async function sendMessage(voiceMessageId?: string) {
     if (isAssistantBusy || directReplyProcessingRef.current) return;
     if (isAttachmentUploadPending || isRestoringDraftAttachments) return;
     if (!authUser) {
@@ -5677,6 +6637,16 @@ export function App() {
       setSendError("Remove files that could not be processed or are over the upload limit before sending.");
       return;
     }
+    const attachmentBytes = attachedMedia.reduce(
+      (total, attachment) => total + (attachment.uploaded?.size_bytes ?? attachment.file.size),
+      0,
+    );
+    if (attachmentBytes > MAX_CHAT_MESSAGE_ATTACHMENT_BYTES) {
+      setSendError(
+        `Attachments in one message cannot exceed ${formatChatAttachmentSize(MAX_CHAT_MESSAGE_ATTACHMENT_BYTES)} total. Remove one or more files before sending.`,
+      );
+      return;
+    }
     if (attachedMedia.some((attachment) => !attachment.uploaded)) {
       setSendError("Wait for every attachment to finish uploading, or remove failed uploads.");
       return;
@@ -5690,11 +6660,17 @@ export function App() {
     shouldScrollToLatestRef.current = true;
     const showThinking = thinkingModeRef.current;
     let jobAccepted = false;
-    const clientRequestId = crypto.randomUUID();
+    const clientRequestId = voiceMessageId ?? crypto.randomUUID();
     const submittedAttachments = attachedMedia;
+    const hasVoiceNote = submittedAttachments.some((attachment) =>
+      attachment.mimeType.startsWith("audio/"),
+    );
+    const messageContent =
+      prompt ||
+      (hasVoiceNote ? VOICE_NOTE_MESSAGE_TEXT : "Please review the attached files.");
     const submissionPayload: ChatSubmissionPayload = {
       clientRequestId,
-      content: prompt || "Please review the attached files.",
+      content: messageContent,
       thinkingMode: showThinking,
       attachmentIds: submittedAttachments.map((attachment) => attachment.id),
       barcodeReadings: [],
@@ -5702,7 +6678,7 @@ export function App() {
     const optimisticMessage: ChatMessage = {
       id: clientRequestId,
       role: "user",
-      text: prompt || "Please review the attached files.",
+      text: messageContent,
       createdAt: new Date().toISOString(),
       versionNumber: 1,
       thinkingSummary: null,
@@ -5712,7 +6688,13 @@ export function App() {
     };
     pendingOptimisticMessageIdsRef.current.add(clientRequestId);
     pendingChatSubmissionsRef.current.set(clientRequestId, submissionPayload);
-    setMessages((current) => [...current, optimisticMessage]);
+    setMessages((current) => {
+      const existingIndex = current.findIndex((message) => message.id === clientRequestId);
+      if (existingIndex < 0) return [...current, optimisticMessage];
+      return current.map((message) =>
+        message.id === clientRequestId ? optimisticMessage : message,
+      );
+    });
     setAttachedMedia([]);
     if (messageInputRef.current) {
       messageInputRef.current.value = "";
@@ -5804,6 +6786,22 @@ export function App() {
       }
     }
   }
+
+  useEffect(() => {
+    const messageId = autoSendVoiceMessageIdRef.current;
+    if (!messageId || isAttachmentUploadPending) return;
+    const attachment = attachedMedia.find((item) => item.id === messageId);
+    if (!attachment || attachment.isUploading) return;
+    if (attachment.isBlocked) {
+      autoSendVoiceMessageIdRef.current = null;
+      setMessages((current) => current.filter((message) => message.id !== messageId));
+      setSendError(attachment.uploadError ?? "The voice message could not be uploaded.");
+      return;
+    }
+    if (!attachment.uploaded) return;
+    autoSendVoiceMessageIdRef.current = null;
+    void sendMessage(messageId);
+  }, [attachedMedia, isAttachmentUploadPending]);
 
   async function handleAssistantRating(
     messageId: string,
@@ -6046,19 +7044,16 @@ export function App() {
         .map((attachment) => attachment.id);
       if (attachmentIds.length > 0) await deleteStoredAttachments(attachmentIds);
 
-      const { data: removedCount, error } = await authClient.rpc(
-        "delete_chat_branch_from_message",
-        { p_message_id: targetId },
-      );
-      if (error) {
-        throw new Error(
-          `Could not delete this message branch. Confirm the latest supabase/schema.sql has been run. ${error.message}`,
-        );
-      }
-      if (removedCount < 1) {
+      closeTts();
+      const deletion = await deleteChatWithGeminiSpeech(await getAccessToken(), {
+        scope: "branch",
+        messageId: targetId,
+      });
+      if (deletion.deletedMessageCount < 1) {
         throw new Error("The message branch was not found, so nothing was deleted.");
       }
 
+      clearGeminiSpeechCache(deletion.messageIds);
       const removedIds = new Set(messages.slice(targetIndex).map((item) => item.id));
       setMessages((current) => current.slice(0, targetIndex));
       setMessageVersions((current) =>
@@ -6184,12 +7179,9 @@ export function App() {
       ]);
       const regenerationWarnings: string[] = [];
       if (queryResult.status === "rejected") {
-        regenerationWarnings.push(
-          `Semantic retrieval was unavailable: ${
-            queryResult.reason instanceof Error
-              ? queryResult.reason.message
-              : "Could not create a retrieval query."
-          }`,
+        console.warn(
+          "Semantic retrieval was unavailable while regenerating a response.",
+          queryResult.reason,
         );
       }
       const targetCreatedAt =
@@ -6251,12 +7243,9 @@ export function App() {
           : Promise.resolve([]),
       ]);
       if (contextResult.status === "rejected") {
-        regenerationWarnings.push(
-          `Related context could not be loaded: ${
-            contextResult.reason instanceof Error
-              ? contextResult.reason.message
-              : "Unknown database error."
-          }`,
+        console.warn(
+          "Related semantic context could not be loaded while regenerating a response.",
+          contextResult.reason,
         );
       }
       if (insightsContextResult.status === "rejected") {
@@ -6529,10 +7518,9 @@ export function App() {
           "RETRIEVAL_DOCUMENT",
         );
       } catch (error) {
-        regenerationWarnings.push(
-          `Semantic search could not be updated: ${
-            error instanceof Error ? error.message : "Unknown embedding error."
-          }`,
+        console.warn(
+          "Semantic search could not be updated after regenerating a response.",
+          error,
         );
       }
       const updatedMessage = await updateChatMessage(
@@ -6764,6 +7752,8 @@ export function App() {
 
   if (
     pathname !== "/" &&
+    pathname !== "/privacy" &&
+    pathname !== "/terms" &&
     !/^\/settings(?:\/(?:general|personal|configure|memory|messages|changelogs|account|privacy|terms))?\/?$/.test(pathname)
   ) {
     return (
@@ -6779,6 +7769,26 @@ export function App() {
 
   if (isAuthLoading) {
     return <PageLoadingSkeleton pathname={pathname} />;
+  }
+
+  if (pathname === "/privacy" || pathname === "/terms") {
+    return (
+      <LegalPage
+        kind={pathname === "/privacy" ? "privacy" : "terms"}
+        {...(authClient && authUser
+          ? {
+              reporter: {
+                client: authClient,
+                accountUserId: authUser.id,
+                accountEmail: authUser.email,
+                accountProvider: authUser.provider,
+                githubUsername: authUser.githubUsername,
+                accountRole: authUser.role,
+              },
+            }
+          : {})}
+      />
+    );
   }
 
   if (historyLoadError && authUser && pathname === "/") {
@@ -6856,18 +7866,44 @@ export function App() {
   const selectedUserMessageText = selectedUserMessage
     ? displayedMessageText(selectedUserMessage)
     : "";
+  const selectedUserMessageIsVoiceNote =
+    selectedUserMessage ? isVoiceNoteMessage(selectedUserMessage) : false;
+  const selectedUserMessageAudio = selectedUserMessage?.attachments?.find((attachment) =>
+    attachment.mime_type.startsWith("audio/"),
+  );
   if (attachmentView && viewedFile && viewedAttachment) {
     const previewUrl = mediaPreviews.get(viewedFile);
     const isMediaView =
       viewedAttachment.mimeType.startsWith("image/") ||
       viewedAttachment.mimeType.startsWith("video/");
     if (isMediaView) {
+      if (
+        attachmentView.mode === "crop" &&
+        viewedAttachment.mimeType.startsWith("image/") &&
+        previewUrl
+      ) {
+        return (
+          <ImageCropper
+            src={previewUrl}
+            file={viewedFile}
+            onCancel={() =>
+              setAttachmentView({ index: attachmentView.index, mode: "media" })
+            }
+            onApply={commitImageCrop}
+          />
+        );
+      }
       return previewUrl ? (
         <MediaPreview
           src={previewUrl}
           fileName={viewedFile.name}
           fileSize={viewedFile.size}
           isVideo={viewedAttachment.mimeType.startsWith("video/")}
+          onCrop={
+            viewedAttachment.mimeType.startsWith("image/") && !viewedAttachment.isUploading
+              ? () => setAttachmentView({ index: attachmentView.index, mode: "crop" })
+              : undefined
+          }
           onClose={closeAttachmentView}
         />
       ) : null;
@@ -6951,7 +7987,7 @@ export function App() {
       className="fixed inset-0 flex justify-center bg-[#f5f6f8] p-0"
     >
       <section
-        aria-label="CheyaVerse chat"
+        aria-label="CheyaAPP chat"
         className="relative flex h-full w-full max-w-[480px] flex-col overflow-hidden bg-[#f5f6f8]"
         onPointerDownCapture={(event) => {
           if (
@@ -7029,14 +8065,14 @@ export function App() {
           <div className="flex h-12 min-w-0 flex-1 items-center gap-2 rounded-full border border-[#e8e9ec] bg-white py-1 pl-1 pr-2">
             <img
               src={cheyaLogo}
-              alt="CheyaVerse logo"
+              alt="CheyaAPP logo"
               className="pointer-events-none size-10 shrink-0 rounded-full object-cover select-none"
               draggable={false}
             />
             <div className="pointer-events-none flex min-w-0 flex-col justify-center select-none">
               <div className="flex items-center gap-0.5">
                 <h1 className="truncate text-base font-semibold leading-5 text-[#17181b]">
-                  CheyaVerse
+                  CheyaAPP
                 </h1>
                 <BadgeCheck
                   aria-label="Verified account"
@@ -7080,6 +8116,7 @@ export function App() {
                 title={label}
                 onClick={() => {
                   if (label === "Settings") navigate("/settings");
+                  else setIsBugReportOpen(true);
                 }}
                 className="flex size-9 items-center justify-center rounded-full text-[#303238] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
               >
@@ -7148,38 +8185,36 @@ export function App() {
                   </span>
                 )}
               </div>
-              {authUser?.role !== "admin" && (
-                <div className="flex shrink-0 items-center gap-0.5">
-                  <button
-                    type="button"
-                    aria-label="Mark all notifications as read"
-                    title={isMarkingInboxRead ? "Marking all as read" : "Mark all as read"}
-                    disabled={isMarkingInboxRead || unreadInboxMessageCount === 0}
-                    onClick={() => void markAllInboxItemsRead()}
-                    className="flex size-7 items-center justify-center rounded-lg text-[#6c727c] transition hover:bg-[#eff8fc] hover:text-[#287ba3] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[#229fe3] disabled:cursor-not-allowed disabled:text-[#c1c3c8]"
-                  >
-                    {isMarkingInboxRead ? (
-                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                    ) : (
-                      <CheckCheck aria-hidden="true" className="size-[17px]" strokeWidth={1.8} />
-                    )}
-                  </button>
-                  <button
-                    type="button"
-                    aria-label="Clear notification inbox"
-                    title={isClearingInbox ? "Clearing inbox" : "Clear inbox"}
-                    disabled={isClearingInbox || inboxItems.length === 0}
-                    onClick={() => void clearNotificationInbox()}
-                    className="flex size-7 items-center justify-center rounded-lg text-[#7b7373] transition hover:bg-red-50 hover:text-[#b43b3b] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[#d84646] disabled:cursor-not-allowed disabled:text-[#c8c3c3]"
-                  >
-                    {isClearingInbox ? (
-                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                    ) : (
-                      <Trash2 aria-hidden="true" className="size-4" strokeWidth={1.8} />
-                    )}
-                  </button>
-                </div>
-              )}
+              <div className="flex shrink-0 items-center gap-0.5">
+                <button
+                  type="button"
+                  aria-label="Mark all notifications as read"
+                  title={isMarkingInboxRead ? "Marking all as read" : "Mark all as read"}
+                  disabled={isMarkingInboxRead || unreadInboxMessageCount === 0}
+                  onClick={() => void markAllInboxItemsRead()}
+                  className="flex size-7 items-center justify-center rounded-lg text-[#6c727c] transition hover:bg-[#eff8fc] hover:text-[#287ba3] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[#229fe3] disabled:cursor-not-allowed disabled:text-[#c1c3c8]"
+                >
+                  {isMarkingInboxRead ? (
+                    <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                  ) : (
+                    <CheckCheck aria-hidden="true" className="size-[17px]" strokeWidth={1.8} />
+                  )}
+                </button>
+                <button
+                  type="button"
+                  aria-label="Clear notification inbox"
+                  title={isClearingInbox ? "Clearing inbox" : "Clear inbox"}
+                  disabled={isClearingInbox || inboxItems.length === 0}
+                  onClick={() => void clearNotificationInbox()}
+                  className="flex size-7 items-center justify-center rounded-lg text-[#7b7373] transition hover:bg-red-50 hover:text-[#b43b3b] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[#d84646] disabled:cursor-not-allowed disabled:text-[#c8c3c3]"
+                >
+                  {isClearingInbox ? (
+                    <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                  ) : (
+                    <Trash2 aria-hidden="true" className="size-4" strokeWidth={1.8} />
+                  )}
+                </button>
+              </div>
             </header>
             <div className="min-h-0 flex-1 space-y-3 overflow-y-auto bg-[#f7f8fa] p-2.5">
               {inboxError && (
@@ -7505,12 +8540,16 @@ export function App() {
         >
           <div className="space-y-3">
             {messages.map((chatMessage) => {
+              if (isSending && pendingAssistantResponseId === chatMessage.id) return null;
               const versionNumber = displayedVersionNumber(chatMessage);
               const versions = messageVersionsForDisplay(chatMessage);
               const versionIndex = versions.findIndex(
                 (item) => item.version_number === versionNumber,
               );
               const visibleText = displayedMessageText(chatMessage);
+              const isVoiceNote = isVoiceNoteMessage(chatMessage);
+              const isVoiceNoteUploading =
+                isVoiceNote && autoSendVoiceMessageIdRef.current === chatMessage.id;
               const visibleThinkingSummary = displayedThinkingSummary(chatMessage);
               const failedSubmission = failedChatSubmissions[chatMessage.id];
               const animateAssistant =
@@ -7551,25 +8590,85 @@ export function App() {
 
               if (chatMessage.role === "user") {
                 return (
-                  <article key={chatMessage.id} className="relative flex w-full flex-col items-end">
+                  <article
+                    key={chatMessage.id}
+                    className={`${
+                      isVoiceNote ? "voice-message-action-group" : "user-message-action-group"
+                    } relative flex w-full flex-col items-end`}
+                  >
                     {chatMessage.attachments && chatMessage.attachments.length > 0 && (
                       <div
                         aria-label="Message attachments"
                         dir="rtl"
-                        className="mb-2 grid w-fit max-w-[min(94%,320px)] grid-cols-3 gap-2"
+                        className={`mb-2 grid w-fit max-w-[min(94%,320px)] ${
+                          chatMessage.attachments.some((attachment) =>
+                            attachment.mime_type.startsWith("audio/"),
+                          )
+                            ? "grid-cols-1"
+                            : "grid-cols-3"
+                        } gap-2`}
+                        onPointerDown={(event) => {
+                          if (!isVoiceNote || event.pointerType !== "touch") return;
+                          clearLongPressTimer();
+                          longPressTriggeredRef.current = false;
+                          longPressStartRef.current = { x: event.clientX, y: event.clientY };
+                          longPressTimerRef.current = setTimeout(() => {
+                            longPressTriggeredRef.current = true;
+                            setActiveUserActions(chatMessage.id);
+                            longPressTimerRef.current = null;
+                          }, 320);
+                        }}
+                        onPointerMove={(event) => {
+                          const start = longPressStartRef.current;
+                          if (
+                            isVoiceNote &&
+                            event.pointerType === "touch" &&
+                            start &&
+                            Math.hypot(event.clientX - start.x, event.clientY - start.y) > 10
+                          ) {
+                            clearLongPressTimer();
+                            longPressStartRef.current = null;
+                          }
+                        }}
+                        onPointerUp={() => {
+                          if (!isVoiceNote) return;
+                          clearLongPressTimer();
+                          longPressStartRef.current = null;
+                        }}
+                        onPointerCancel={() => {
+                          if (!isVoiceNote) return;
+                          clearLongPressTimer();
+                          longPressStartRef.current = null;
+                        }}
+                        onClickCapture={(event) => {
+                          if (!longPressTriggeredRef.current) return;
+                          event.preventDefault();
+                          event.stopPropagation();
+                          longPressTriggeredRef.current = false;
+                        }}
+                        onContextMenu={(event) => {
+                          if (!isVoiceNote) return;
+                          event.preventDefault();
+                          setActiveUserActions(chatMessage.id);
+                        }}
                       >
                         {chatMessage.attachments.map((attachment) => (
                           <ChatMessageAttachmentTile
                             key={attachment.id}
                             attachment={attachment}
                             expired={isChatAttachmentExpired(attachment)}
+                            isProcessing={isVoiceNoteUploading}
                             getPreviewUrl={getAttachmentPreviewUrl}
                             onOpen={(item) => void openStoredAttachment(item)}
                           />
                         ))}
                       </div>
                     )}
-                    <div className="user-message-action-group flex w-full max-w-full flex-col items-end">
+                    <div
+                      className={`${
+                        isVoiceNote ? "" : "user-message-action-group"
+                      } flex w-full max-w-full flex-col items-end`}
+                    >
                     <div
                       className={
                         failedSubmission
@@ -7593,7 +8692,7 @@ export function App() {
                           )}
                         </button>
                       )}
-                      <div
+                      {!isVoiceNote && <div
                         onPointerDown={(event) => {
                         if (event.pointerType !== "touch") return;
                         clearLongPressTimer();
@@ -7645,17 +8744,20 @@ export function App() {
                         client={authClient}
                         userMessage
                       />
-                      </div>
+                      </div>}
                     </div>
                     <div
                       data-user-actions
                       aria-label="User message actions"
                       className="user-message-actions mt-0 hidden h-0 w-full items-center justify-end gap-0.5 overflow-hidden sm:flex"
                     >
-                      <button
+                      {!isVoiceNote && <button
                         type="button"
                         aria-label="Copy user message"
-                        onClick={() => void copyMessageText(chatMessage.id, visibleText)}
+                        onClick={(event) => {
+                          event.currentTarget.blur();
+                          void copyMessageText(chatMessage.id, visibleText);
+                        }}
                         className="flex size-5 items-center justify-center rounded-full text-[#777a82] opacity-0 pointer-events-none transition-none hover:bg-[#f1f2f4] hover:text-[#34363b]"
                       >
                         {copiedMessageId === chatMessage.id ? (
@@ -7663,15 +8765,18 @@ export function App() {
                         ) : (
                           <Copy aria-hidden="true" className="size-3" />
                         )}
-                      </button>
-                      <button
+                      </button>}
+                      {!isVoiceNote && <button
                         type="button"
                         aria-label="Edit user message"
-                        onClick={() => openUserMessageEditor(chatMessage.id, visibleText)}
+                        onClick={(event) => {
+                          event.currentTarget.blur();
+                          openUserMessageEditor(chatMessage.id, visibleText);
+                        }}
                         className="flex size-5 items-center justify-center rounded-full text-[#777a82] opacity-0 pointer-events-none transition-none hover:bg-[#f1f2f4] hover:text-[#34363b]"
                       >
                         <Pencil aria-hidden="true" className="size-3" />
-                      </button>
+                      </button>}
                       <button
                         type="button"
                         aria-label="Delete this message and everything after it"
@@ -7680,7 +8785,7 @@ export function App() {
                           setDeleteChatTarget({ id: chatMessage.id, text: visibleText });
                           setActiveUserActions(null);
                         }}
-                        className="flex size-5 items-center justify-center rounded-full text-[#b43b3b] opacity-0 pointer-events-none transition-none hover:bg-red-50 disabled:opacity-40"
+                        className="pointer-events-none flex size-5 items-center justify-center rounded-full text-[#b43b3b] opacity-0 transition-none hover:bg-red-50 disabled:opacity-40"
                       >
                         <Trash2 aria-hidden="true" className="size-3" />
                       </button>
@@ -7730,9 +8835,11 @@ export function App() {
                         Thinking mode
                       </button>
                       {expandedThinkingIds.has(ratingKey) && (
-                        <p className="mt-1 border-l border-[#e4e5e8] pl-3 text-xs leading-5 text-[#747780]">
-                          {visibleThinkingSummary}
-                        </p>
+                        <div className="mt-1 border-l border-[#e4e5e8] pl-3 text-xs leading-5 text-[#747780] [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1 [&_pre]:my-1">
+                          <Suspense fallback={null}>
+                            <AssistantMarkdown content={visibleThinkingSummary} />
+                          </Suspense>
+                        </div>
                       )}
                     </div>
                   )}
@@ -7915,7 +9022,7 @@ export function App() {
                 </article>
               );
             })}
-            {isAssistantBusy && (
+            {isAssistantBusy && !typingAssistant && (
               <div
                 role="status"
                 aria-live="polite"
@@ -7990,12 +9097,13 @@ export function App() {
               event.preventDefault();
             }}
           >
-            {attachedMedia.length > 0 && (
+            {attachedMedia.some((attachment) => !attachment.isAutoSentVoiceNote) && (
               <div
                 aria-label="Files ready to upload"
                 className="grid max-w-full grid-flow-col auto-cols-[68px] gap-1.5 overflow-x-auto overflow-y-hidden overscroll-x-contain px-2 pb-0 pt-2 sm:auto-cols-[68px] sm:gap-1.5 sm:pb-1 sm:pt-2.5"
               >
                 {attachedMedia.map((attachment, index) => {
+                  if (attachment.isAutoSentVoiceNote) return null;
                   const { file } = attachment;
                   const isPreviewable =
                     attachment.mimeType.startsWith("image/") ||
@@ -8012,7 +9120,11 @@ export function App() {
                       <button
                         type="button"
                         aria-label={`Open ${file.name}`}
-                        disabled={attachment.isBlocked}
+                        disabled={
+                          attachment.isUploading ||
+                          attachment.isBlocked ||
+                          Boolean(attachment.uploadError)
+                        }
                         onClick={() => void openAttachment(index)}
                         className="absolute inset-0 flex size-full flex-col items-center justify-center overflow-hidden text-left disabled:cursor-not-allowed"
                       >
@@ -8068,21 +9180,24 @@ export function App() {
                       {attachment.isUploading && (
                         <span
                           role="status"
-                          aria-label={`Processing ${file.name}`}
+                          aria-label={`Saving ${file.name}`}
                           className="attachment-upload-progress pointer-events-none absolute inset-x-0 bottom-0 z-[5]"
                         />
                       )}
                       {attachment.uploadError && !attachment.isBlocked && (
                         <div
                           role="alert"
-                          className="absolute inset-x-0 bottom-0 flex items-center justify-center gap-1 bg-red-700/90 px-1 py-1 text-white"
+                          className="absolute inset-0 z-[6] flex flex-col items-center justify-center gap-1 bg-red-900/60 px-1 text-white"
                           title={attachment.uploadError}
                         >
-                          <span className="truncate text-[9px] font-medium">Upload failed</span>
+                          <TriangleAlert aria-hidden="true" className="size-5 shrink-0" />
+                          <span className="max-w-full truncate text-[8px] font-medium">
+                            Save failed
+                          </span>
                           <button
                             type="button"
-                            aria-label={`Retry upload of ${file.name}`}
-                            title={`Retry upload: ${attachment.uploadError}`}
+                            aria-label={`Retry processing ${file.name}`}
+                            title={`Retry: ${attachment.uploadError}`}
                             onClick={(event) => {
                               event.stopPropagation();
                               setAttachedMedia((current) =>
@@ -8092,15 +9207,11 @@ export function App() {
                                     : item,
                                 ),
                               );
-                              void uploadPendingAttachment({
-                                ...attachment,
-                                isUploading: true,
-                                uploadError: null,
-                              });
+                              void retryPendingAttachment(attachment);
                             }}
-                            className="flex size-4 shrink-0 items-center justify-center rounded hover:bg-white/20"
+                            className="flex size-7 shrink-0 items-center justify-center rounded-full bg-white/20 hover:bg-white/35"
                           >
-                            <RotateCw aria-hidden="true" className="size-3" />
+                            <RotateCw aria-hidden="true" className="size-4" />
                           </button>
                         </div>
                       )}
@@ -8122,43 +9233,94 @@ export function App() {
               </div>
             )}
             <div className="flex min-h-11 items-start px-3 pb-2 pt-1">
-              <ChatMessageInput
-                inputRef={messageInputRef}
-                defaultValue={messageDraftRef.current}
-                disabled={!hasGeminiApiKey}
-                enterKeyBehavior={
-                  window.matchMedia("(pointer: coarse)").matches
-                    ? generalSettings.enter_key_behavior_mobile
-                    : generalSettings.enter_key_behavior_desktop
-                }
-                fontSize={Math.round(generalSettings.font_size * 16 / 14)}
-                onDraftInput={handleMessageDraftInput}
-                onSubmitMessage={() => void sendMessage()}
-                placeholder={
-                  hasGeminiApiKey ? "Ask anything..." : "Add a Gemini API key in Settings first"
-                }
-              />
+              {isRecordingVoice ? (
+                <div
+                  role="status"
+                  aria-label="Recording voice message"
+                  className="flex min-h-11 w-full items-center gap-3 px-1 text-sm text-[#34363b]"
+                >
+                  <span className="size-2.5 animate-pulse rounded-full bg-red-500" />
+                  <div
+                    role="img"
+                    aria-label="Live voice waveform"
+                    className="flex h-9 min-w-0 flex-1 items-center justify-center gap-[3px] overflow-hidden"
+                  >
+                    {voiceRecordingWaveform.map((height, index) => (
+                      <span
+                        key={index}
+                        className="w-[3px] shrink-0 rounded-full bg-[#7651a2] transition-[height] duration-150"
+                        style={{ height: `${height}px` }}
+                      />
+                    ))}
+                  </div>
+                  <span className="ml-auto tabular-nums text-[#777a82]">
+                    {formatMediaTime(voiceRecordingSeconds)}
+                  </span>
+                </div>
+              ) : (
+                <ChatMessageInput
+                  inputRef={messageInputRef}
+                  defaultValue={messageDraftRef.current}
+                  disabled={!hasGeminiApiKey}
+                  enterKeyBehavior={
+                    window.matchMedia("(pointer: coarse)").matches
+                      ? generalSettings.enter_key_behavior_mobile
+                      : generalSettings.enter_key_behavior_desktop
+                  }
+                  fontSize={Math.round(generalSettings.font_size * 16 / 14)}
+                  onDraftInput={handleMessageDraftInput}
+                  onSubmitMessage={() => void sendMessage()}
+                  placeholder={
+                    hasGeminiApiKey ? "Ask anything..." : "Add a Gemini API key in Settings first"
+                  }
+                />
+              )}
             </div>
 
             <div className="-mx-1 flex items-center justify-between gap-2 px-1 pb-1">
-              <ChatMediaMenu
-                disabled={
-                  !hasGeminiApiKey ||
-                  isRestoringDraftAttachments ||
-                  isPreparingAttachments
-                }
-                onOpenCamera={openCamera}
-                onPickPhoto={() => fileInputRef.current?.click()}
-                onPickFiles={() => filesInputRef.current?.click()}
-              />
-              <div className="flex items-center gap-1">
-                <ThinkingModeToggle
-                  disabled={!hasGeminiApiKey}
-                  onToggle={(enabled) => {
-                    thinkingModeRef.current = enabled;
-                  }}
+              {isRecordingVoice ? (
+                null
+              ) : (
+                <ChatMediaMenu
+                  disabled={
+                    !hasGeminiApiKey ||
+                    isRestoringDraftAttachments ||
+                    isPreparingAttachments
+                  }
+                  onOpenCamera={openCamera}
+                  onPickPhoto={() => fileInputRef.current?.click()}
+                  onPickFiles={() => filesInputRef.current?.click()}
                 />
-                {isAssistantBusy ? (
+              )}
+              <div className="flex items-center gap-1">
+                {!isRecordingVoice && (
+                  <ThinkingModeToggle
+                    disabled={!hasGeminiApiKey}
+                    onToggle={(enabled) => {
+                      thinkingModeRef.current = enabled;
+                    }}
+                  />
+                )}
+                {isRecordingVoice ? (
+                  <>
+                    <button
+                      type="button"
+                      aria-label="Cancel voice recording"
+                      onClick={() => stopVoiceRecording(true)}
+                      className="flex size-9 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] hover:bg-[#f7f8fa] sm:size-10"
+                    >
+                      <X aria-hidden="true" className="size-[18px]" />
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="Send voice message"
+                      onClick={() => stopVoiceRecording()}
+                      className="flex size-9 shrink-0 items-center justify-center rounded-full border border-red-600 bg-red-600 text-white hover:bg-red-700 sm:size-10"
+                    >
+                      <span aria-hidden="true" className="size-3.5 rounded-sm bg-current" />
+                    </button>
+                  </>
+                ) : isAssistantBusy ? (
                   <>
                     <button
                       type="button"
@@ -8184,7 +9346,7 @@ export function App() {
                     onPointerDown={(event) => {
                       if (event.pointerType === "touch") event.preventDefault();
                     }}
-                    onClick={sendMessage}
+                    onClick={() => void sendMessage()}
                     disabled={
                       isAssistantBusy ||
                       isRestoringDraftAttachments ||
@@ -8209,7 +9371,9 @@ export function App() {
                     <button
                       type="button"
                       aria-label="Use microphone"
-                      className="chat-composer-idle-control flex size-9 shrink-0 items-center justify-center rounded-full border-0 bg-transparent text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] sm:size-10"
+                      disabled={!hasGeminiApiKey || isRestoringDraftAttachments}
+                      onClick={() => void startVoiceRecording()}
+                      className="chat-composer-idle-control flex size-9 shrink-0 items-center justify-center rounded-full border-0 bg-transparent text-[#34363b] transition-colors hover:bg-[#f7f8fa] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] disabled:opacity-40 sm:size-10"
                     >
                       <Mic aria-hidden="true" className="size-[19px]" strokeWidth={1.8} />
                     </button>
@@ -8226,7 +9390,7 @@ export function App() {
                       onPointerDown={(event) => {
                         if (event.pointerType === "touch") event.preventDefault();
                       }}
-                      onClick={sendMessage}
+                      onClick={() => void sendMessage()}
                       disabled={
                         isRestoringDraftAttachments ||
                         isAttachmentUploadPending ||
@@ -8266,22 +9430,31 @@ export function App() {
             data-user-actions
             role="dialog"
             aria-modal="true"
-            aria-label="Selected user message"
+            aria-label={selectedUserMessageIsVoiceNote ? "Selected voice message" : "Selected user message"}
             className="w-full max-w-sm"
           >
-            <div
-              className="max-h-40 overflow-hidden rounded-2xl bg-[#28292e] px-4 py-3 text-sm leading-5 text-white line-clamp-6 shadow-2xl"
-              style={{ fontSize: Math.round(13 * chatFontScale), lineHeight: 1.4 }}
-            >
-              {selectedUserMessageText}
-            </div>
+            {selectedUserMessageIsVoiceNote && selectedUserMessageAudio ? (
+              <ChatMessageAudioNote
+                attachment={selectedUserMessageAudio}
+                expired={isChatAttachmentExpired(selectedUserMessageAudio)}
+                getPreviewUrl={getAttachmentPreviewUrl}
+                size="large"
+              />
+            ) : (
+              <div
+                className="max-h-40 overflow-hidden rounded-2xl bg-[#28292e] px-4 py-3 text-sm leading-5 text-white line-clamp-6 shadow-2xl"
+                style={{ fontSize: Math.round(13 * chatFontScale), lineHeight: 1.4 }}
+              >
+                {selectedUserMessageText}
+              </div>
+            )}
           </section>
           <div
             data-user-actions
             aria-label="Message options"
             className="w-full max-w-sm overflow-hidden rounded-[28px] bg-white py-2 shadow-2xl"
           >
-            <button
+            {!selectedUserMessageIsVoiceNote && <button
               type="button"
               onClick={() => {
                 void copyMessageText(selectedUserMessage.id, selectedUserMessageText);
@@ -8295,9 +9468,9 @@ export function App() {
                 <Copy aria-hidden="true" className="size-5" />
               )}
               Copy message
-            </button>
-            <div className="mx-5 h-px bg-[#eceef1]" />
-            <button
+            </button>}
+            {!selectedUserMessageIsVoiceNote && <div className="mx-5 h-px bg-[#eceef1]" />}
+            {!selectedUserMessageIsVoiceNote && <button
               type="button"
               onClick={() => {
                 openUserMessageEditor(selectedUserMessage.id, selectedUserMessageText);
@@ -8307,8 +9480,8 @@ export function App() {
             >
               <Pencil aria-hidden="true" className="size-5" />
               Edit message
-            </button>
-            <div className="mx-5 h-px bg-[#eceef1]" />
+            </button>}
+            {!selectedUserMessageIsVoiceNote && <div className="mx-5 h-px bg-[#eceef1]" />}
             <button
               type="button"
               disabled={isSending || isDeletingChatBranch}
@@ -8458,7 +9631,7 @@ export function App() {
             role="dialog"
             aria-modal="true"
             aria-label="Send feedback"
-            className="chat-quick-panel feedback-construction-frame relative w-full max-w-3xl shadow-[0_20px_56px_rgba(0,0,0,0.22)]"
+            className="chat-quick-panel feedback-construction-frame relative w-full max-w-[420px] shadow-[0_20px_56px_rgba(0,0,0,0.22)]"
           >
             <div aria-hidden="true" className="feedback-construction-stripe" />
             <div className="feedback-construction-content">
@@ -8795,6 +9968,19 @@ export function App() {
           event.currentTarget.value = "";
         }}
       />
+      {authClient && authUser && (
+        <BugReportDialog
+          open={isBugReportOpen}
+          onClose={() => setIsBugReportOpen(false)}
+          onDiscard={() => setIsBugReportOpen(false)}
+          client={authClient}
+          accountUserId={authUser.id}
+          accountEmail={authUser.email}
+          accountProvider={authUser.provider}
+          githubUsername={authUser.githubUsername}
+          accountRole={authUser.role}
+        />
+      )}
     </main>
   );
 }

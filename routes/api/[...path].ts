@@ -9,12 +9,15 @@ import accountAiAction from "../../api-handlers/account-ai-action.post";
 import accountAiError from "../../api-handlers/account-ai-error.post";
 import accountDelete from "../../api-handlers/account-delete.post";
 import accountInboxClear from "../../api-handlers/account-inbox-clear.post";
+import bugReport from "../../api-handlers/bug-report.post";
+import accountWelcomeEmail from "../../api-handlers/account-welcome-email.post";
 import accessCode from "../../api-handlers/access-code.post";
 import adminAttachmentLink from "../../api-handlers/admin-attachment-link.post";
 import adminMessageApproval from "../../api-handlers/admin-message-approval.post";
 import adminRelayFeedback from "../../api-handlers/admin-relay-feedback.post";
 import chatAttachmentLink from "../../api-handlers/chat-attachment-link.post";
 import chatAttachmentsDelete from "../../api-handlers/chat-attachments-delete.post";
+import chatTtsAudioCacheDelete from "../../api-handlers/chat-tts-audio-cache-delete.post";
 import chatAttachments from "../../api-handlers/chat-attachments.post";
 import chatJobs from "../../api-handlers/chat-jobs.post";
 import chatMessageAttachments from "../../api-handlers/chat-message-attachments.post";
@@ -33,12 +36,15 @@ const apiHandlers: Record<string, EventHandler> = {
   "POST /api/account-ai-error": accountAiError,
   "POST /api/account-delete": accountDelete,
   "POST /api/account-inbox-clear": accountInboxClear,
+  "POST /api/bug-report": bugReport,
+  "POST /api/account-welcome-email": accountWelcomeEmail,
   "POST /api/access-code": accessCode,
   "POST /api/admin-attachment-link": adminAttachmentLink,
   "POST /api/admin-message-approval": adminMessageApproval,
   "POST /api/admin-relay-feedback": adminRelayFeedback,
   "POST /api/chat-attachment-link": chatAttachmentLink,
   "POST /api/chat-attachments-delete": chatAttachmentsDelete,
+  "POST /api/chat-tts-audio-cache-delete": chatTtsAudioCacheDelete,
   "POST /api/chat-attachments": chatAttachments,
   "POST /api/chat-jobs": chatJobs,
   "POST /api/chat-message-attachments": chatMessageAttachments,
