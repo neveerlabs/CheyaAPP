@@ -301,16 +301,17 @@ function formatMediaTime(seconds: number): string {
   return `${Math.floor(wholeSeconds / 60)}:${String(wholeSeconds % 60).padStart(2, "0")}`;
 }
 
-const VOICE_NOTE_SAMPLE_RATE = 24_000;
-
-function encodeVoiceNoteWav(chunks: Int16Array[]): Blob {
-  const sampleCount = chunks.reduce((total, chunk) => total + chunk.length, 0);
-  if (sampleCount === 0) {
+function encodeVoiceNoteWav(samples: Float32Array, sampleRate: number): Blob {
+  const sourceSampleCount = samples.length;
+  if (
+    sourceSampleCount === 0 ||
+    !Number.isInteger(sampleRate) ||
+    sampleRate <= 0
+  ) {
     throw new Error("The recording is empty. Please try recording again.");
   }
 
-  const sampleRate = VOICE_NOTE_SAMPLE_RATE;
-  const dataSize = sampleCount * 2;
+  const dataSize = sourceSampleCount * 2;
   const buffer = new ArrayBuffer(44 + dataSize);
   const view = new DataView(buffer);
   const writeAscii = (offset: number, value: string) => {
@@ -333,20 +334,15 @@ function encodeVoiceNoteWav(chunks: Int16Array[]): Blob {
   writeAscii(36, "data");
   view.setUint32(40, dataSize, true);
 
-  let peak = 0;
-  for (const chunk of chunks) {
-    for (const sample of chunk) {
-      peak = Math.max(peak, Math.abs(sample));
-    }
-  }
-  const gain = peak > 0 ? 32767 / peak : 1;
   let outputOffset = 44;
-  for (const chunk of chunks) {
-    for (const sample of chunk) {
-      const normalizedSample = Math.max(-32768, Math.min(32767, Math.round(sample * gain)));
-      view.setInt16(outputOffset, normalizedSample, true);
-      outputOffset += 2;
-    }
+  for (const sample of samples) {
+    const clippedSample = Math.max(-1, Math.min(1, sample));
+    view.setInt16(
+      outputOffset,
+      clippedSample < 0 ? clippedSample * 0x8000 : clippedSample * 0x7fff,
+      true,
+    );
+    outputOffset += 2;
   }
 
   return new Blob([buffer], { type: "audio/wav" });
@@ -1792,18 +1788,17 @@ export function App() {
   const jobRefreshTimerRef = useRef<number | null>(null);
   const cameraVideoRef = useRef<HTMLVideoElement>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
-  const voiceRecorderRef = useRef<{ stop: () => void } | null>(null);
+  const voiceRecorderRef = useRef<MediaRecorder | null>(null);
   const voiceRecordingStreamRef = useRef<MediaStream | null>(null);
   const voiceRecordingAudioContextRef = useRef<AudioContext | null>(null);
   const voiceRecordingAnalyserRef = useRef<AnalyserNode | null>(null);
-  const voiceRecordingProcessorRef = useRef<ScriptProcessorNode | null>(null);
-  const voiceRecordingGainRef = useRef<GainNode | null>(null);
-  const voiceRecordingPcmChunksRef = useRef<Int16Array[]>([]);
+  const voiceRecordingChunksRef = useRef<Blob[]>([]);
   const voiceRecordingStartAtRef = useRef(0);
   const voiceRecordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const voiceRecordingCancelledRef = useRef(false);
   const autoSendVoiceMessageIdRef = useRef<string | null>(null);
   const localVoicePreviewUrlsRef = useRef(new Map<string, string>());
+  const voiceNoteRenderKeysRef = useRef(new Map<string, string>());
   const preparingAttachmentsRef = useRef(false);
   const cameraHistoryEntryRef = useRef(false);
   const messageDraftRef = useRef("");
@@ -5507,6 +5502,10 @@ export function App() {
         },
       );
       const uploaded = registration.attachment;
+      if (uploadable.isAutoSentVoiceNote) {
+        const renderKey = voiceNoteRenderKeysRef.current.get(uploadable.id);
+        if (renderKey) voiceNoteRenderKeysRef.current.set(uploaded.id, renderKey);
+      }
       if (cancelledAttachmentsRef.current.has(uploadable.id)) {
         await deleteStoredAttachments([uploadable.id]);
         await removeChatAttachmentDraft(authUser.id, uploadable.id);
@@ -5971,14 +5970,6 @@ export function App() {
       clearInterval(voiceRecordingTimerRef.current);
       voiceRecordingTimerRef.current = null;
     }
-    const processor = voiceRecordingProcessorRef.current;
-    if (processor) {
-      processor.onaudioprocess = null;
-      processor.disconnect();
-      voiceRecordingProcessorRef.current = null;
-    }
-    voiceRecordingGainRef.current?.disconnect();
-    voiceRecordingGainRef.current = null;
     voiceRecordingStreamRef.current?.getTracks().forEach((track) => track.stop());
     voiceRecordingStreamRef.current = null;
     voiceRecordingAnalyserRef.current = null;
@@ -5996,10 +5987,12 @@ export function App() {
 
   async function finishVoiceRecording() {
     const elapsedSeconds = Math.floor((Date.now() - voiceRecordingStartAtRef.current) / 1000);
+    const chunks = voiceRecordingChunksRef.current;
+    voiceRecordingChunksRef.current = [];
+    const recorder = voiceRecorderRef.current;
     try {
       await releaseVoiceRecording();
     } catch (error) {
-      voiceRecordingPcmChunksRef.current = [];
       setSendError(
         error instanceof Error
           ? `Could not finish voice recording: ${error.message}`
@@ -6007,8 +6000,6 @@ export function App() {
       );
       return;
     }
-    const chunks = voiceRecordingPcmChunksRef.current;
-    voiceRecordingPcmChunksRef.current = [];
     if (voiceRecordingCancelledRef.current) return;
     if (elapsedSeconds < 1) {
       setSendError("Record a little longer before stopping the voice message.");
@@ -6017,9 +6008,30 @@ export function App() {
 
     let blob: Blob;
     try {
-      blob = encodeVoiceNoteWav(chunks);
+      const recording = new Blob(chunks, {
+        type: recorder?.mimeType || chunks[0]?.type || "audio/webm",
+      });
+      if (recording.size === 0) throw new Error("The microphone recording was empty. Try again.");
+      const decoder = new AudioContext();
+      try {
+        const decoded = await decoder.decodeAudioData(await recording.arrayBuffer());
+        const monoSamples = new Float32Array(decoded.length);
+        for (let channel = 0; channel < decoded.numberOfChannels; channel += 1) {
+          const channelSamples = decoded.getChannelData(channel);
+          for (let index = 0; index < decoded.length; index += 1) {
+            monoSamples[index] += channelSamples[index] / decoded.numberOfChannels;
+          }
+        }
+        blob = encodeVoiceNoteWav(monoSamples, decoded.sampleRate);
+      } finally {
+        await decoder.close();
+      }
     } catch (error) {
-      setSendError(error instanceof Error ? error.message : "Could not prepare the voice message.");
+      setSendError(
+        error instanceof Error
+          ? `Could not prepare the microphone recording: ${error.message}`
+          : "Could not prepare the microphone recording. Please try again.",
+      );
       return;
     }
     if (blob.size > MAX_CHAT_ATTACHMENT_SOURCE_BYTES) {
@@ -6036,6 +6048,7 @@ export function App() {
     const createdAt = new Date();
     const localPreviewUrl = URL.createObjectURL(file);
     localVoicePreviewUrlsRef.current.set(id, localPreviewUrl);
+    voiceNoteRenderKeysRef.current.set(id, `voice-note:${id}`);
     autoSendVoiceMessageIdRef.current = id;
     setMessages((current) => [
       ...current,
@@ -6072,64 +6085,50 @@ export function App() {
       setSendError("Send or remove the current attachments before recording a voice message.");
       return;
     }
+    if (!window.isSecureContext) {
+      setSendError(
+        "Microphone access requires a secure connection. On a phone, open the app over HTTPS; the local network HTTP address cannot request microphone access.",
+      );
+      return;
+    }
     if (!navigator.mediaDevices?.getUserMedia || typeof AudioContext === "undefined") {
-      setSendError("Voice recording is not available in this browser.");
+      setSendError("Voice recording is not supported by this browser.");
       return;
     }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          channelCount: 1,
-        },
-      });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const audioContext = new AudioContext();
       const source = audioContext.createMediaStreamSource(stream);
       const analyser = audioContext.createAnalyser();
       analyser.fftSize = 512;
       source.connect(analyser);
-      const processor = audioContext.createScriptProcessor(4096, 1, 1);
-      const silentGain = audioContext.createGain();
-      silentGain.gain.value = 0;
-      source.connect(processor);
-      processor.connect(silentGain);
-      silentGain.connect(audioContext.destination);
-      processor.onaudioprocess = (event) => {
-        const input = event.inputBuffer.getChannelData(0);
-        const ratio = audioContext.sampleRate / VOICE_NOTE_SAMPLE_RATE;
-        const output = new Int16Array(Math.floor(input.length / ratio));
-        for (let outputIndex = 0; outputIndex < output.length; outputIndex += 1) {
-          const start = Math.floor(outputIndex * ratio);
-          const end = Math.min(input.length, Math.floor((outputIndex + 1) * ratio));
-          let sum = 0;
-          for (let inputIndex = start; inputIndex < end; inputIndex += 1) {
-            sum += input[inputIndex];
-          }
-          const sample = Math.max(-1, Math.min(1, sum / Math.max(1, end - start)));
-          output[outputIndex] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-        }
-        voiceRecordingPcmChunksRef.current.push(output);
+      const supportedMimeType = ["audio/webm;codecs=opus", "audio/mp4"].find((mimeType) =>
+        MediaRecorder.isTypeSupported(mimeType),
+      );
+      const recorder = supportedMimeType
+        ? new MediaRecorder(stream, { mimeType: supportedMimeType, audioBitsPerSecond: 128_000 })
+        : new MediaRecorder(stream);
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) voiceRecordingChunksRef.current.push(event.data);
       };
+      recorder.onstop = () => void finishVoiceRecording();
       voiceRecordingStreamRef.current = stream;
       voiceRecordingAudioContextRef.current = audioContext;
       voiceRecordingAnalyserRef.current = analyser;
-      voiceRecordingProcessorRef.current = processor;
-      voiceRecordingGainRef.current = silentGain;
-      voiceRecordingPcmChunksRef.current = [];
-      voiceRecorderRef.current = { stop: () => void finishVoiceRecording() };
+      voiceRecordingChunksRef.current = [];
+      voiceRecorderRef.current = recorder;
       voiceRecordingCancelledRef.current = false;
       voiceRecordingStartAtRef.current = Date.now();
       await audioContext.resume();
+      recorder.start(250);
       setIsRecordingVoice(true);
       setSendError("");
       voiceRecordingTimerRef.current = setInterval(() => {
         const elapsedSeconds = Math.floor((Date.now() - voiceRecordingStartAtRef.current) / 1000);
         setVoiceRecordingSeconds(elapsedSeconds);
         const maxRecordingSeconds = Math.floor(
-          MAX_CHAT_ATTACHMENT_SOURCE_BYTES / (VOICE_NOTE_SAMPLE_RATE * 2),
+          MAX_CHAT_ATTACHMENT_SOURCE_BYTES / (audioContext.sampleRate * 2),
         );
         if (elapsedSeconds >= maxRecordingSeconds) {
           stopVoiceRecording(true);
@@ -6156,14 +6155,20 @@ export function App() {
         setVoiceRecordingWaveform(bars);
       }, 250);
     } catch (error) {
-      voiceRecordingPcmChunksRef.current = [];
+      voiceRecordingChunksRef.current = [];
       await releaseVoiceRecording().catch((releaseError: unknown) => {
         console.warn("Could not clean up a failed voice recording.", releaseError);
       });
       setSendError(
-        error instanceof Error
-          ? `Could not start voice recording: ${error.message}`
-          : "Could not start voice recording. Check microphone permission and try again.",
+        error instanceof DOMException && error.name === "NotAllowedError"
+          ? "Microphone access was blocked. Allow microphone access for this site in your browser settings, then try again."
+          : error instanceof DOMException && error.name === "NotFoundError"
+            ? "No microphone was found on this device."
+            : error instanceof DOMException && error.name === "NotReadableError"
+              ? "The microphone is busy or unavailable. Close other apps using it, then try again."
+              : error instanceof Error
+                ? `Could not start voice recording: ${error.message}`
+                : "Could not start voice recording. Check microphone permission and try again.",
       );
     }
   }
@@ -6172,14 +6177,18 @@ export function App() {
     const recorder = voiceRecorderRef.current;
     voiceRecordingCancelledRef.current = cancel;
     if (cancel) {
-      voiceRecordingPcmChunksRef.current = [];
-      void releaseVoiceRecording().catch((error: unknown) => {
-        console.warn("Could not cancel the voice recording cleanly.", error);
-      });
+      voiceRecordingChunksRef.current = [];
+      if (recorder && recorder.state !== "inactive") {
+        recorder.stop();
+      } else {
+        void releaseVoiceRecording().catch((error: unknown) => {
+          console.warn("Could not cancel the voice recording cleanly.", error);
+        });
+      }
     } else if (recorder) {
-      recorder.stop();
+      if (recorder.state !== "inactive") recorder.stop();
     } else {
-      voiceRecordingPcmChunksRef.current = [];
+      voiceRecordingChunksRef.current = [];
       void releaseVoiceRecording().catch((error: unknown) => {
         console.warn("Could not stop the voice recording cleanly.", error);
       });
@@ -7038,10 +7047,15 @@ export function App() {
       if (targetIndex < 0) {
         throw new Error("Reload the conversation before deleting this message branch.");
       }
-      const attachmentIds = messages
-        .slice(targetIndex)
-        .flatMap((message) => message.attachments ?? [])
-        .map((attachment) => attachment.id);
+      const removedMessages = messages.slice(targetIndex);
+      const removedMessageIds = new Set(removedMessages.map((message) => message.id));
+      const attachmentIds = [
+        ...new Set(
+          removedMessages
+            .flatMap((message) => message.attachments ?? [])
+            .map((attachment) => attachment.id),
+        ),
+      ];
       if (attachmentIds.length > 0) await deleteStoredAttachments(attachmentIds);
 
       closeTts();
@@ -7054,7 +7068,29 @@ export function App() {
       }
 
       clearGeminiSpeechCache(deletion.messageIds);
-      const removedIds = new Set(messages.slice(targetIndex).map((item) => item.id));
+      const removedIds = new Set([...removedMessageIds, ...deletion.messageIds]);
+      const localDraftIds = new Set([...attachmentIds, ...removedMessageIds]);
+      for (const attachmentId of attachmentIds) {
+        const renderKey = voiceNoteRenderKeysRef.current.get(attachmentId);
+        if (!renderKey?.startsWith("voice-note:")) continue;
+        localDraftIds.add(renderKey.slice("voice-note:".length));
+      }
+      let draftCleanupError: unknown = null;
+      if (authUser && localDraftIds.size > 0) {
+        const cleanupResults = await Promise.allSettled(
+          [...localDraftIds].map((id) => removeChatAttachmentDraft(authUser.id, id)),
+        );
+        draftCleanupError = cleanupResults.find(
+          (result): result is PromiseRejectedResult => result.status === "rejected",
+        )?.reason;
+      }
+      for (const id of localDraftIds) {
+        const previewUrl = localVoicePreviewUrlsRef.current.get(id);
+        if (previewUrl) URL.revokeObjectURL(previewUrl);
+        localVoicePreviewUrlsRef.current.delete(id);
+        voiceNoteRenderKeysRef.current.delete(id);
+      }
+      for (const id of attachmentIds) voiceNoteRenderKeysRef.current.delete(id);
       setMessages((current) => current.slice(0, targetIndex));
       setMessageVersions((current) =>
         Object.fromEntries(Object.entries(current).filter(([id]) => !removedIds.has(id))),
@@ -7074,7 +7110,16 @@ export function App() {
       );
       setActiveUserActions(null);
       setDeleteChatTarget(null);
-      showActionToast("Message and following conversation deleted.");
+      if (draftCleanupError) {
+        const message =
+          draftCleanupError instanceof Error
+            ? `The conversation was deleted, but a local attachment draft could not be removed: ${draftCleanupError.message}`
+            : "The conversation was deleted, but a local attachment draft could not be removed.";
+        setSendError(message);
+        showAttachmentToast(message);
+      } else {
+        showActionToast("Message and following conversation deleted.");
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Could not delete this message branch.";
       setSendError(message);
@@ -8589,9 +8634,19 @@ export function App() {
               ) : null;
 
               if (chatMessage.role === "user") {
+                const voiceAttachmentId = isVoiceNote
+                  ? chatMessage.attachments?.find((attachment) =>
+                      attachment.mime_type.startsWith("audio/"),
+                    )?.id
+                  : null;
                 return (
                   <article
-                    key={chatMessage.id}
+                    key={
+                      voiceAttachmentId
+                        ? voiceNoteRenderKeysRef.current.get(voiceAttachmentId) ??
+                          `voice-note:${voiceAttachmentId}`
+                        : chatMessage.id
+                    }
                     className={`${
                       isVoiceNote ? "voice-message-action-group" : "user-message-action-group"
                     } relative flex w-full flex-col items-end`}
@@ -9452,7 +9507,7 @@ export function App() {
           <div
             data-user-actions
             aria-label="Message options"
-            className="w-full max-w-sm overflow-hidden rounded-[28px] bg-white py-2 shadow-2xl"
+            className="w-full max-w-sm select-none overflow-hidden rounded-[28px] bg-white py-2 shadow-2xl"
           >
             {!selectedUserMessageIsVoiceNote && <button
               type="button"
