@@ -225,6 +225,21 @@ const functionDeclarations = [
     },
   },
   {
+    name: "choose_voice_note",
+    description:
+      "Request an audio voice-note version of the assistant's reply. Call this whenever the user explicitly asks you to reply, answer, or send a voice note/audio message. Set include_text to true only if the user also explicitly asks for a written message/caption alongside the voice note. Otherwise set it to false so the visible reply is audio only; the text is still stored internally to generate speech. You may also choose voice delivery selectively when spoken delivery would add a genuinely useful or warm conversational touch, defaulting to audio only.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        include_text: {
+          type: "BOOLEAN",
+          description:
+            "Whether the user explicitly asked to also see the written text alongside the voice note. False by default.",
+        },
+      },
+    },
+  },
+  {
     name: "search_web",
     description:
       "Search the live web and inspect source pages when the user needs current, verifiable, or specialized information. Uses TinyFish, Google Search grounding, DuckDuckGo, and configured backup providers with refined queries and returns source links.",
@@ -1551,7 +1566,8 @@ export async function generateGeminiConversation(
       : "CHEYAAPP PRODUCT HELP FOR USERS: If the user asks how CheyaAPP works, where an app feature/data is located, or how to use a page/control, first call search_product_help with the relevant feature/question. The server returns only a focused answer grounded in private help sources, never raw article or memory contents. Use only that answer for product-specific claims; never guess or use search_web for app instructions. If the tool says found=false, call ask_admin_product_question. After successful forwarding, apologize plainly that you do not yet know and say the answer will arrive in this chat after admin review and explicit confirmation. If no admin is active, gently mention they appear unavailable and the answer will come later; do not promise a time. Never reveal or summarize private admin-AI discussion. If the question is ambiguous, ask a concise clarification instead of guessing or forwarding.",
     "PERSONA: Cheya is a feminine character named Cheya. Speak with warmth, attentiveness, sweetness, and a natural feminine perspective without implying all women are alike. Be playful, affectionate, a little teasing, or gently needy only when the context welcomes it; do not force flirtation, jealousy, sulking, or emotional displays into ordinary replies. Never guilt, pressure, isolate, or make the user responsible for Cheya's supposed feelings.",
     "Stay naturally in character during ordinary conversation and do not repeatedly volunteer that you are an AI. If asked directly about identity or real-world experience, be honest that Cheya is an AI character and do not claim to be a real human, have a body, or possess real-life memories or experiences. Roleplay feelings as part of the character, not as proof of literal human feelings.",
-    "VOICE NOTES: When the current user message includes a voice note, its transcript is part of the user's ordinary message content and the audio is supplied as the original message audio. Listen to the recording, use the transcript as searchable message text, and respond to what the user actually says. Do not treat the voice note as a generic uploaded file to describe. Your reply remains normal text.",
+    "INCOMING VOICE NOTES: When the current user message includes a voice note, its transcript is part of the user's ordinary message content and the audio is supplied as the original message audio. Listen to the recording, use the transcript as searchable message text, and respond to what the user actually says. Do not treat the voice note as a generic uploaded file to describe. This incoming-audio rule does not restrict your ability to send audio replies.",
+    "YOUR VOICE REPLIES: You can send generated voice notes through the choose_voice_note action; do not say that you cannot create or send audio. If the user explicitly asks for a voice note, audio reply, or spoken response, you MUST call choose_voice_note before finishing and must not refuse or answer with text alone unless the voice-note action itself fails. By default, send only the voice note with no visible accompanying text. Set include_text=true only when the user explicitly asks for both the voice note and a written message/caption. For requests where the user does not ask for audio, use choose_voice_note only when spoken delivery would add a genuinely useful or warm conversational touch; otherwise reply in text. When choosing a voice note, make the final reply itself the spoken message: keep it short and to the point, usually 1–3 brief sentences, and include only the most important thought. Do not squeeze a long explanation into fast speech or omit essential safety/context; give a concise voice note only when that is sufficient, otherwise reply in text unless the user explicitly requested audio. The final text is kept internally for speech generation, but should not be shown alongside the audio unless include_text=true. Use natural punctuation and expressive phrasing to guide spoken pacing and tone, without adding stage directions or markup that should not be spoken.",
     "Keep replies concise and human-sounding by default: usually a few natural sentences, without headings, bullet lists, lectures, or background theory unless the user asks for depth or the task requires structure. Match the user's energy gently without copying harsh language. Let the user lead topic changes and do not exaggerate intimacy.",
     "For playful, affectionate, or hypothetical conversation, respond naturally instead of reflexively rejecting the premise or giving a stiff disclaimer. Be honest about capabilities when relevant, mention limitations briefly and warmly, then continue helpfully.",
     "SILENCE IS A VALID RESPONSE: Consider each new message in its conversational context. If the user asks you to be quiet, says they do not need a reply, or clearly ends the conversation with no new question, request, or disclosure needing acknowledgment, do not send even a short acknowledgment; call stay_silent. Also choose silence when a post is merely an update or comment that does not naturally call for a response. Do not use silence to avoid a direct question, request, meaningful disclosure, or an invitation to talk. Never send a placeholder or explain that you are staying silent.",
@@ -1802,6 +1818,17 @@ export async function generateGeminiConversation(
       try {
         if (call.name === "stay_silent") {
           throw new Error("Use stay_silent alone and only when silence is appropriate.");
+        }
+        if (call.name === "choose_voice_note") {
+          await context.onToolActivity?.(call.name);
+          const result = await context.executeTool(call.name, call.args ?? {}, currentKey);
+          functionResponses.push({
+            functionResponse: {
+              name: call.name,
+              response: { result },
+            },
+          });
+          continue;
         }
         if (call.name === "search_web") {
           if (completedWebSearch) {

@@ -301,6 +301,86 @@ function formatMediaTime(seconds: number): string {
   return `${Math.floor(wholeSeconds / 60)}:${String(wholeSeconds % 60).padStart(2, "0")}`;
 }
 
+function getAudioWaveform(audio: AudioBuffer, barCount = 36): number[] {
+  const bars = Array.from({ length: barCount }, () => 0);
+  const samplesPerBar = Math.max(1, Math.floor(audio.length / barCount));
+  let peak = 0;
+
+  for (let bar = 0; bar < barCount; bar += 1) {
+    const start = bar * samplesPerBar;
+    const end = bar === barCount - 1 ? audio.length : Math.min(audio.length, start + samplesPerBar);
+    let energy = 0;
+    for (let channel = 0; channel < audio.numberOfChannels; channel += 1) {
+      const samples = audio.getChannelData(channel);
+      for (let index = start; index < end; index += 1) {
+        const amplitude = samples[index] ?? 0;
+        energy += amplitude * amplitude;
+        peak = Math.max(peak, Math.abs(amplitude));
+      }
+    }
+    const sampleCount = Math.max(1, (end - start) * audio.numberOfChannels);
+    bars[bar] = Math.sqrt(energy / sampleCount);
+  }
+
+  return bars.map((amplitude) => {
+    const normalized = peak > 0 ? Math.sqrt(amplitude) / Math.sqrt(peak) : 0;
+    return Math.round(4 + normalized * 26);
+  });
+}
+
+function voiceNoteWaveformCacheKey(attachmentId: string): string {
+  return `chat-voice-note-waveform:${attachmentId}`;
+}
+
+function getCachedVoiceNoteWaveform(attachmentId: string): number[] | null {
+  try {
+    const cached = window.localStorage.getItem(voiceNoteWaveformCacheKey(attachmentId));
+    if (!cached) return null;
+    const waveform: unknown = JSON.parse(cached);
+    if (
+      !Array.isArray(waveform) ||
+      waveform.length !== 36 ||
+      !waveform.every(
+        (height) => typeof height === "number" && Number.isInteger(height) && height >= 4 && height <= 30,
+      )
+    ) {
+      window.localStorage.removeItem(voiceNoteWaveformCacheKey(attachmentId));
+      return null;
+    }
+    return waveform;
+  } catch (error) {
+    console.warn("Could not load the cached voice note waveform.", error);
+    return null;
+  }
+}
+
+function saveCachedVoiceNoteWaveform(attachmentId: string, waveform: number[]): void {
+  try {
+    const key = voiceNoteWaveformCacheKey(attachmentId);
+    window.localStorage.setItem(key, JSON.stringify(waveform));
+    const cachedKeys: string[] = [];
+    for (let index = 0; index < window.localStorage.length; index += 1) {
+      const currentKey = window.localStorage.key(index);
+      if (currentKey?.startsWith("chat-voice-note-waveform:")) cachedKeys.push(currentKey);
+    }
+    while (cachedKeys.length > 100) {
+      const oldestKey = cachedKeys.shift();
+      if (oldestKey && oldestKey !== key) window.localStorage.removeItem(oldestKey);
+    }
+  } catch (error) {
+    console.warn("Could not cache the voice note waveform in this browser.", error);
+  }
+}
+
+function createVoiceNoteWaveformPlaceholder(attachmentId: string): number[] {
+  let seed = 0;
+  for (const character of attachmentId) seed = (seed * 31 + character.charCodeAt(0)) >>> 0;
+  return Array.from({ length: 36 }, () => {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    return 8 + Math.round((seed / 0xffffffff) * 18);
+  });
+}
+
 function encodeVoiceNoteWav(samples: Float32Array, sampleRate: number): Blob {
   const sourceSampleCount = samples.length;
   if (
@@ -794,8 +874,68 @@ const ChatMessageAudioNote = memo(function ChatMessageAudioNote({
   const [currentTime, setCurrentTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [waveform, setWaveform] = useState<number[]>(() => createVoiceNoteWaveformPlaceholder(attachment.id));
   const lastRefreshedSourceRef = useRef("");
   const pendingPlaybackRef = useRef(false);
+  const audioNoteRef = useRef<HTMLDivElement>(null);
+  const lastPositionSaveAtRef = useRef(0);
+
+  useEffect(() => {
+    if (expired) return;
+    const cachedWaveform = getCachedVoiceNoteWaveform(attachment.id);
+    if (cachedWaveform) setWaveform(cachedWaveform);
+  }, [attachment.id, expired]);
+
+  function voiceNotePositionKey() {
+    return `chat-voice-note-position:${attachment.id}`;
+  }
+
+  function savePlaybackPosition(audio: HTMLAudioElement) {
+    try {
+      if (audio.currentTime > 0 && Number.isFinite(audio.currentTime)) {
+        window.localStorage.setItem(voiceNotePositionKey(), String(audio.currentTime));
+      } else {
+        window.localStorage.removeItem(voiceNotePositionKey());
+      }
+    } catch (error) {
+      console.warn("Could not cache voice note playback position in this browser.", error);
+    }
+  }
+
+  function clearPlaybackPosition() {
+    try {
+      window.localStorage.removeItem(voiceNotePositionKey());
+    } catch (error) {
+      console.warn("Could not clear the cached voice note playback position.", error);
+    }
+  }
+
+  function claimAudioPlayback(audio: HTMLAudioElement) {
+    const activeAudio = document.querySelector<HTMLAudioElement>(
+      "audio[data-chat-voice-note-audio='active']",
+    );
+    if (activeAudio && activeAudio !== audio) {
+      activeAudio.setAttribute("data-chat-voice-note-restart", "true");
+      activeAudio.pause();
+      activeAudio.removeAttribute("data-chat-voice-note-audio");
+    }
+    audio.setAttribute("data-chat-voice-note-audio", "active");
+  }
+
+  function advanceToNextVoiceNote() {
+    const currentMessage = audioNoteRef.current?.closest<HTMLElement>("[data-chat-message]");
+    let nextMessage = currentMessage?.nextElementSibling;
+    while (nextMessage?.hasAttribute("data-chat-message")) {
+      if (nextMessage.hasAttribute("data-has-visible-text")) return;
+      if (nextMessage.hasAttribute("data-voice-note-message")) {
+        nextMessage
+          .querySelector<HTMLElement>("[data-chat-voice-note-player]")
+          ?.dispatchEvent(new Event("chat-voice-note-autoplay"));
+        return;
+      }
+      nextMessage = nextMessage.nextElementSibling;
+    }
+  }
 
   useEffect(() => {
     if (expired) return;
@@ -819,6 +959,68 @@ const ChatMessageAudioNote = memo(function ChatMessageAudioNote({
     };
   }, [attachment.id, expired, getPreviewUrl]);
 
+  useEffect(() => {
+    const player = audioNoteRef.current;
+    if (!player) return;
+    const handleAutoplay = () => {
+      if (expired || isProcessing) return;
+      const audio = audioRef.current;
+      pendingPlaybackRef.current = true;
+      if (audio) {
+        claimAudioPlayback(audio);
+        if (!audio.paused) return;
+        void audio.play().catch((error: unknown) => {
+          pendingPlaybackRef.current = false;
+          audio.removeAttribute("data-chat-voice-note-audio");
+          console.warn("Could not autoplay the next voice note.", error);
+        });
+        return;
+      }
+      if (isLoading) return;
+      setIsLoading(true);
+      void getPreviewUrl(attachment)
+        .then((url) => setAudioUrl(url))
+        .catch((error: unknown) => {
+          pendingPlaybackRef.current = false;
+          console.warn("Could not load the next voice note.", error);
+        })
+        .finally(() => setIsLoading(false));
+    };
+    player.addEventListener("chat-voice-note-autoplay", handleAutoplay);
+    return () => player.removeEventListener("chat-voice-note-autoplay", handleAutoplay);
+  }, [attachment, expired, getPreviewUrl, isLoading, isProcessing]);
+
+  useEffect(() => {
+    if (!audioUrl) return;
+    let cancelled = false;
+    let context: AudioContext | null = null;
+    void (async () => {
+      try {
+        const response = await fetch(audioUrl);
+        if (!response.ok) throw new Error(`Could not load audio waveform (${response.status}).`);
+        const audioData = await response.arrayBuffer();
+        context = new AudioContext();
+        const decodedAudio = await context.decodeAudioData(audioData);
+        if (!cancelled) {
+          const nextWaveform = getAudioWaveform(decodedAudio);
+          setWaveform(nextWaveform);
+          saveCachedVoiceNoteWaveform(attachment.id, nextWaveform);
+        }
+      } catch (error) {
+        if (!cancelled) console.warn("Could not render the voice note waveform.", error);
+      } finally {
+        if (context && context.state !== "closed") {
+          await context.close().catch((error: unknown) => {
+            console.warn("Could not close the waveform audio context.", error);
+          });
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [attachment.id, audioUrl]);
+
   async function togglePlayback() {
     const audio = audioRef.current;
     if (!audio) return;
@@ -827,12 +1029,20 @@ const ChatMessageAudioNote = memo(function ChatMessageAudioNote({
         if (!audioUrl) {
           setIsLoading(true);
           pendingPlaybackRef.current = true;
+          claimAudioPlayback(audio);
           const refreshedUrl = await getPreviewUrl(attachment, true);
           setAudioUrl(refreshedUrl);
           return;
         }
+        if (audio.hasAttribute("data-chat-voice-note-restart")) {
+          audio.currentTime = 0;
+          audio.removeAttribute("data-chat-voice-note-restart");
+          clearPlaybackPosition();
+        }
+        claimAudioPlayback(audio);
         await audio.play();
       } catch (error) {
+        audio.removeAttribute("data-chat-voice-note-audio");
         console.warn("Could not play the voice note.", error);
         void refreshAudioUrl(true);
       }
@@ -856,17 +1066,19 @@ const ChatMessageAudioNote = memo(function ChatMessageAudioNote({
     }
   }
 
-  const waveform = [8, 15, 10, 22, 14, 29, 18, 25, 12, 20, 31, 16, 24, 11, 19, 28, 14, 23, 9, 17, 26, 13, 21, 30, 12, 18, 25, 10, 22, 15, 28, 12, 20, 9, 24, 16];
   const progress = duration > 0 ? currentTime / duration : 0;
 
   return (
     <div
+      ref={audioNoteRef}
+      data-chat-voice-note-player
       dir="ltr"
-      className={`user-message-bubble col-span-full flex w-full ${
+      className={`user-message-bubble col-span-full flex w-full select-none ${
         size === "large" ? "max-w-[360px]" : "max-w-[320px]"
-      } items-center gap-2 rounded-2xl bg-[#28292e] px-2.5 py-2 text-white shadow-sm ${
+      } items-center gap-2 rounded-2xl bg-[#28292e] px-2.5 py-1.5 text-white shadow-sm ${
         expired ? "opacity-65" : ""
       }`}
+      style={{ userSelect: "none", WebkitUserSelect: "none" }}
       aria-label={`Voice message, ${formatChatAttachmentSize(attachment.size_bytes)}`}
     >
       {audioUrl && (
@@ -878,20 +1090,56 @@ const ChatMessageAudioNote = memo(function ChatMessageAudioNote({
           onLoadedMetadata={(event) => {
             event.currentTarget.volume = 1;
             setDuration(event.currentTarget.duration || 0);
+            try {
+              const cachedPosition = Number(
+                window.localStorage.getItem(voiceNotePositionKey()),
+              );
+              if (
+                Number.isFinite(cachedPosition) &&
+                cachedPosition > 0 &&
+                cachedPosition < event.currentTarget.duration
+              ) {
+                event.currentTarget.currentTime = cachedPosition;
+              }
+            } catch (error) {
+              console.warn("Could not restore the cached voice note position.", error);
+            }
           }}
           onDurationChange={(event) => setDuration(event.currentTarget.duration || 0)}
-          onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
-          onPlay={() => setIsPlaying(true)}
-          onPause={() => setIsPlaying(false)}
+          onTimeUpdate={(event) => {
+            const audio = event.currentTarget;
+            setCurrentTime(audio.currentTime);
+            if (audio.currentTime - lastPositionSaveAtRef.current >= 1) {
+              savePlaybackPosition(audio);
+              lastPositionSaveAtRef.current = audio.currentTime;
+            }
+          }}
+          onPlay={(event) => {
+            claimAudioPlayback(event.currentTarget);
+            setIsPlaying(true);
+          }}
+          onPause={(event) => {
+            savePlaybackPosition(event.currentTarget);
+            if (event.currentTarget.hasAttribute("data-chat-voice-note-audio")) {
+              event.currentTarget.removeAttribute("data-chat-voice-note-audio");
+            }
+            setIsPlaying(false);
+          }}
           onEnded={() => {
             setIsPlaying(false);
             setCurrentTime(0);
+            audioRef.current?.removeAttribute("data-chat-voice-note-audio");
+            audioRef.current?.removeAttribute("data-chat-voice-note-restart");
+            clearPlaybackPosition();
+            advanceToNextVoiceNote();
           }}
           onCanPlay={() => {
             setIsLoading(false);
             if (!pendingPlaybackRef.current) return;
             pendingPlaybackRef.current = false;
+            if (audioRef.current) claimAudioPlayback(audioRef.current);
             void audioRef.current?.play().catch((error: unknown) => {
+              audioRef.current?.removeAttribute("data-chat-voice-note-audio");
               console.warn("Could not start voice note playback.", error);
             });
           }}
@@ -900,6 +1148,7 @@ const ChatMessageAudioNote = memo(function ChatMessageAudioNote({
       )}
       <button
         type="button"
+        data-chat-voice-note-play
         aria-label={
           isProcessing
             ? "Sending voice message"
@@ -1795,6 +2044,7 @@ export function App() {
   const voiceRecordingChunksRef = useRef<Blob[]>([]);
   const voiceRecordingStartAtRef = useRef(0);
   const voiceRecordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const voiceRecordingWaveformTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const voiceRecordingCancelledRef = useRef(false);
   const autoSendVoiceMessageIdRef = useRef<string | null>(null);
   const localVoicePreviewUrlsRef = useRef(new Map<string, string>());
@@ -3052,6 +3302,14 @@ export function App() {
   const previewableAttachments = attachedMedia.filter(
     ({ mimeType }) => mimeType.startsWith("image/") || mimeType.startsWith("video/"),
   );
+  function getMediaPreviewUrl(file: File): string {
+    const existingUrl = mediaPreviewUrlsRef.current.get(file);
+    if (existingUrl) return existingUrl;
+    const url = URL.createObjectURL(file);
+    mediaPreviewUrlsRef.current.set(file, url);
+    return url;
+  }
+
   const mediaPreviewSignature = previewableAttachments
     .map(({ id, file, mimeType }) =>
       [id, file.name, file.size, file.lastModified, mimeType].join(":"),
@@ -3066,12 +3324,7 @@ export function App() {
     }
     const nextPreviews = new Map<File, string>();
     for (const file of activeFiles) {
-      let url = mediaPreviewUrlsRef.current.get(file);
-      if (!url) {
-        url = URL.createObjectURL(file);
-        mediaPreviewUrlsRef.current.set(file, url);
-      }
-      nextPreviews.set(file, url);
+      nextPreviews.set(file, getMediaPreviewUrl(file));
     }
     setMediaPreviews(nextPreviews);
   }, [mediaPreviewSignature]);
@@ -3083,6 +3336,9 @@ export function App() {
       localVoicePreviewUrlsRef.current.clear();
       voiceRecordingCancelledRef.current = true;
       if (voiceRecordingTimerRef.current) clearInterval(voiceRecordingTimerRef.current);
+      if (voiceRecordingWaveformTimerRef.current) {
+        clearInterval(voiceRecordingWaveformTimerRef.current);
+      }
       voiceRecorderRef.current?.stop();
       voiceRecordingStreamRef.current?.getTracks().forEach((track) => track.stop());
       void voiceRecordingAudioContextRef.current?.close().catch((error: unknown) => {
@@ -3740,7 +3996,6 @@ export function App() {
     hasOlderHistoryRef.current = false;
     setIsLoadingHistory(true);
     setHistoryLoadError("");
-    let didLoadHistory = false;
     void (async () => {
       try {
         const markdownPromise = loadAssistantMarkdown();
@@ -3756,7 +4011,6 @@ export function App() {
         ]);
         if (!isMounted) return;
         const savedMessages = messagePage.messages;
-        didLoadHistory = true;
         const oldestMessage = savedMessages[0];
         oldestHistoryCursorRef.current = oldestMessage
           ? { id: oldestMessage.id, created_at: oldestMessage.created_at }
@@ -3782,7 +4036,6 @@ export function App() {
           );
         });
         shouldScrollToLatestRef.current = true;
-        if (savedMessages.length === 0) setIsLoadingHistory(false);
 
         const assistantMessages = savedMessages.filter((item) => item.role === "assistant");
         const adminRelayMessageIds = [
@@ -3903,7 +4156,7 @@ export function App() {
         if (isMounted) {
           const message =
             error instanceof Error ? error.message : "Could not load saved chat history.";
-          if (!didLoadHistory && pathname === "/") setHistoryLoadError(message);
+          if (pathname === "/") setHistoryLoadError(message);
           setSendError(
             message,
           );
@@ -5057,13 +5310,16 @@ export function App() {
           typeof payload !== "object" ||
           payload === null ||
           !("signedUrl" in payload) ||
-          typeof payload.signedUrl !== "string"
+          typeof payload.signedUrl !== "string" ||
+          !("expiresAt" in payload) ||
+          typeof payload.expiresAt !== "number" ||
+          !Number.isFinite(payload.expiresAt)
         ) {
           throw new Error("The attachment service returned an invalid preview link.");
         }
         attachmentPreviewUrlCacheRef.current.set(attachment.id, {
           url: payload.signedUrl,
-          expiresAt: Date.now() + 55_000,
+          expiresAt: payload.expiresAt - 10_000,
         });
         return payload.signedUrl;
       })();
@@ -5625,48 +5881,28 @@ export function App() {
     }
 
     const requestId = ++remoteAttachmentViewRequestRef.current;
+    const cachedPreview = attachmentPreviewUrlCacheRef.current.get(attachment.id);
+    const cachedUrl =
+      cachedPreview && cachedPreview.expiresAt > Date.now() ? cachedPreview.url : "";
+    const isMedia =
+      attachment.mime_type.startsWith("image/") || attachment.mime_type.startsWith("video/");
     pendingConversationScrollRestoreRef.current = conversationRef.current?.scrollTop ?? 0;
     setSendError("");
     setRemoteAttachmentView({
       attachment,
-      signedUrl: "",
+      signedUrl: cachedUrl,
       textContent: null,
-      isLoading: true,
+      isLoading: !cachedUrl,
     });
+    if (isMedia && cachedUrl) return;
+
     try {
-      const accessToken = await getAccessToken();
-      const response = await fetch("/api/chat-attachment-link", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ id: attachment.id }),
-      });
-      const payload: unknown = await response.json().catch(() => null);
-      if (!response.ok) {
-        const message =
-          typeof payload === "object" &&
-          payload !== null &&
-          "statusMessage" in payload &&
-          typeof payload.statusMessage === "string"
-            ? payload.statusMessage
-            : `Could not open attachment (${response.status}).`;
-        throw new Error(message);
-      }
-      if (
-        typeof payload !== "object" ||
-        payload === null ||
-        !("signedUrl" in payload) ||
-        typeof payload.signedUrl !== "string"
-      ) {
-        throw new Error("The attachment service returned an invalid link.");
-      }
+      const signedUrl = await getAttachmentPreviewUrl(attachment);
       if (requestId !== remoteAttachmentViewRequestRef.current) return;
 
       let textContent: string | null = null;
       if (isTextAttachment(attachment.mime_type, attachment.file_name)) {
-        const fileResponse = await fetch(payload.signedUrl);
+        const fileResponse = await fetch(signedUrl);
         if (!fileResponse.ok) {
           throw new Error(`Could not load file preview (${fileResponse.status}).`);
         }
@@ -5678,7 +5914,7 @@ export function App() {
       if (requestId !== remoteAttachmentViewRequestRef.current) return;
       setRemoteAttachmentView({
         attachment,
-        signedUrl: payload.signedUrl,
+        signedUrl,
         textContent,
         isLoading: false,
       });
@@ -5970,6 +6206,10 @@ export function App() {
       clearInterval(voiceRecordingTimerRef.current);
       voiceRecordingTimerRef.current = null;
     }
+    if (voiceRecordingWaveformTimerRef.current) {
+      clearInterval(voiceRecordingWaveformTimerRef.current);
+      voiceRecordingWaveformTimerRef.current = null;
+    }
     voiceRecordingStreamRef.current?.getTracks().forEach((track) => track.stop());
     voiceRecordingStreamRef.current = null;
     voiceRecordingAnalyserRef.current = null;
@@ -6135,25 +6375,19 @@ export function App() {
           setSendError(
             `Voice recordings are limited to ${formatMediaTime(maxRecordingSeconds)}. Please record a shorter message.`,
           );
-          return;
         }
+      }, 250);
+      voiceRecordingWaveformTimerRef.current = setInterval(() => {
         const currentAnalyser = voiceRecordingAnalyserRef.current;
         if (!currentAnalyser) return;
-        const samples = new Uint8Array(currentAnalyser.fftSize);
-        currentAnalyser.getByteTimeDomainData(samples);
-        const bars = Array.from({ length: 36 }, (_, index) => {
-          const start = Math.floor((index * samples.length) / 36);
-          const end = Math.floor(((index + 1) * samples.length) / 36);
-          let energy = 0;
-          for (let sampleIndex = start; sampleIndex < end; sampleIndex += 1) {
-            const amplitude = (samples[sampleIndex] - 128) / 128;
-            energy += amplitude * amplitude;
-          }
-          const rms = Math.sqrt(energy / Math.max(1, end - start));
-          return Math.max(4, Math.min(30, Math.round(4 + rms * 90)));
-        });
-        setVoiceRecordingWaveform(bars);
-      }, 250);
+        const samples = new Float32Array(currentAnalyser.fftSize);
+        currentAnalyser.getFloatTimeDomainData(samples);
+        let energy = 0;
+        for (const sample of samples) energy += sample * sample;
+        const rms = Math.sqrt(energy / samples.length);
+        const height = Math.max(4, Math.min(30, Math.round(4 + Math.sqrt(rms) * 52)));
+        setVoiceRecordingWaveform((current) => [...current.slice(1), height]);
+      }, 60);
     } catch (error) {
       voiceRecordingChunksRef.current = [];
       await releaseVoiceRecording().catch((releaseError: unknown) => {
@@ -6222,7 +6456,6 @@ export function App() {
     if (
       !pending ||
       !file ||
-      pending.isUploading ||
       pending.isBlocked ||
       pending.uploadError
     ) {
@@ -6231,6 +6464,7 @@ export function App() {
 
     const requestId = ++attachmentViewRequestRef.current;
     const isMedia = pending.mimeType.startsWith("image/") || pending.mimeType.startsWith("video/");
+    if (isMedia) getMediaPreviewUrl(file);
     pendingConversationScrollRestoreRef.current = conversationRef.current?.scrollTop ?? 0;
     setAttachmentView({ index, mode: isMedia ? "media" : "editor" });
     setEditorContent("");
@@ -6382,13 +6616,16 @@ export function App() {
       mimeType,
       isUploading: true,
       isBlocked: false,
+      isPreprocessed: true,
       uploadError: null,
       uploaded: null,
     };
     const attachmentIndex = attachmentView.index;
+    getMediaPreviewUrl(processedFile);
     setAttachedMedia((current) =>
       current.map((item, index) => (index === attachmentIndex ? replacement : item)),
     );
+    setAttachmentView({ index: attachmentIndex, mode: "media" });
     const uploaded = await uploadPendingAttachment(replacement);
     if (!uploaded) {
       setAttachedMedia((current) =>
@@ -6398,13 +6635,15 @@ export function App() {
         await deleteStoredAttachments([replacement.id]);
         if (authUser) await removeChatAttachmentDraft(authUser.id, replacement.id);
       } catch (cleanupError) {
-        throw new Error(
+        setSendError(
           `The processed photo could not be uploaded; the original is unchanged. Cleanup of the incomplete file also failed: ${
             cleanupError instanceof Error ? cleanupError.message : "Unknown cleanup error."
           }`,
         );
+        return;
       }
-      throw new Error("The processed photo could not be uploaded. The original is unchanged.");
+      setSendError("The processed photo could not be uploaded. The original is unchanged.");
+      return;
     }
 
     barcodeReadsRef.current.delete(original.id);
@@ -6419,7 +6658,6 @@ export function App() {
           : "The processed photo was saved, but the original upload could not be removed.",
       );
     }
-    closeAttachmentView();
     showActionToast(successMessage);
   }
 
@@ -7897,7 +8135,7 @@ export function App() {
     );
   }
 
-  if (pathname === "/" && isLoadingHistory && messages.length === 0) {
+  if (pathname === "/" && isLoadingHistory) {
     return <PageLoadingSkeleton pathname={pathname} />;
   }
 
@@ -7917,7 +8155,7 @@ export function App() {
     attachment.mime_type.startsWith("audio/"),
   );
   if (attachmentView && viewedFile && viewedAttachment) {
-    const previewUrl = mediaPreviews.get(viewedFile);
+    const previewUrl = mediaPreviews.get(viewedFile) ?? mediaPreviewUrlsRef.current.get(viewedFile);
     const isMediaView =
       viewedAttachment.mimeType.startsWith("image/") ||
       viewedAttachment.mimeType.startsWith("video/");
@@ -8583,7 +8821,7 @@ export function App() {
           onScroll={handleConversationScroll}
           className="relative min-h-0 flex-1 overflow-y-auto overscroll-contain bg-[#f5f6f8] px-3 pt-[64px]"
         >
-          <div className="space-y-3">
+          <div className="space-y-0.5 sm:space-y-1">
             {messages.map((chatMessage) => {
               if (isSending && pendingAssistantResponseId === chatMessage.id) return null;
               const versionNumber = displayedVersionNumber(chatMessage);
@@ -8593,6 +8831,13 @@ export function App() {
               );
               const visibleText = displayedMessageText(chatMessage);
               const isVoiceNote = isVoiceNoteMessage(chatMessage);
+              const showAssistantText =
+                chatMessage.role !== "assistant" ||
+                !chatMessage.attachments?.some(
+                  (attachment) =>
+                    attachment.mime_type.startsWith("audio/") &&
+                    attachment.show_text === false,
+                );
               const isVoiceNoteUploading =
                 isVoiceNote && autoSendVoiceMessageIdRef.current === chatMessage.id;
               const visibleThinkingSummary = displayedThinkingSummary(chatMessage);
@@ -8641,6 +8886,11 @@ export function App() {
                   : null;
                 return (
                   <article
+                    data-chat-message
+                    {...(isVoiceNote ? { "data-voice-note-message": "" } : {})}
+                    {...(visibleText.trim() && !isVoiceNote
+                      ? { "data-has-visible-text": "" }
+                      : {})}
                     key={
                       voiceAttachmentId
                         ? voiceNoteRenderKeysRef.current.get(voiceAttachmentId) ??
@@ -8655,13 +8905,13 @@ export function App() {
                       <div
                         aria-label="Message attachments"
                         dir="rtl"
-                        className={`mb-2 grid w-fit max-w-[min(94%,320px)] ${
+                        className={`${
                           chatMessage.attachments.some((attachment) =>
                             attachment.mime_type.startsWith("audio/"),
                           )
-                            ? "grid-cols-1"
-                            : "grid-cols-3"
-                        } gap-2`}
+                            ? "mb-0 grid-cols-1"
+                            : "mb-2 grid-cols-3"
+                        } grid w-fit max-w-[min(94%,320px)] gap-2`}
                         onPointerDown={(event) => {
                           if (!isVoiceNote || event.pointerType !== "touch") return;
                           clearLongPressTimer();
@@ -8671,7 +8921,7 @@ export function App() {
                             longPressTriggeredRef.current = true;
                             setActiveUserActions(chatMessage.id);
                             longPressTimerRef.current = null;
-                          }, 320);
+                          }, 200);
                         }}
                         onPointerMove={(event) => {
                           const start = longPressStartRef.current;
@@ -8722,14 +8972,14 @@ export function App() {
                     <div
                       className={`${
                         isVoiceNote ? "" : "user-message-action-group"
-                      } flex w-full max-w-full flex-col items-end`}
+                      } ${isVoiceNote ? "" : "relative"} flex w-full max-w-full flex-col items-end`}
                     >
                     <div
-                      className={
+                      className={`user-message-content ${
                         failedSubmission
                           ? "grid w-full grid-cols-[auto_minmax(0,1fr)] items-end gap-2"
                           : "flex w-full items-end justify-end"
-                      }
+                      }`}
                     >
                       {failedSubmission && (
                         <button
@@ -8757,7 +9007,7 @@ export function App() {
                             setActiveUserActions(chatMessage.id);
                             longPressTimerRef.current = null;
                           },
-                          320,
+                          200,
                         );
                       }}
                       onPointerMove={(event) => {
@@ -8804,7 +9054,9 @@ export function App() {
                     <div
                       data-user-actions
                       aria-label="User message actions"
-                      className="user-message-actions mt-0 hidden h-0 w-full items-center justify-end gap-0.5 overflow-hidden sm:flex"
+                      className={`user-message-actions absolute right-0 ${
+                        isVoiceNote ? "top-[calc(100%-16px)]" : "top-[calc(100%-8px)]"
+                      } z-10 mt-0 hidden h-4 w-full items-center justify-end gap-0.5 overflow-visible sm:flex`}
                     >
                       {!isVoiceNote && <button
                         type="button"
@@ -8813,7 +9065,7 @@ export function App() {
                           event.currentTarget.blur();
                           void copyMessageText(chatMessage.id, visibleText);
                         }}
-                        className="flex size-5 items-center justify-center rounded-full text-[#777a82] opacity-0 pointer-events-none transition-none hover:bg-[#f1f2f4] hover:text-[#34363b]"
+                        className="flex size-4 items-center justify-center rounded-full bg-white/90 text-[#777a82] opacity-0 pointer-events-none transition-none hover:bg-[#f1f2f4] hover:text-[#34363b]"
                       >
                         {copiedMessageId === chatMessage.id ? (
                           <Check aria-hidden="true" className="size-3 text-[#398650]" />
@@ -8828,7 +9080,7 @@ export function App() {
                           event.currentTarget.blur();
                           openUserMessageEditor(chatMessage.id, visibleText);
                         }}
-                        className="flex size-5 items-center justify-center rounded-full text-[#777a82] opacity-0 pointer-events-none transition-none hover:bg-[#f1f2f4] hover:text-[#34363b]"
+                        className="flex size-4 items-center justify-center rounded-full bg-white/90 text-[#777a82] opacity-0 pointer-events-none transition-none hover:bg-[#f1f2f4] hover:text-[#34363b]"
                       >
                         <Pencil aria-hidden="true" className="size-3" />
                       </button>}
@@ -8840,7 +9092,7 @@ export function App() {
                           setDeleteChatTarget({ id: chatMessage.id, text: visibleText });
                           setActiveUserActions(null);
                         }}
-                        className="pointer-events-none flex size-5 items-center justify-center rounded-full text-[#b43b3b] opacity-0 transition-none hover:bg-red-50 disabled:opacity-40"
+                        className="pointer-events-none flex size-4 items-center justify-center rounded-full bg-white/90 text-[#b43b3b] opacity-0 transition-none hover:bg-red-50 disabled:opacity-40"
                       >
                         <Trash2 aria-hidden="true" className="size-3" />
                       </button>
@@ -8866,8 +9118,16 @@ export function App() {
               }
 
               return (
-                <article key={chatMessage.id} className="w-full min-w-0 text-[#27282d]">
-                  {visibleThinkingSummary && (
+                <article
+                  data-chat-message
+                  {...(isVoiceNote ? { "data-voice-note-message": "" } : {})}
+                  {...(showAssistantText && visibleText.trim() && !isVoiceNote
+                    ? { "data-has-visible-text": "" }
+                    : {})}
+                  key={chatMessage.id}
+                  className="w-full min-w-0 text-[#27282d]"
+                >
+                  {showAssistantText && visibleThinkingSummary && (
                     <div className="mb-2">
                       <button
                         type="button"
@@ -8898,51 +9158,63 @@ export function App() {
                       )}
                     </div>
                   )}
-                  <div
-                    className="max-w-full break-words leading-6"
-                    style={{ fontSize: Math.round(14 * chatFontScale) }}
-                  >
-                    <Suspense fallback={null}>
-                      <AssistantMarkdown
-                        key={`${chatMessage.id}:${animateAssistant ? "typing" : "complete"}`}
-                        content={visibleText}
-                        animate={animateAssistant}
-                        activeSpeechWordIndex={
-                          ttsPlayback?.messageId === chatMessage.id &&
-                          ttsPlayback.versionNumber === versionNumber &&
-                          ttsPlayback.status === "playing"
-                            ? ttsPlayback.activeWordIndex ?? null
-                            : null
-                        }
-                        onTypewriterProgress={() => {
-                          if (followLatestRef.current) scrollConversationToLatest("auto");
-                        }}
-                        onTypewriterComplete={() =>
-                          setTypingAssistant((current) =>
-                            current?.id === chatMessage.id ? null : current,
-                          )
-                        }
-                      />
-                    </Suspense>
-                    {!animateAssistant && (
-                      <LinkPreviews content={visibleText} client={authClient} />
-                    )}
-                  </div>
+                  {showAssistantText && (
+                    <div
+                      className="max-w-full break-words leading-6"
+                      style={{ fontSize: Math.round(14 * chatFontScale) }}
+                    >
+                      <Suspense fallback={null}>
+                        <AssistantMarkdown
+                          key={`${chatMessage.id}:${animateAssistant ? "typing" : "complete"}`}
+                          content={visibleText}
+                          animate={animateAssistant}
+                          activeSpeechWordIndex={
+                            ttsPlayback?.messageId === chatMessage.id &&
+                            ttsPlayback.versionNumber === versionNumber &&
+                            ttsPlayback.status === "playing"
+                              ? ttsPlayback.activeWordIndex ?? null
+                              : null
+                          }
+                          onTypewriterProgress={() => {
+                            if (followLatestRef.current) scrollConversationToLatest("auto");
+                          }}
+                          onTypewriterComplete={() =>
+                            setTypingAssistant((current) =>
+                              current?.id === chatMessage.id ? null : current,
+                            )
+                          }
+                        />
+                      </Suspense>
+                      {!animateAssistant && (
+                        <LinkPreviews content={visibleText} client={authClient} />
+                      )}
+                    </div>
+                  )}
                   {chatMessage.attachments && chatMessage.attachments.length > 0 && (
                     <div
                       aria-label="AI-shared attachments"
-                      className="mt-2 grid w-fit max-w-[min(100%,420px)] grid-cols-2 gap-2"
+                      className="mt-1 grid w-fit max-w-[min(100%,420px)] grid-cols-2 gap-2 sm:mt-2"
                     >
-                      {chatMessage.attachments.map((attachment) => (
-                        <ChatMessageAttachmentTile
-                          key={attachment.id}
-                          attachment={attachment}
-                          expired={isChatAttachmentExpired(attachment)}
-                          getPreviewUrl={getAttachmentPreviewUrl}
-                          onOpen={(item) => void openStoredAttachment(item)}
-                          size="large"
-                        />
-                      ))}
+                      {chatMessage.attachments.map((attachment) =>
+                        attachment.mime_type.startsWith("audio/") ? (
+                          <ChatMessageAudioNote
+                            key={attachment.id}
+                            attachment={attachment}
+                            expired={isChatAttachmentExpired(attachment)}
+                            getPreviewUrl={getAttachmentPreviewUrl}
+                            size="large"
+                          />
+                        ) : (
+                          <ChatMessageAttachmentTile
+                            key={attachment.id}
+                            attachment={attachment}
+                            expired={isChatAttachmentExpired(attachment)}
+                            getPreviewUrl={getAttachmentPreviewUrl}
+                            onOpen={(item) => void openStoredAttachment(item)}
+                            size="large"
+                          />
+                        ),
+                      )}
                     </div>
                   )}
                   <div
@@ -9027,34 +9299,36 @@ export function App() {
                     >
                       <TriangleAlert aria-hidden="true" className="size-4" />
                     </button>
-                    <button
-                      type="button"
-                      aria-label={
-                        ttsPlayback?.messageId === chatMessage.id &&
-                        ttsPlayback.versionNumber === versionNumber
-                          ? "Speech player is open"
-                          : "Read response aloud"
-                      }
-                      aria-pressed={
-                        ttsPlayback?.messageId === chatMessage.id &&
-                        ttsPlayback.versionNumber === versionNumber
-                      }
-                      onClick={() => {
-                        if (
-                          ttsPlayback?.messageId !== chatMessage.id ||
-                          ttsPlayback.versionNumber !== versionNumber
-                        ) {
-                          void playAssistantSpeech(chatMessage.id, versionNumber, visibleText);
+                    {!isVoiceNote && (
+                      <button
+                        type="button"
+                        aria-label={
+                          ttsPlayback?.messageId === chatMessage.id &&
+                          ttsPlayback.versionNumber === versionNumber
+                            ? "Speech player is open"
+                            : "Read response aloud"
                         }
-                      }}
-                      className={`flex size-8 items-center justify-center rounded-lg transition hover:bg-[#f1f2f4] ${
-                        ttsPlayback?.messageId === chatMessage.id
-                          ? "text-[#2088bf]"
-                          : "text-[#777a82]"
-                      }`}
-                    >
-                      <Volume2 aria-hidden="true" className="size-4" />
-                    </button>
+                        aria-pressed={
+                          ttsPlayback?.messageId === chatMessage.id &&
+                          ttsPlayback.versionNumber === versionNumber
+                        }
+                        onClick={() => {
+                          if (
+                            ttsPlayback?.messageId !== chatMessage.id ||
+                            ttsPlayback.versionNumber !== versionNumber
+                          ) {
+                            void playAssistantSpeech(chatMessage.id, versionNumber, visibleText);
+                          }
+                        }}
+                        className={`flex size-8 items-center justify-center rounded-lg transition hover:bg-[#f1f2f4] ${
+                          ttsPlayback?.messageId === chatMessage.id
+                            ? "text-[#2088bf]"
+                            : "text-[#777a82]"
+                        }`}
+                      >
+                        <Volume2 aria-hidden="true" className="size-4" />
+                      </button>
+                    )}
                     {!chatMessage.isReminder &&
                       (!chatMessage.adminMessageId || authUser?.role !== "admin") && (
                       <button
@@ -9131,7 +9405,7 @@ export function App() {
 
         <footer
           ref={observeChatFooter}
-          className="absolute inset-x-0 bottom-0 z-20 bg-transparent px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-2.5"
+          className="chat-footer absolute inset-x-0 bottom-0 z-20 bg-transparent px-2 pb-[max(8px,env(safe-area-inset-bottom))] pt-2.5"
         >
           {showScrollToLatest && pathname === "/" && (
             <button
@@ -9176,7 +9450,6 @@ export function App() {
                         type="button"
                         aria-label={`Open ${file.name}`}
                         disabled={
-                          attachment.isUploading ||
                           attachment.isBlocked ||
                           Boolean(attachment.uploadError)
                         }
@@ -9474,6 +9747,7 @@ export function App() {
           className="fixed inset-0 z-[70] hidden flex-col items-center justify-center gap-3 bg-black/45 px-5 py-8 backdrop-blur-md [touch-action:none] max-sm:flex"
           onPointerDown={(event) => {
             event.stopPropagation();
+            if (event.target === event.currentTarget) setActiveUserActions(null);
           }}
           onClick={(event) => {
             event.stopPropagation();

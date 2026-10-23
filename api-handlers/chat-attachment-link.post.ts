@@ -79,14 +79,18 @@ export default defineEventHandler(async (event) => {
     throw createError({ statusCode: 410, statusMessage: "This attachment expired after 24 hours." });
   }
 
+  const signedUrlLifetimeSeconds = Math.min(secondsUntilExpiry, 3600);
   const { data, error } = await serviceClient.storage
     .from(CHAT_ATTACHMENT_BUCKET)
-    .createSignedUrl(attachment.storage_path, Math.min(secondsUntilExpiry, 3600));
+    .createSignedUrl(attachment.storage_path, signedUrlLifetimeSeconds);
   if (error) {
     throw createError({
       statusCode: 502,
       statusMessage: `Could not open attachment: ${error.message}`,
     });
   }
-  return { signedUrl: data.signedUrl };
+  return {
+    signedUrl: data.signedUrl,
+    expiresAt: Date.now() + signedUrlLifetimeSeconds * 1000,
+  };
 });

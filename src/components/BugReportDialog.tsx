@@ -66,6 +66,18 @@ export function BugReportDialog({
   const [filePreviews, setFilePreviews] = useState<Map<File, string>>(() => new Map());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const reportWasSentRef = useRef(false);
+  const previewHistoryEntryRef = useRef(false);
+
+  useEffect(() => {
+    if (!open) return;
+    const closePreviewOnBack = () => {
+      if (!previewHistoryEntryRef.current) return;
+      previewHistoryEntryRef.current = false;
+      setPreviewFile(null);
+    };
+    window.addEventListener("popstate", closePreviewOnBack);
+    return () => window.removeEventListener("popstate", closePreviewOnBack);
+  }, [open]);
 
   useEffect(() => {
     let isActive = true;
@@ -187,6 +199,30 @@ export function BugReportDialog({
     if (previewFile === fileToRemove) setPreviewFile(null);
   }
 
+  function openPreview(file: File) {
+    window.history.pushState(
+      { ...(window.history.state ?? {}), bugReportMediaPreview: true },
+      "",
+      window.location.href,
+    );
+    previewHistoryEntryRef.current = true;
+    setPreviewFile(file);
+  }
+
+  function closePreview() {
+    const hasHistoryEntry = previewHistoryEntryRef.current;
+    previewHistoryEntryRef.current = false;
+    setPreviewFile(null);
+    if (
+      hasHistoryEntry &&
+      window.history.state &&
+      typeof window.history.state === "object" &&
+      "bugReportMediaPreview" in window.history.state
+    ) {
+      window.history.back();
+    }
+  }
+
   async function discardDraft() {
     if (isSending || isDiscarding) return;
     setIsDiscarding(true);
@@ -232,7 +268,6 @@ export function BugReportDialog({
       const body = new FormData();
       body.set("description", trimmedDescription);
       for (const file of files) body.append("media", file, file.name);
-
       const response = await fetch("/api/bug-report", {
         method: "POST",
         headers: { Authorization: `Bearer ${session.access_token}` },
@@ -257,7 +292,6 @@ export function BugReportDialog({
       ) {
         throw new Error("The bug report service returned an invalid response.");
       }
-
       reportWasSentRef.current = true;
       setIsSent(true);
       setDescription("");
@@ -352,7 +386,7 @@ export function BugReportDialog({
                           <button
                             type="button"
                             aria-label={`Preview ${file.name}`}
-                            onClick={() => setPreviewFile(file)}
+                            onClick={() => openPreview(file)}
                             className="flex size-full items-center justify-center"
                           >
                             {fileUrl && isVideo ? (
@@ -438,7 +472,7 @@ export function BugReportDialog({
         <BugReportMediaPreview
           file={previewFile}
           src={previewUrl}
-          onClose={() => setPreviewFile(null)}
+          onClose={closePreview}
         />
       )}
     </>

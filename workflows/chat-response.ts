@@ -7,9 +7,11 @@ import {
   loadChatMessagePage,
   loadInsightsForMessages,
   loadRecentInsights,
+  releaseStoredChatAttachment,
   saveChatBranch,
   saveMessageInsight,
 } from "../src/lib/chat-data";
+import { start } from "workflow/api";
 import {
   analyzeGeminiMessage,
   generateGeminiConversation,
@@ -22,9 +24,18 @@ import {
 } from "../src/lib/gemini";
 import {
   CHAT_ATTACHMENT_BUCKET,
+  CHAT_ATTACHMENT_RETENTION_MS,
   MAX_GEMINI_CONTEXT_ATTACHMENTS,
   VOICE_NOTE_TRANSCRIPT_MARKER,
 } from "../src/lib/chat-attachments";
+import {
+  DEFAULT_GEMINI_TTS_VOICE,
+  generateGeminiSpeech,
+  isGeminiTtsVoice,
+} from "../src/lib/gemini-tts";
+import { speechTextFromMarkdown } from "../src/lib/speech-text";
+import { generateSoundOfTextAudio } from "../src/lib/server-sound-of-text";
+import { expireChatAttachmentWorkflow } from "./expire-chat-attachment";
 import type { AiBarcodeReading } from "../src/lib/chat-barcode";
 import { searchWebWithFallback } from "../src/lib/server-web-search";
 import { ACCOUNT_AI_ACTION_NAMES } from "../src/lib/account-ai-actions";
@@ -149,7 +160,7 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
       .order("id", { ascending: true }),
     client
       .from("user_settings")
-      .select("display_name, custom_prompt, chat_style, web_search_enabled")
+      .select("display_name, custom_prompt, chat_style, web_search_enabled, tts_api_key, tts_api_keys, tts_voice")
       .eq("user_id", job.user_id)
       .maybeSingle(),
     client
@@ -171,6 +182,8 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
   const warnings: string[] = [];
   const sharedAttachmentIds = new Set<string>();
   let adminMessageId: string | null = null;
+  let voiceNoteRequested = false;
+  let includeVoiceNoteText = false;
   let userMessageContent = userMessage.content;
   let userMessageVersionNumber = userMessage.version_number;
 
@@ -569,6 +582,18 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
         await updateJob(jobId, job.user_id, { progress: activity });
       },
       executeTool: async (name, input, key) => {
+        if (name === "choose_voice_note") {
+          voiceNoteRequested = true;
+          if (
+            typeof input === "object" &&
+            input !== null &&
+            "include_text" in input &&
+            input.include_text === true
+          ) {
+            includeVoiceNoteText = true;
+          }
+          return { selected: true };
+        }
         if (ACCOUNT_AI_ACTION_NAMES.has(name)) {
           const toolResult = await executeAccountAiTool(
             job.user_id,
@@ -721,6 +746,106 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
   if (completeError) throw new Error(`Could not save Cheya's response: ${completeError.message}`);
   const savedResponse = savedResponses[0] as StoredChatMessage | undefined;
   if (!savedResponse) throw new Error("The database did not return the saved response.");
+
+  if (voiceNoteRequested) {
+    await updateJob(jobId, job.user_id, {
+      progress: "Preparing Cheya's voice note…",
+    });
+    const speechText = speechTextFromMarkdown(result.text);
+    const configuredTtsKeys = Array.isArray(profile?.tts_api_keys)
+      ? profile.tts_api_keys.filter((key): key is string => typeof key === "string" && Boolean(key.trim()))
+      : [];
+    const ttsKeys = configuredTtsKeys.length
+      ? configuredTtsKeys
+      : profile?.tts_api_key?.trim()
+        ? [profile.tts_api_key]
+        : [];
+    const voice = profile?.tts_voice && isGeminiTtsVoice(profile.tts_voice)
+      ? profile.tts_voice
+      : DEFAULT_GEMINI_TTS_VOICE;
+    let generatedAudio: Blob | null = null;
+    let audioMimeType = "";
+    let geminiTtsError: unknown;
+
+    if (ttsKeys.length > 0) {
+      try {
+        generatedAudio = await generateGeminiSpeech(ttsKeys, speechText, voice);
+        audioMimeType = "audio/wav";
+      } catch (error) {
+        geminiTtsError = error;
+      }
+    } else {
+      geminiTtsError = new Error("No Gemini TTS API key is configured in the user's settings.");
+    }
+
+    if (!generatedAudio || generatedAudio.size > 18 * 1024 * 1024) {
+      if (generatedAudio) {
+        geminiTtsError = new Error("Gemini TTS audio exceeded the 18 MB storage limit.");
+      }
+      try {
+        generatedAudio = await generateSoundOfTextAudio(speechText);
+        audioMimeType = "audio/mpeg";
+      } catch (error) {
+        warnings.push(
+          `The text reply was saved, but voice-note generation failed. Gemini TTS: ${
+            geminiTtsError instanceof Error ? geminiTtsError.message : "unknown error."
+          } Sound of Text: ${error instanceof Error ? error.message : "unknown error."}`,
+        );
+      }
+    }
+
+    if (generatedAudio) {
+      const attachmentId = crypto.randomUUID();
+      const storagePath = `${job.user_id}/${attachmentId}`;
+      const { error: uploadError } = await client.storage
+        .from(CHAT_ATTACHMENT_BUCKET)
+        .upload(storagePath, generatedAudio, { contentType: audioMimeType, upsert: false });
+      if (uploadError) {
+        warnings.push(`The text reply was saved, but its voice note could not be stored: ${uploadError.message}`);
+      } else {
+        const { error: attachmentError } = await client.from("chat_message_attachments").insert({
+          id: attachmentId,
+          user_id: job.user_id,
+          message_id: savedResponse.id,
+          storage_path: storagePath,
+          file_name: `cheya-voice-note.${audioMimeType === "audio/wav" ? "wav" : "mp3"}`,
+          mime_type: audioMimeType,
+          size_bytes: generatedAudio.size,
+          show_text: includeVoiceNoteText,
+          expires_at: new Date(Date.now() + CHAT_ATTACHMENT_RETENTION_MS).toISOString(),
+        });
+        if (attachmentError) {
+          const { error: cleanupError } = await client.storage
+            .from(CHAT_ATTACHMENT_BUCKET)
+            .remove([storagePath]);
+          warnings.push(
+            `The text reply was saved, but its voice note metadata could not be saved: ${attachmentError.message}${
+              cleanupError ? ` Storage cleanup also failed: ${cleanupError.message}` : ""
+            }`,
+          );
+        } else {
+          try {
+            await start(expireChatAttachmentWorkflow, [attachmentId]);
+          } catch (error) {
+            try {
+              await releaseStoredChatAttachment(client, attachmentId, job.user_id);
+            } catch (cleanupError) {
+              warnings.push(
+                `The voice-note expiry could not be scheduled, and immediate cleanup failed: ${
+                  cleanupError instanceof Error ? cleanupError.message : "Unknown cleanup error."
+                }`,
+              );
+            }
+            warnings.push(
+              `The text reply was saved, but its voice note could not be retained for 24 hours: ${
+                error instanceof Error ? error.message : "Expiry scheduling failed."
+              }`,
+            );
+          }
+        }
+      }
+    }
+  }
 
   try {
     await linkChatAttachments(

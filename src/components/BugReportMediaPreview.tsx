@@ -141,6 +141,12 @@ export function BugReportMediaPreview({
   function handlePointerEnd(event: ReactPointerEvent<HTMLDivElement>) {
     pointersRef.current.delete(event.pointerId);
     panStartRef.current = null;
+    if (pointersRef.current.size === 0) {
+      gestureRef.current = null;
+      if (mediaRef.current) mediaRef.current.style.transition = "transform 180ms ease-out";
+      applyTransform(1, 0, 0);
+      return;
+    }
     if (pointersRef.current.size < 2) gestureRef.current = null;
     if (pointersRef.current.size === 1 && transformRef.current.scale > 1) {
       const [pointer] = [...pointersRef.current.values()];
@@ -228,6 +234,7 @@ export function BugReportMediaPreview({
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerEnd}
         onPointerCancel={handlePointerEnd}
+        onLostPointerCapture={handlePointerEnd}
       >
         {isVideo ? (
           <video

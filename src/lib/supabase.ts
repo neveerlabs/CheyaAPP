@@ -682,6 +682,7 @@ export type Database = {
           storage_path: string;
           sha256: string | null;
           identity_sha256: string | null;
+          show_text: boolean;
         };
         Insert: {
           id?: string;
@@ -690,6 +691,7 @@ export type Database = {
           storage_path: string;
           sha256?: string | null;
           identity_sha256?: string | null;
+          show_text?: boolean;
           file_name: string;
           mime_type: string;
           size_bytes: number;

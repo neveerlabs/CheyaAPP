@@ -87,6 +87,7 @@ export type ChatAttachment = {
   file_name: string;
   mime_type: string;
   size_bytes: number;
+  show_text?: boolean;
   created_at: string;
   expires_at: string;
   deleted_at: string | null;

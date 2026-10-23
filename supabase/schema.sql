@@ -1835,6 +1835,7 @@ create table if not exists public.chat_message_attachments (
   file_name text not null check (length(trim(file_name)) between 1 and 255),
   mime_type text not null,
   size_bytes bigint not null check (size_bytes between 1 and 18874368),
+  show_text boolean not null default true,
   created_at timestamptz not null default now(),
   expires_at timestamptz not null default (now() + interval '24 hours'),
   deleted_at timestamptz,
@@ -1852,6 +1853,8 @@ alter table public.chat_message_attachments
 alter table public.chat_message_attachments
   add column if not exists identity_sha256 text
   check (identity_sha256 is null or identity_sha256 ~ '^[0-9a-f]{64}$');
+alter table public.chat_message_attachments
+  add column if not exists show_text boolean not null default true;
 
 create index if not exists chat_message_attachments_user_message_idx
   on public.chat_message_attachments (user_id, message_id, created_at);

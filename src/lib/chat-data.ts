@@ -326,7 +326,7 @@ export async function loadMessageAttachments(
   const [directResult, linkResult] = await Promise.all([
     client
       .from("chat_message_attachments")
-      .select("id, user_id, message_id, file_name, mime_type, size_bytes, created_at, expires_at, deleted_at")
+      .select("id, user_id, message_id, file_name, mime_type, size_bytes, show_text, created_at, expires_at, deleted_at")
       .in("message_id", messageIds)
       .order("created_at", { ascending: true }),
     client
@@ -346,7 +346,7 @@ export async function loadMessageAttachments(
     sharedAttachmentIds.length > 0
       ? await client
           .from("chat_message_attachments")
-          .select("id, user_id, message_id, file_name, mime_type, size_bytes, created_at, expires_at, deleted_at")
+          .select("id, user_id, message_id, file_name, mime_type, size_bytes, show_text, created_at, expires_at, deleted_at")
           .in("id", sharedAttachmentIds)
       : { data: [], error: null };
   if (sharedResult.error) {
