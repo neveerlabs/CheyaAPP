@@ -101,6 +101,7 @@ export async function linkChatAttachmentsFromClient(
   client: AppSupabaseClient,
   messageId: string,
   attachmentIds: string[],
+  showText?: boolean,
 ): Promise<void> {
   const {
     data: { session },
@@ -115,7 +116,11 @@ export async function linkChatAttachmentsFromClient(
       Authorization: ["Bearer", session.access_token].join(" "),
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ messageId, attachmentIds }),
+    body: JSON.stringify({
+      messageId,
+      attachmentIds,
+      ...(showText === undefined ? {} : { showText }),
+    }),
   });
   const payload: unknown = await response.json().catch(() => null);
   if (!response.ok) {

@@ -88,6 +88,11 @@ import {
   type GeminiAttachmentReference,
 } from "./lib/gemini";
 import {
+  DEFAULT_GEMINI_TTS_VOICE,
+  generateGeminiSpeech,
+  isGeminiTtsVoice,
+} from "./lib/gemini-tts";
+import {
   clearAccountSessionId,
   getAccountSessionId,
   getAccountSessionLocation,
@@ -2121,8 +2126,21 @@ export function App() {
   const longPressStartRef = useRef<{ x: number; y: number } | null>(null);
   const longPressTriggeredRef = useRef(false);
   const wasSettingsRef = useRef(window.location.pathname === "/settings");
+  const pendingAssistantAnchorIndex = messages.findIndex(
+    (message) => message.id === pendingAssistantAnchorRef.current,
+  );
+  const hasAssistantReplyAfterAnchor =
+    pendingAssistantAnchorIndex >= 0 &&
+    messages
+      .slice(pendingAssistantAnchorIndex + 1)
+      .some((message) => message.role === "assistant");
   const activeChatJob =
-    chatJobs.find((job) => job.status === "queued" || job.status === "processing") ??
+    chatJobs.find(
+      (job) =>
+        job.message_id === pendingAssistantAnchorRef.current &&
+        !hasAssistantReplyAfterAnchor &&
+        (job.status === "queued" || job.status === "processing"),
+    ) ??
     chatJobs.find(
       (job) =>
         job.status === "completed" &&
@@ -2130,14 +2148,9 @@ export function App() {
         job.assistant_message_id !== null &&
         !messages.some((message) => message.id === job.assistant_message_id),
     );
-  const pendingAssistantAnchorIndex = messages.findIndex(
-    (message) => message.id === pendingAssistantAnchorRef.current,
-  );
   const isAwaitingAssistantResponse =
     pendingAssistantAnchorIndex >= 0 &&
-    !messages
-      .slice(pendingAssistantAnchorIndex + 1)
-      .some((message) => message.role === "assistant");
+    !hasAssistantReplyAfterAnchor;
   const isAssistantBusy =
     isSending || Boolean(typingAssistant) || isAwaitingAssistantResponse;
   const unreadInboxMessageCount = inboxItems.filter((item) => !item.read_at).length;
@@ -3264,6 +3277,12 @@ export function App() {
   function handleConversationScroll() {
     const conversation = conversationRef.current;
     if (!conversation) return;
+    if (shouldScrollToLatestRef.current) {
+      conversation.scrollTop = conversation.scrollHeight;
+      followLatestRef.current = true;
+      setShowScrollToLatest(false);
+      return;
+    }
     if (conversation.scrollTop <= 48 && hasOlderHistoryRef.current) {
       void loadOlderChatHistory();
     }
@@ -3600,6 +3619,12 @@ export function App() {
   useEffect(() => () => clearLongPressTimer(), []);
 
   useEffect(() => {
+    if (!isSending) return;
+    clearLongPressTimer();
+    setActiveUserActions(null);
+  }, [isSending]);
+
+  useEffect(() => {
     if (!authenticatedUserId) return;
     const userId = authenticatedUserId;
     messageDraftUserIdRef.current = userId;
@@ -3749,7 +3774,6 @@ export function App() {
     }
 
     let frame = 0;
-    let frameCount = 0;
     let previousHeight = -1;
     let stableFrames = 0;
     const scrollWhenReady = () => {
@@ -3761,12 +3785,11 @@ export function App() {
 
       conversation.scrollTop = conversation.scrollHeight;
       followLatestRef.current = true;
-      frameCount += 1;
       if (conversation.scrollHeight === previousHeight) stableFrames += 1;
       else stableFrames = 0;
       previousHeight = conversation.scrollHeight;
 
-      if (frameCount < 8 && stableFrames < 2) {
+      if (stableFrames < 3) {
         frame = window.requestAnimationFrame(scrollWhenReady);
       } else {
         shouldScrollToLatestRef.current = false;
@@ -3817,6 +3840,19 @@ export function App() {
   }, [isSending, messages]);
 
   useEffect(() => {
+    const anchorId = pendingAssistantAnchorRef.current;
+    if (!isSending || !anchorId || directReplyProcessingRef.current) return;
+    const anchorIndex = messages.findIndex((item) => item.id === anchorId);
+    if (
+      anchorIndex < 0 ||
+      !messages.slice(anchorIndex + 1).some((item) => item.role === "assistant")
+    ) {
+      return;
+    }
+    setIsSending(false);
+  }, [isSending, messages]);
+
+  useEffect(() => {
     let isMounted = true;
     let unsubscribe: (() => void) | null = null;
     const oauthCallbackError = consumeOAuthCallbackError();
@@ -3848,12 +3884,14 @@ export function App() {
       if (!session?.user || session.user.is_anonymous) {
         setAuthUser(null);
         setIsAuthLoading(false);
+        setIsLoadingHistory(false);
         setMessages([]);
         setChatJobs([]);
         setHasGeminiApiKey(false);
         return;
       }
 
+      let waitForChatHistory = false;
       setIsAuthLoading(true);
       try {
         const requestedProvider = getPendingAuthProvider();
@@ -3897,6 +3935,8 @@ export function App() {
         }
         if (!isMounted) return;
         setAuthError("");
+        setIsLoadingHistory(true);
+        waitForChatHistory = true;
         setAuthUser({
           id: session.user.id,
           email: googleEmail,
@@ -3937,7 +3977,7 @@ export function App() {
         setAuthUser(null);
         setAuthError(error instanceof Error ? error.message : "Could not prepare account data.");
       } finally {
-        if (isMounted) setIsAuthLoading(false);
+        if (isMounted && !waitForChatHistory) setIsAuthLoading(false);
       }
     };
 
@@ -3998,17 +4038,15 @@ export function App() {
     setHistoryLoadError("");
     void (async () => {
       try {
-        const markdownPromise = loadAssistantMarkdown();
         const chatData = await import("./lib/chat-data");
         const {
           loadChatMessagePage,
           loadMessageAttachments,
           loadMessageVersions,
         } = chatData;
-        const [messagePage] = await Promise.all([
-          loadChatMessagePage(authClient, { userId: authenticatedUserId }),
-          markdownPromise,
-        ]);
+        const messagePage = await loadChatMessagePage(authClient, {
+          userId: authenticatedUserId,
+        });
         if (!isMounted) return;
         const savedMessages = messagePage.messages;
         const oldestMessage = savedMessages[0];
@@ -4036,6 +4074,8 @@ export function App() {
           );
         });
         shouldScrollToLatestRef.current = true;
+        setIsLoadingHistory(false);
+        setIsAuthLoading(false);
 
         const assistantMessages = savedMessages.filter((item) => item.role === "assistant");
         const adminRelayMessageIds = [
@@ -4112,8 +4152,22 @@ export function App() {
         if (isMounted) {
           setHasGeminiApiKey(keyResult.data.length > 0);
           setChatJobs(jobsResult.data);
+          const latestUserMessageId = [...savedMessages]
+            .reverse()
+            .find((message) => message.role === "user")?.id;
+          const latestUserMessageIndex = savedMessages.findIndex(
+            (message) => message.id === latestUserMessageId,
+          );
+          const latestUserHasAssistantReply =
+            latestUserMessageIndex >= 0 &&
+            savedMessages
+              .slice(latestUserMessageIndex + 1)
+              .some((message) => message.role === "assistant");
           const pendingJob = jobsResult.data.find(
-            (job) => job.status === "queued" || job.status === "processing",
+            (job) =>
+              job.message_id === latestUserMessageId &&
+              !latestUserHasAssistantReply &&
+              (job.status === "queued" || job.status === "processing"),
           );
           const completedReplyAwaitingDisplay = jobsResult.data.find(
             (job) =>
@@ -4162,7 +4216,10 @@ export function App() {
           );
         }
       } finally {
-        if (isMounted) setIsLoadingHistory(false);
+        if (isMounted) {
+          setIsLoadingHistory(false);
+          setIsAuthLoading(false);
+        }
       }
     })();
 
@@ -4617,8 +4674,20 @@ export function App() {
           jobsResult.data.map((job) => [job.id, job.status, job.progress, job.error, job.updated_at]),
         );
         setChatJobs(jobsResult.data);
+        const activeAnchorIndex = messagesRef.current.findIndex(
+          (message) => message.id === pendingAssistantAnchorRef.current,
+        );
+        const activeAnchorHasAssistantReply =
+          activeAnchorIndex >= 0 &&
+          messagesRef.current
+            .slice(activeAnchorIndex + 1)
+            .some((message) => message.role === "assistant");
         const hasPendingJob = jobsResult.data.some(
-          (job) => job.status === "queued" || job.status === "processing",
+          (job) =>
+            job.message_id === pendingAssistantAnchorRef.current &&
+            activeAnchorIndex >= 0 &&
+            !activeAnchorHasAssistantReply &&
+            (job.status === "queued" || job.status === "processing"),
         );
         const completedReplyAwaitingDisplay = jobsResult.data.some(
           (job) =>
@@ -4690,10 +4759,22 @@ export function App() {
           setSendError(`Could not refresh chat job status: ${error.message}`);
           return;
         }
-        const hasPendingJob = data.some(
-          (job) => job.status === "queued" || job.status === "processing",
-        );
         const anchorMessageId = pendingAssistantAnchorRef.current;
+        const anchorIndex = messagesRef.current.findIndex(
+          (message) => message.id === anchorMessageId,
+        );
+        const assistantReplyExistsAfterAnchor =
+          anchorIndex >= 0 &&
+          messagesRef.current
+            .slice(anchorIndex + 1)
+            .some((message) => message.role === "assistant");
+        const hasPendingJob = data.some(
+          (job) =>
+            job.message_id === anchorMessageId &&
+            anchorIndex >= 0 &&
+            !assistantReplyExistsAfterAnchor &&
+            (job.status === "queued" || job.status === "processing"),
+        );
         const anchoredJob = data.find((job) => job.message_id === anchorMessageId);
         if (
           anchoredJob &&
@@ -7393,6 +7474,9 @@ export function App() {
     const previousAssistant = messages[assistantIndex];
     const previousAnswer = displayedMessageText(previousAssistant);
     const previousVersionNumber = displayedVersionNumber(previousAssistant);
+    const previousVoiceNote = previousAssistant.attachments?.find((attachment) =>
+      attachment.mime_type.startsWith("audio/"),
+    );
 
     setIsSending(true);
     directReplyProcessingRef.current = true;
@@ -7447,7 +7531,7 @@ export function App() {
             .order("id", { ascending: true }),
           client
             .from("user_settings")
-            .select("display_name, custom_prompt, chat_style, web_search_enabled")
+            .select("display_name, custom_prompt, chat_style, web_search_enabled, tts_api_key, tts_api_keys, tts_voice")
             .maybeSingle(),
         ]);
       if (keysError) throw keysError;
@@ -7461,6 +7545,8 @@ export function App() {
         loadMessageCreatedAt(client, sourceMessage.id),
       ]);
       const regenerationWarnings: string[] = [];
+      let voiceNoteRequested = Boolean(previousVoiceNote);
+      let includeVoiceNoteText = previousVoiceNote?.show_text ?? false;
       if (queryResult.status === "rejected") {
         console.warn(
           "Semantic retrieval was unavailable while regenerating a response.",
@@ -7652,6 +7738,18 @@ export function App() {
             ]);
           },
           executeTool: async (name, input, key) => {
+            if (name === "choose_voice_note") {
+              voiceNoteRequested = true;
+              if (
+                typeof input === "object" &&
+                input !== null &&
+                "include_text" in input &&
+                input.include_text === true
+              ) {
+                includeVoiceNoteText = true;
+              }
+              return { selected: true };
+            }
             if (ACCOUNT_AI_ACTION_NAMES.has(name)) {
               if (!authClient) throw new Error("Sign in before using account AI actions.");
               const result = await executeAccountAiActionFromClient(
@@ -7824,6 +7922,103 @@ export function App() {
       responseSaved = true;
       hiddenChatMessageIdsRef.current.delete(messageId);
       let linkedAttachments = previousAssistant.attachments ?? [];
+      if (voiceNoteRequested) {
+        let registeredVoiceNoteId: string | null = null;
+        let voiceNoteLinked = false;
+        try {
+          const configuredTtsKeys = Array.isArray(profile?.tts_api_keys)
+            ? profile.tts_api_keys.filter(
+                (key): key is string => typeof key === "string" && Boolean(key.trim()),
+              )
+            : [];
+          const ttsKeys = configuredTtsKeys.length
+            ? configuredTtsKeys
+            : profile?.tts_api_key?.trim()
+              ? [profile.tts_api_key]
+              : [];
+          if (ttsKeys.length === 0) {
+            throw new Error("No Gemini TTS API key is configured in the user's settings.");
+          }
+          const voice = profile?.tts_voice && isGeminiTtsVoice(profile.tts_voice)
+            ? profile.tts_voice
+            : DEFAULT_GEMINI_TTS_VOICE;
+          const audio = await generateGeminiSpeech(
+            ttsKeys,
+            speechTextFromMarkdown(result.text),
+            voice,
+          );
+          if (audio.size > MAX_CHAT_ATTACHMENT_BYTES) {
+            throw new Error("Generated voice note exceeds the 18 MB storage limit.");
+          }
+          const mimeType = audio.type.startsWith("audio/") ? audio.type : "audio/wav";
+          const extension = mimeType === "audio/mpeg" ? "mp3" : "wav";
+          const attachmentId = crypto.randomUUID();
+          const registration = await registerChatAttachment({
+            id: attachmentId,
+            file: new File([audio], `cheya-voice-note.${extension}`, { type: mimeType }),
+            mimeType,
+            isUploading: false,
+            isBlocked: false,
+            uploadError: null,
+            uploaded: null,
+          });
+          if (!registration.attachment) {
+            throw new Error("The voice-note upload did not return attachment metadata.");
+          }
+          const generatedVoiceNoteId = registration.attachment.id;
+          registeredVoiceNoteId = generatedVoiceNoteId;
+          await linkChatAttachmentsFromClient(
+            client,
+            updatedMessage.id,
+            [generatedVoiceNoteId],
+            registration.reused && registration.attachment.message_id !== null
+              ? undefined
+              : includeVoiceNoteText,
+          );
+          voiceNoteLinked = true;
+          const loadedAttachments = await loadMessageAttachments(client, [updatedMessage.id]);
+          linkedAttachments = loadedAttachments[updatedMessage.id] ?? linkedAttachments;
+          const replacedVoiceIds =
+            previousAssistant.attachments
+              ?.filter((attachment) => attachment.mime_type.startsWith("audio/"))
+              .filter((attachment) => attachment.id !== generatedVoiceNoteId)
+              .map((attachment) => attachment.id) ?? [];
+          if (replacedVoiceIds.length > 0) {
+            try {
+              await deleteStoredAttachments(replacedVoiceIds);
+              linkedAttachments = linkedAttachments.filter(
+                (attachment) => !replacedVoiceIds.includes(attachment.id),
+              );
+            } catch (error) {
+              regenerationWarnings.push(
+                `The new voice note was saved, but the previous voice note could not be removed: ${
+                  error instanceof Error ? error.message : "Unknown cleanup error."
+                }`,
+              );
+            }
+            linkedAttachments = linkedAttachments.filter(
+              (attachment) => !replacedVoiceIds.includes(attachment.id),
+            );
+          }
+        } catch (error) {
+          if (registeredVoiceNoteId && !voiceNoteLinked) {
+            try {
+              await deleteStoredAttachments([registeredVoiceNoteId]);
+            } catch (cleanupError) {
+              regenerationWarnings.push(
+                `The reply was regenerated, but an unlinked voice-note upload could not be cleaned up: ${
+                  cleanupError instanceof Error ? cleanupError.message : "Unknown cleanup error."
+                }`,
+              );
+            }
+          }
+          regenerationWarnings.push(
+            `The reply was regenerated, but its voice note could not be created: ${
+              error instanceof Error ? error.message : "Unknown voice-note error."
+            }`,
+          );
+        }
+      }
       if (sharedAttachmentIds.size > 0) {
         try {
           await linkChatAttachmentsFromClient(client, updatedMessage.id, [...sharedAttachmentIds]);
@@ -8913,7 +9108,7 @@ export function App() {
                             : "mb-2 grid-cols-3"
                         } grid w-fit max-w-[min(94%,320px)] gap-2`}
                         onPointerDown={(event) => {
-                          if (!isVoiceNote || event.pointerType !== "touch") return;
+                          if (!isVoiceNote || isSending || event.pointerType !== "touch") return;
                           clearLongPressTimer();
                           longPressTriggeredRef.current = false;
                           longPressStartRef.current = { x: event.clientX, y: event.clientY };
@@ -8954,6 +9149,7 @@ export function App() {
                         onContextMenu={(event) => {
                           if (!isVoiceNote) return;
                           event.preventDefault();
+                          if (isSending) return;
                           setActiveUserActions(chatMessage.id);
                         }}
                       >
@@ -8999,11 +9195,12 @@ export function App() {
                       )}
                       {!isVoiceNote && <div
                         onPointerDown={(event) => {
-                        if (event.pointerType !== "touch") return;
+                        if (isSending || event.pointerType !== "touch") return;
                         clearLongPressTimer();
                         longPressStartRef.current = { x: event.clientX, y: event.clientY };
                         longPressTimerRef.current = setTimeout(
                           () => {
+                            if (isSending) return;
                             setActiveUserActions(chatMessage.id);
                             longPressTimerRef.current = null;
                           },
@@ -9030,8 +9227,9 @@ export function App() {
                         longPressStartRef.current = null;
                       }}
                       onContextMenu={(event) => {
-                        event.preventDefault();
-                        setActiveUserActions(chatMessage.id);
+                      event.preventDefault();
+                      if (isSending) return;
+                      setActiveUserActions(chatMessage.id);
                       }}
                       onDragStart={(event) => event.preventDefault()}
                       className="user-message-bubble w-auto min-w-0 max-w-[94%] select-none rounded-[18px] rounded-br-md bg-[#28292e] px-3.5 py-1.5 text-[13px] leading-[1.35] text-white [webkit-touch-callout:none]"
@@ -9051,7 +9249,7 @@ export function App() {
                       />
                       </div>}
                     </div>
-                    <div
+                    {!isSending && <div
                       data-user-actions
                       aria-label="User message actions"
                       className={`user-message-actions absolute right-0 ${
@@ -9096,7 +9294,7 @@ export function App() {
                       >
                         <Trash2 aria-hidden="true" className="size-3" />
                       </button>
-                    </div>
+                    </div>}
                     </div>
                     {failedSubmission && (
                       <p role="status" className="mt-1 max-w-[94%] text-right text-[11px] leading-4 text-[#a34444]">
@@ -9370,11 +9568,7 @@ export function App() {
                       "Reviewing the request…"}
                   </p>
                 ) : (
-                  <p>
-                    {typingAssistant
-                      ? "Cheya is writing the reply…"
-                      : activeChatJob?.progress || "Cheya is preparing a reply…"}
-                  </p>
+                  <p><i>Processing...</i></p>
                 )}
               </div>
             )}

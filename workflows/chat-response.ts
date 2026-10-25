@@ -141,9 +141,15 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
     throw new Error("The queued user message could not be found.");
   }
 
+  const updateProgress = async (progress: string) => {
+    if (job.thinking_mode) {
+      await updateJob(jobId, job.user_id, { progress });
+    }
+  };
+
   await updateJob(jobId, job.user_id, {
     status: "processing",
-    progress: "Loading your chat history and settings…",
+    progress: job.thinking_mode ? "Loading your chat history and settings…" : "Processing...",
     error: null,
   });
 
@@ -207,9 +213,7 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
       messageCreatedAt: userMessage.created_at,
     }));
   if (voiceNotes.length > 0) {
-    await updateJob(jobId, job.user_id, {
-      progress: "Listening to your voice message…",
-    });
+    await updateProgress("Listening to your voice message…");
     const transcription = await transcribeGeminiVoiceNote(
       typedKeys,
       voiceNotes,
@@ -298,27 +302,26 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
     warnings.push("Personal context retrieval is using the message embedding as a fallback.");
   }
 
-  await updateJob(jobId, job.user_id, {
-    progress: "Checking the active conversation and matching relevant personal context…",
-  });
-  const history = (await loadChatMessagePage(client, { limit: 20, userId: job.user_id })).messages
+  await updateProgress("Checking the active conversation and matching relevant personal context…");
+  const historyLimit = job.thinking_mode ? 20 : 6;
+  const history = (await loadChatMessagePage(client, {
+    limit: historyLimit,
+    userId: job.user_id,
+  })).messages
     .filter((item) => item.id !== userMessage.id)
-    .slice(-12);
-  const priorInsightsPromise = loadRecentInsights(
-    client,
-    12,
-    userMessage.id,
-    userMessage.created_at,
-    job.user_id,
-  ).then(
-    (insights) => ({ insights, error: null }),
-    (error: unknown) => ({ insights: [], error }),
-  );
+    .slice(job.thinking_mode ? -12 : -6);
+  const priorInsightsPromise = job.thinking_mode
+    ? loadRecentInsights(client, 12, userMessage.id, userMessage.created_at, job.user_id).then(
+        (insights) => ({ insights, error: null }),
+        (error: unknown) => ({ insights: [], error }),
+      )
+    : Promise.resolve({ insights: [], error: null });
   let insightAnalysisPromise: Promise<
     | { ok: true; result: Awaited<ReturnType<typeof analyzeGeminiMessage>> | null }
     | { ok: false; error: unknown }
   > = Promise.resolve({ ok: true, result: null });
   const saveInsightAnalysis = async () => {
+    if (!job.thinking_mode) return;
     const priorInsights = await priorInsightsPromise;
     if (priorInsights.error) {
       console.error("Could not load prior insights for conversation analysis.", priorInsights.error);
@@ -447,7 +450,10 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
   const currentAudioAttachments = attachmentsForModel.filter((attachment) =>
     attachment.mimeType.startsWith("audio/"),
   );
-  if (userMessageContent !== "Please review the attached files." || currentAudioAttachments.length > 0) {
+  if (
+    job.thinking_mode &&
+    (userMessageContent !== "Please review the attached files." || currentAudioAttachments.length > 0)
+  ) {
     insightAnalysisPromise = priorInsightsPromise
       .then(({ insights }) =>
         analyzeGeminiMessage(
@@ -484,10 +490,21 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
     ...retrievedMessages.filter((item) => item.role === "assistant").map((item) => item.id),
     ...history.filter((item) => item.role === "assistant").map((item) => item.id),
   ];
-  const [feedbackResult, insightsResult] = await Promise.allSettled([
-    loadRecentAssistantFeedback(client, [...new Set(assistantIds)], 32, job.user_id),
-    loadInsightsForMessages(client, [...new Set(candidateMessageIds)], job.user_id, 20, true),
-  ]);
+  const [feedbackResult, insightsResult] = job.thinking_mode
+    ? await Promise.allSettled([
+        loadRecentAssistantFeedback(client, [...new Set(assistantIds)], 32, job.user_id),
+        loadInsightsForMessages(client, [...new Set(candidateMessageIds)], job.user_id, 20, true),
+      ])
+    : [
+        {
+          status: "fulfilled",
+          value: [] as Awaited<ReturnType<typeof loadRecentAssistantFeedback>>,
+        } as const,
+        {
+          status: "fulfilled",
+          value: [] as Awaited<ReturnType<typeof loadInsightsForMessages>>,
+        } as const,
+      ];
 
   let feedback: Awaited<ReturnType<typeof loadRecentAssistantFeedback>> = [];
   if (feedbackResult.status === "fulfilled") feedback = feedbackResult.value;
@@ -539,11 +556,7 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
 
   const relevantMessages = retrievedMessages;
 
-  await updateJob(jobId, job.user_id, {
-    progress: job.thinking_mode
-      ? "Reviewing the full message, its timing, and relevant personal context…"
-      : "Preparing Cheya's reply…",
-  });
+  await updateProgress("Reviewing the full message, its timing, and relevant personal context…");
   const result = await generateGeminiConversation(
     typedKeys,
     userMessageContent,
@@ -579,7 +592,7 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
           toolName === "search_web"
             ? "Action: Searching the web and inspecting sources…"
             : `Action: Using chat tool "${toolName}"…`;
-        await updateJob(jobId, job.user_id, { progress: activity });
+        await updateProgress(activity);
       },
       executeTool: async (name, input, key) => {
         if (name === "choose_voice_note") {
@@ -719,27 +732,12 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
     }
   }
 
-  let assistantEmbedding: number[] | null = null;
-  try {
-    assistantEmbedding = await createEmbedding(
-      typedKeys[result.keyIndex].api_key,
-      result.text,
-      "RETRIEVAL_DOCUMENT",
-    );
-  } catch (error) {
-    warnings.push(
-      `The answer will be saved without a searchable embedding: ${
-        error instanceof Error ? error.message : "Could not create its embedding."
-      }`,
-    );
-  }
-
   await saveInsightAnalysis();
-  await updateJob(jobId, job.user_id, { progress: "Saving Cheya's response…" });
+  await updateProgress("Saving Cheya's response…");
   const { data: savedResponses, error: completeError } = await client.rpc("complete_chat_job", {
     p_job_id: jobId,
     p_content: result.text,
-    p_embedding: assistantEmbedding ? `[${assistantEmbedding.join(",")}]` : null,
+    p_embedding: null,
     p_thinking_summary: thinkingSummary,
     p_admin_message_id: adminMessageId,
   });
@@ -747,10 +745,39 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
   const savedResponse = savedResponses[0] as StoredChatMessage | undefined;
   if (!savedResponse) throw new Error("The database did not return the saved response.");
 
+  try {
+    const assistantEmbedding = await createEmbedding(
+      typedKeys[result.keyIndex].api_key,
+      result.text,
+      "RETRIEVAL_DOCUMENT",
+    );
+    const serializedEmbedding = `[${assistantEmbedding.join(",")}]`;
+    const [messageUpdate, versionUpdate] = await Promise.all([
+      client
+        .from("chat_messages")
+        .update({ embedding: serializedEmbedding })
+        .eq("id", savedResponse.id)
+        .eq("user_id", job.user_id),
+      client
+        .from("chat_message_versions")
+        .update({ embedding: serializedEmbedding })
+        .eq("message_id", savedResponse.id)
+        .eq("user_id", job.user_id)
+        .eq("version_number", savedResponse.version_number),
+    ]);
+    if (messageUpdate.error || versionUpdate.error) {
+      throw new Error(messageUpdate.error?.message ?? versionUpdate.error?.message);
+    }
+  } catch (error) {
+    warnings.push(
+      `The answer was saved without a searchable embedding: ${
+        error instanceof Error ? error.message : "Could not create its embedding."
+      }`,
+    );
+  }
+
   if (voiceNoteRequested) {
-    await updateJob(jobId, job.user_id, {
-      progress: "Preparing Cheya's voice note…",
-    });
+    await updateProgress("Preparing Cheya's voice note…");
     const speechText = speechTextFromMarkdown(result.text);
     const configuredTtsKeys = Array.isArray(profile?.tts_api_keys)
       ? profile.tts_api_keys.filter((key): key is string => typeof key === "string" && Boolean(key.trim()))
