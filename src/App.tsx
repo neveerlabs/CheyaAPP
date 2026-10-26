@@ -329,12 +329,12 @@ function getAudioWaveform(audio: AudioBuffer, barCount = 36): number[] {
 
   return bars.map((amplitude) => {
     const normalized = peak > 0 ? Math.sqrt(amplitude) / Math.sqrt(peak) : 0;
-    return Math.round(4 + normalized * 26);
+    return Math.round(5 + normalized * 23);
   });
 }
 
 function voiceNoteWaveformCacheKey(attachmentId: string): string {
-  return `chat-voice-note-waveform:${attachmentId}`;
+  return `chat-voice-note-waveform:v3:${attachmentId}`;
 }
 
 function getCachedVoiceNoteWaveform(attachmentId: string): number[] | null {
@@ -346,7 +346,7 @@ function getCachedVoiceNoteWaveform(attachmentId: string): number[] | null {
       !Array.isArray(waveform) ||
       waveform.length !== 36 ||
       !waveform.every(
-        (height) => typeof height === "number" && Number.isInteger(height) && height >= 4 && height <= 30,
+        (height) => typeof height === "number" && Number.isInteger(height) && height >= 5 && height <= 28,
       )
     ) {
       window.localStorage.removeItem(voiceNoteWaveformCacheKey(attachmentId));
@@ -1179,15 +1179,15 @@ const ChatMessageAudioNote = memo(function ChatMessageAudioNote({
         <div
           role="img"
           aria-label="Audio waveform"
-          className="flex h-7 items-center gap-[3px] overflow-hidden"
+          className="flex h-7 translate-y-px items-center gap-[3px] overflow-hidden"
         >
           {waveform.map((height, index) => (
             <span
               key={index}
-              className={`w-[3px] shrink-0 rounded-full ${
+              className={`w-[4px] shrink-0 rounded-full ${
                 index / waveform.length <= progress ? "bg-[#c39ae8]" : "bg-white/45"
               }`}
-              style={{ height: `${Math.round(height * 0.75)}px` }}
+              style={{ height: `${height}px` }}
             />
           ))}
         </div>
@@ -1773,7 +1773,7 @@ function formatSpeechTime(seconds: number): string {
 
 function speechWaveHeight(text: string, index: number): number {
   const character = text.charCodeAt((index * 7) % Math.max(text.length, 1)) || index * 13;
-  return 18 + ((character * (index + 11)) % 72);
+  return 5 + ((character * (index + 11)) % 24);
 }
 
 async function decodeSpeechAudio(audio: Blob): Promise<AudioBuffer> {
@@ -2022,6 +2022,7 @@ export function App() {
   const [editorError, setEditorError] = useState("");
   const [isEditorLoading, setIsEditorLoading] = useState(false);
   const conversationRef = useRef<HTMLDivElement>(null);
+  const conversationTouchStartYRef = useRef<number | null>(null);
   const chatFooterObserverRef = useRef<ResizeObserver | null>(null);
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
   const ttsWordTimelineRef = useRef<SpeechWordTimeline | null>(null);
@@ -3277,12 +3278,7 @@ export function App() {
   function handleConversationScroll() {
     const conversation = conversationRef.current;
     if (!conversation) return;
-    if (shouldScrollToLatestRef.current) {
-      conversation.scrollTop = conversation.scrollHeight;
-      followLatestRef.current = true;
-      setShowScrollToLatest(false);
-      return;
-    }
+    shouldScrollToLatestRef.current = false;
     if (conversation.scrollTop <= 48 && hasOlderHistoryRef.current) {
       void loadOlderChatHistory();
     }
@@ -3291,6 +3287,21 @@ export function App() {
     );
     followLatestRef.current =
       conversation.scrollHeight - conversation.scrollTop - conversation.clientHeight <= 120;
+  }
+
+  function handleConversationTouchStart(event: React.TouchEvent<HTMLDivElement>) {
+    conversationTouchStartYRef.current = event.touches[0]?.clientY ?? null;
+  }
+
+  function handleConversationTouchMove(event: React.TouchEvent<HTMLDivElement>) {
+    const touchStartY = conversationTouchStartYRef.current;
+    const touchY = event.touches[0]?.clientY;
+    if (touchStartY === null || touchY === undefined || Math.abs(touchY - touchStartY) < 6) {
+      return;
+    }
+    shouldScrollToLatestRef.current = false;
+    if (touchY > touchStartY) followLatestRef.current = false;
+    conversationTouchStartYRef.current = touchY;
   }
 
   function resizeMessageInput(input: HTMLTextAreaElement) {
@@ -3747,17 +3758,15 @@ export function App() {
   useEffect(() => {
     if (!isSending || !followLatestRef.current) return;
     const viewport = window.visualViewport;
-    const scrollToLatest = () => {
+    const scrollToLatestOnResize = () => {
       if (!followLatestRef.current) return;
       window.requestAnimationFrame(() => scrollConversationToLatest("auto"));
     };
-    viewport?.addEventListener("resize", scrollToLatest);
-    viewport?.addEventListener("scroll", scrollToLatest);
-    window.addEventListener("resize", scrollToLatest);
+    viewport?.addEventListener("resize", scrollToLatestOnResize);
+    window.addEventListener("resize", scrollToLatestOnResize);
     return () => {
-      viewport?.removeEventListener("resize", scrollToLatest);
-      viewport?.removeEventListener("scroll", scrollToLatest);
-      window.removeEventListener("resize", scrollToLatest);
+      viewport?.removeEventListener("resize", scrollToLatestOnResize);
+      window.removeEventListener("resize", scrollToLatestOnResize);
     };
   }, [isSending]);
 
@@ -3777,6 +3786,7 @@ export function App() {
     let previousHeight = -1;
     let stableFrames = 0;
     const scrollWhenReady = () => {
+      if (!shouldScrollToLatestRef.current) return;
       const conversation = conversationRef.current;
       if (!conversation) {
         frame = window.requestAnimationFrame(scrollWhenReady);
@@ -7512,7 +7522,7 @@ export function App() {
           loadMessageCreatedAt,
           loadMessageFeedback,
           loadMessageVersions,
-          loadRecentAssistantFeedback,
+          loadAllAssistantFeedback,
           loadRecentInsights,
           saveChatBranch,
           updateChatMessage,
@@ -7567,10 +7577,7 @@ export function App() {
       const history = messages.slice(0, sourceIndex).slice(-12);
       const [feedbackResult, recentFeedbackResult] = await Promise.allSettled([
         loadMessageFeedback(client, messageId, previousVersionNumber),
-        loadRecentAssistantFeedback(
-          client,
-          history.filter((item) => item.role === "assistant").map((item) => item.id),
-        ),
+        loadAllAssistantFeedback(client, authUser.id),
       ]);
       const previousFeedback =
         feedbackResult.status === "fulfilled"
@@ -7586,16 +7593,17 @@ export function App() {
         );
       }
       const recentFeedback =
-        recentFeedbackResult.status === "fulfilled" ? recentFeedbackResult.value : [];
-      if (recentFeedbackResult.status === "rejected") {
-        regenerationWarnings.push(
-          `Other saved response feedback could not be loaded: ${
-            recentFeedbackResult.reason instanceof Error
-              ? recentFeedbackResult.reason.message
-              : "Unknown database error."
-          }`,
-        );
-      }
+        recentFeedbackResult.status === "fulfilled"
+          ? recentFeedbackResult.value
+          : (() => {
+              throw new Error(
+                `Could not load all saved response feedback: ${
+                  recentFeedbackResult.reason instanceof Error
+                    ? recentFeedbackResult.reason.message
+                    : "Unknown database error."
+                }`,
+              );
+            })();
       const [contextResult, insightsContextResult] = await Promise.allSettled([
         queryResult.status === "fulfilled" && targetCreatedAt
           ? findRelevantContext(
@@ -7606,7 +7614,7 @@ export function App() {
               undefined,
               sourceText,
             )
-          : Promise.resolve({ messages: [], memories: [] }),
+          : Promise.resolve({ messages: [], memories: [], insights: [] }),
         targetCreatedAt
           ? loadRecentInsights(client, 12, sourceMessage.id, targetCreatedAt)
           : Promise.resolve([]),
@@ -7629,9 +7637,18 @@ export function App() {
       const relevantContext =
         contextResult.status === "fulfilled"
           ? contextResult.value
-          : { messages: [], memories: [] };
+          : { messages: [], memories: [], insights: [] };
       const insights =
         insightsContextResult.status === "fulfilled" ? insightsContextResult.value : [];
+      const insightsByMessageId = new Map(
+        relevantContext.insights.map((insight) => [insight.message_id, insight]),
+      );
+      for (const insight of insights) {
+        if (!insightsByMessageId.has(insight.message_id)) {
+          insightsByMessageId.set(insight.message_id, insight);
+        }
+      }
+      const combinedInsights = [...insightsByMessageId.values()];
       const attachmentMessageIds = [...history.map((item) => item.id), sourceMessage.id];
       setThinkingSteps(["Preparing the message and attachments for Cheya…"]);
       const { data: savedAttachments, error: attachmentsError } = await client
@@ -7709,7 +7726,7 @@ export function App() {
           })),
           relevantMessages: relevantContext.messages,
           memories: relevantContext.memories,
-          insights,
+          insights: combinedInsights,
           feedback: recentFeedback,
           barcodeReadings,
           attachments: attachmentsForModel,
@@ -7872,7 +7889,7 @@ export function App() {
               })),
               relevantMessages: relevantContext.messages,
               memories: relevantContext.memories,
-              insights,
+              insights: combinedInsights,
               replacedResponse: {
                 content: previousAnswer,
                 feedback: previousFeedback.rating,
@@ -8939,22 +8956,22 @@ export function App() {
                       <div
                         role="img"
                         aria-label="Speech waveform"
-                        className="flex h-6 min-w-0 flex-1 items-center justify-between gap-[2px] overflow-hidden px-1.5"
+                        className="flex h-7 min-w-0 flex-1 items-center justify-between gap-[3px] overflow-hidden px-1.5"
                       >
-                        {Array.from({ length: 36 }, (_, index) => {
+                        {Array.from({ length: 28 }, (_, index) => {
                           const progress =
                             ttsPlayback.status === "ended"
                               ? 1
-                              : ttsPlayback.elapsedSeconds / ttsPlayback.durationSeconds;
+                              : ttsPlayback.durationSeconds > 0
+                                ? ttsPlayback.elapsedSeconds / ttsPlayback.durationSeconds
+                                : 0;
                           return (
                             <span
                               key={index}
                               className={`tts-wave-bar ${
-                                (index + 0.5) / 36 <= progress ? "tts-wave-bar-played" : ""
+                                (index + 0.5) / 28 <= progress ? "tts-wave-bar-played" : ""
                               }`}
-                              style={{
-                                height: `${speechWaveHeight(ttsPlayback.text, index)}%`,
-                              }}
+                              style={{ height: `${speechWaveHeight(ttsPlayback.text, index)}px` }}
                             />
                           );
                         })}
@@ -9014,6 +9031,18 @@ export function App() {
           aria-label="Conversation"
           aria-live="polite"
           onScroll={handleConversationScroll}
+          onTouchStart={handleConversationTouchStart}
+          onTouchMove={handleConversationTouchMove}
+          onTouchEnd={() => {
+            conversationTouchStartYRef.current = null;
+          }}
+          onTouchCancel={() => {
+            conversationTouchStartYRef.current = null;
+          }}
+          onWheel={(event) => {
+            shouldScrollToLatestRef.current = false;
+            if (event.deltaY < 0) followLatestRef.current = false;
+          }}
           className="relative min-h-0 flex-1 overflow-y-auto overscroll-contain bg-[#f5f6f8] px-3 pt-[64px]"
         >
           <div className="space-y-0.5 sm:space-y-1">

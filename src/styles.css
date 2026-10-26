@@ -330,16 +330,14 @@ select,
 }
 
 .tts-wave-bar {
-  width: 2px;
-  min-width: 2px;
-  border-radius: 1px;
-  background: #17181b;
-  transform: scaleY(0.72);
-  transform-origin: center;
+  width: 4px;
+  min-width: 4px;
+  border-radius: 9999px;
+  background: rgb(167 123 208 / 45%);
 }
 
 .tts-wave-bar-played {
-  background: #1d4ed8;
+  background: #a77bd0;
 }
 
 .feedback-construction-frame {

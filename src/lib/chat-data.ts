@@ -14,7 +14,10 @@ const MAX_KEYWORD_TERMS = 8;
 const SCHEMA_ERROR_CODES = new Set(["PGRST202", "PGRST204", "PGRST205", "42703", "42883", "42P01"]);
 type EmbeddingTaskType = "RETRIEVAL_DOCUMENT" | "RETRIEVAL_QUERY";
 
-type InsightDraft = Omit<MessageInsight, "id" | "user_id" | "message_id" | "created_at">;
+type InsightDraft = Omit<
+  MessageInsight,
+  "id" | "user_id" | "message_id" | "embedding" | "created_at"
+>;
 
 function describeDatabaseError(error: { code?: string; message: string }): string {
   const schemaError =
@@ -67,6 +70,18 @@ export type RetrievedChatMessage = Pick<
 export type RetrievedMemory = Pick<UserMemory, "id" | "category" | "content"> & {
   similarity: number;
 };
+
+export type RetrievedInsight = Pick<
+  MessageInsight,
+  | "message_id"
+  | "mood"
+  | "communication_style"
+  | "situation"
+  | "topics"
+  | "support_needs"
+  | "summary"
+  | "created_at"
+> & { similarity: number };
 
 export async function createEmbedding(
   apiKey: string,
@@ -418,87 +433,99 @@ export async function findRelevantContext(
   beforeCreatedAt?: string,
   userId?: string,
   keywordText = "",
-): Promise<{ messages: RetrievedChatMessage[]; memories: RetrievedMemory[] }> {
+): Promise<{
+  messages: RetrievedChatMessage[];
+  memories: RetrievedMemory[];
+  insights: RetrievedInsight[];
+}> {
   const queryEmbedding = serializeEmbedding(embedding);
   const keywords = retrievalKeywords(keywordText);
   const keywordFilter = keywords
     .map((keyword) => `content.ilike.%${keyword}%`)
     .join(",");
-  const [messageResult, memoryResult, keywordMessageResult, keywordMemoryResult] = await Promise.all([
-    userId
-      ? beforeCreatedAt
-        ? client.rpc("match_chat_messages_before_for_user", {
-            p_user_id: userId,
+  const [messageResult, memoryResult, keywordMessageResult, keywordMemoryResult, insightResult] =
+    await Promise.all([
+      userId
+        ? beforeCreatedAt
+          ? client.rpc("match_chat_messages_before_for_user", {
+              p_user_id: userId,
+              query_embedding: queryEmbedding,
+              max_created_at: beforeCreatedAt,
+              result_limit: SEARCH_RESULT_LIMIT,
+              exclude_message_id: excludeMessageId,
+            })
+          : client.rpc("match_chat_messages_for_user", {
+              p_user_id: userId,
+              query_embedding: queryEmbedding,
+              result_limit: SEARCH_RESULT_LIMIT,
+              exclude_message_id: excludeMessageId,
+            })
+        : beforeCreatedAt
+        ? client.rpc("match_chat_messages_before", {
             query_embedding: queryEmbedding,
             max_created_at: beforeCreatedAt,
             result_limit: SEARCH_RESULT_LIMIT,
             exclude_message_id: excludeMessageId,
           })
-        : client.rpc("match_chat_messages_for_user", {
-            p_user_id: userId,
+        : client.rpc("match_chat_messages", {
             query_embedding: queryEmbedding,
             result_limit: SEARCH_RESULT_LIMIT,
             exclude_message_id: excludeMessageId,
+          }),
+      userId
+        ? client.rpc("match_user_memories_for_user", {
+            p_user_id: userId,
+            query_embedding: queryEmbedding,
+            result_limit: SEARCH_RESULT_LIMIT,
           })
-      : beforeCreatedAt
-      ? client.rpc("match_chat_messages_before", {
-          query_embedding: queryEmbedding,
-          max_created_at: beforeCreatedAt,
-          result_limit: SEARCH_RESULT_LIMIT,
-          exclude_message_id: excludeMessageId,
-        })
-      : client.rpc("match_chat_messages", {
-          query_embedding: queryEmbedding,
-          result_limit: SEARCH_RESULT_LIMIT,
-          exclude_message_id: excludeMessageId,
-        }),
-    userId
-      ? client.rpc("match_user_memories_for_user", {
-          p_user_id: userId,
-          query_embedding: queryEmbedding,
-          result_limit: SEARCH_RESULT_LIMIT,
-        })
-      : client.rpc("match_user_memories", {
-          query_embedding: queryEmbedding,
-          result_limit: SEARCH_RESULT_LIMIT,
-        }),
-    keywords.length > 0
-      ? (async () => {
-          let query = client
-            .from("chat_messages")
-            .select("id, role, content, created_at")
-            .eq("is_active", true)
-            .neq("id", excludeMessageId)
-            .or(keywordFilter)
-            .order("created_at", { ascending: false })
-            .limit(SEARCH_RESULT_LIMIT * 2);
-          if (beforeCreatedAt) query = query.lt("created_at", beforeCreatedAt);
-          if (userId) query = query.eq("user_id", userId);
-          const { data, error } = await query;
-          if (error) throw new Error(`Could not search active chat history by keyword: ${error.message}`);
-          return data;
-        })()
-      : Promise.resolve([]),
-    keywords.length > 0
-      ? (async () => {
-          let query = client
-            .from("user_memories")
-            .select("id, category, content")
-            .or(
-              [
-                ...keywords.map((keyword) => `content.ilike.%${keyword}%`),
-                ...keywords.map((keyword) => `category.ilike.%${keyword}%`),
-              ].join(","),
-            )
-            .order("updated_at", { ascending: false })
-            .limit(SEARCH_RESULT_LIMIT * 2);
-          if (userId) query = query.eq("user_id", userId);
-          const { data, error } = await query;
-          if (error) throw new Error(`Could not search saved memories by keyword: ${error.message}`);
-          return data;
-        })()
-      : Promise.resolve([]),
-  ]);
+        : client.rpc("match_user_memories", {
+            query_embedding: queryEmbedding,
+            result_limit: SEARCH_RESULT_LIMIT,
+          }),
+      keywords.length > 0
+        ? (async () => {
+            let query = client
+              .from("chat_messages")
+              .select("id, role, content, created_at")
+              .eq("is_active", true)
+              .neq("id", excludeMessageId)
+              .or(keywordFilter)
+              .order("created_at", { ascending: false })
+              .limit(SEARCH_RESULT_LIMIT * 2);
+            if (beforeCreatedAt) query = query.lt("created_at", beforeCreatedAt);
+            if (userId) query = query.eq("user_id", userId);
+            const { data, error } = await query;
+            if (error) throw new Error(`Could not search active chat history by keyword: ${error.message}`);
+            return data;
+          })()
+        : Promise.resolve([]),
+      keywords.length > 0
+        ? (async () => {
+            let query = client
+              .from("user_memories")
+              .select("id, category, content")
+              .or(
+                [
+                  ...keywords.map((keyword) => `content.ilike.%${keyword}%`),
+                  ...keywords.map((keyword) => `category.ilike.%${keyword}%`),
+                ].join(","),
+              )
+              .order("updated_at", { ascending: false })
+              .limit(SEARCH_RESULT_LIMIT * 2);
+            if (userId) query = query.eq("user_id", userId);
+            const { data, error } = await query;
+            if (error) throw new Error(`Could not search saved memories by keyword: ${error.message}`);
+            return data;
+          })()
+        : Promise.resolve([]),
+      userId
+        ? client.rpc("match_message_insights_for_user", {
+            p_user_id: userId,
+            query_embedding: queryEmbedding,
+            result_limit: SEARCH_RESULT_LIMIT,
+          })
+        : Promise.resolve({ data: [], error: null }),
+    ]);
 
   if (messageResult.error) {
     throw new Error(
@@ -508,6 +535,11 @@ export async function findRelevantContext(
   if (memoryResult.error) {
     throw new Error(
       `Could not retrieve related memories: ${describeDatabaseError(memoryResult.error)}`,
+    );
+  }
+  if (insightResult.error) {
+    throw new Error(
+      `Could not retrieve related conversation insights: ${describeDatabaseError(insightResult.error)}`,
     );
   }
   if (keywordMessageResult instanceof Error) throw keywordMessageResult;
@@ -551,6 +583,10 @@ export async function findRelevantContext(
     memories: [...memoryMatches.values()]
       .sort((first, second) => second.similarity - first.similarity)
       .slice(0, SEARCH_RESULT_LIMIT * 2),
+    insights: insightResult.data
+      .filter((row) => row.similarity >= 0.35)
+      .sort((first, second) => second.similarity - first.similarity)
+      .slice(0, SEARCH_RESULT_LIMIT),
   };
 }
 
@@ -666,12 +702,14 @@ export async function saveMessageInsight(
   messageId: string,
   insight: InsightDraft,
   userId?: string,
+  embedding?: string | null,
 ): Promise<void> {
   const { error } = await client.from("message_insights").upsert(
     {
       ...(userId ? { user_id: userId } : {}),
       message_id: messageId,
       ...insight,
+      ...(embedding === undefined ? {} : { embedding }),
     },
     { onConflict: "message_id" },
   );
@@ -856,13 +894,12 @@ export async function loadMessageFeedback(
   };
 }
 
-export async function loadRecentAssistantFeedback(
+export async function loadAllAssistantFeedback(
   client: AppSupabaseClient,
-  messageIds: string[],
-  limit = 8,
-  userId?: string,
+  userId: string,
 ): Promise<
   Array<{
+    feedbackId: string;
     messageId: string;
     rating: "like" | "dislike" | "report";
     response: string;
@@ -870,96 +907,129 @@ export async function loadRecentAssistantFeedback(
     details: string | null;
     request: string | null;
     requestMessageId: string | null;
+    createdAt: string;
   }>
 > {
-  if (messageIds.length === 0) return [];
-  let ratingsQuery = client
+  const feedback: Array<{
+    id: string;
+    message_id: string;
+    version_number: number;
+    kind: "like" | "dislike" | "report";
+    details: string | null;
+    created_at: string;
+  }> = [];
+  const feedbackPageSize = 500;
+  for (let offset = 0; ; offset += feedbackPageSize) {
+    const { data, error } = await client
       .from("message_feedback")
-      .select("message_id, version_number, kind, details, created_at")
-      .in("message_id", messageIds)
-      .in("kind", ["like", "dislike"])
+      .select("id, message_id, version_number, kind, details, created_at")
+      .eq("user_id", userId)
+      .in("kind", ["like", "dislike", "report"])
       .order("created_at", { ascending: false })
-      .limit(limit);
-  let reportsQuery = client
-      .from("message_feedback")
-      .select("message_id, version_number, kind, details, created_at")
-      .in("message_id", messageIds)
-      .eq("kind", "report")
-      .order("created_at", { ascending: false })
-      .limit(limit);
-  if (userId) {
-    ratingsQuery = ratingsQuery.eq("user_id", userId);
-    reportsQuery = reportsQuery.eq("user_id", userId);
+      .range(offset, offset + feedbackPageSize - 1);
+    if (error) {
+      throw new Error(`Could not load saved response feedback: ${error.message}`);
+    }
+    if (!data) throw new Error("Could not load saved response feedback: the database returned no data.");
+    feedback.push(...data);
+    if (data.length < feedbackPageSize) break;
   }
-  const [ratingsResult, reportsResult] = await Promise.all([ratingsQuery, reportsQuery]);
-  if (ratingsResult.error) {
-    throw new Error(`Could not load recent response ratings: ${ratingsResult.error.message}`);
-  }
-  if (reportsResult.error) {
-    throw new Error(`Could not load recent response reports: ${reportsResult.error.message}`);
-  }
-  const feedback = [...ratingsResult.data, ...reportsResult.data];
   if (feedback.length === 0) return [];
-  let versionsQuery = client
-    .from("chat_message_versions")
-    .select("message_id, version_number, content")
-    .in("message_id", [...new Set(feedback.map((item) => item.message_id))]);
-  if (userId) versionsQuery = versionsQuery.eq("user_id", userId);
-  let targetMessagesQuery = client
-    .from("chat_messages")
-    .select("id, created_at")
-    .in("id", [...new Set(feedback.map((item) => item.message_id))]);
-  if (userId) targetMessagesQuery = targetMessagesQuery.eq("user_id", userId);
-  const [versionsResult, targetMessagesResult] = await Promise.all([
-    versionsQuery,
-    targetMessagesQuery,
+  const messageIds = [...new Set(feedback.map((item) => item.message_id))];
+  const idChunks = Array.from(
+    { length: Math.ceil(messageIds.length / 100) },
+    (_, index) => messageIds.slice(index * 100, (index + 1) * 100),
+  );
+  const [versionsResults, targetMessagesResults] = await Promise.all([
+    Promise.all(
+      idChunks.map((ids) =>
+        client
+          .from("chat_message_versions")
+          .select("message_id, version_number, content")
+          .eq("user_id", userId)
+          .in("message_id", ids),
+      ),
+    ),
+    Promise.all(
+      idChunks.map((ids) =>
+        client
+          .from("chat_messages")
+          .select("id, role, created_at")
+          .eq("user_id", userId)
+          .in("id", ids),
+      ),
+    ),
   ]);
-  const { data: versions, error: versionsError } = versionsResult;
+  const versionsError = versionsResults.find((result) => result.error)?.error;
   if (versionsError) {
     throw new Error(`Could not load rated response versions: ${versionsError.message}`);
   }
+  if (versionsResults.some((result) => result.data === null)) {
+    throw new Error("Could not load rated response versions: the database returned no data.");
+  }
+  const versions = versionsResults.flatMap((result) => result.data ?? []);
   const contentById = new Map(
     versions.map((item) => [`${item.message_id}:${item.version_number}`, item.content]),
   );
-  const { data: targetMessages, error: targetMessagesError } = targetMessagesResult;
+  const targetMessagesError = targetMessagesResults.find((result) => result.error)?.error;
   if (targetMessagesError) {
     throw new Error(`Could not load rated response context: ${targetMessagesError.message}`);
   }
+  if (targetMessagesResults.some((result) => result.data === null)) {
+    throw new Error("Could not load rated response context: the database returned no data.");
+  }
+  const targetMessages = targetMessagesResults
+    .flatMap((result) => result.data ?? [])
+    .sort((first, second) => second.created_at.localeCompare(first.created_at))
+    .filter((item) => item.role === "assistant");
   const latestResponseTime = targetMessages.reduce(
     (latest, item) => (item.created_at > latest ? item.created_at : latest),
     "",
   );
-  let userMessagesQuery = client
-    .from("chat_messages")
-    .select("id, content, created_at")
-    .eq("role", "user")
-    .order("created_at", { ascending: false })
-    .limit(200);
-  if (latestResponseTime) userMessagesQuery = userMessagesQuery.lte("created_at", latestResponseTime);
-  if (userId) userMessagesQuery = userMessagesQuery.eq("user_id", userId);
-  const { data: userMessages, error: userMessagesError } = await userMessagesQuery;
-  if (userMessagesError) {
-    throw new Error(`Could not load requests for rated responses: ${userMessagesError.message}`);
+  const requestByResponseId = new Map<
+    string,
+    { id: string; content: string; created_at: string } | null
+  >();
+  let responseIndex = 0;
+  const requestPageSize = 500;
+  for (let offset = 0; responseIndex < targetMessages.length; offset += requestPageSize) {
+    let query = client
+      .from("chat_messages")
+      .select("id, content, created_at")
+      .eq("user_id", userId)
+      .eq("role", "user")
+      .order("created_at", { ascending: false })
+      .range(offset, offset + requestPageSize - 1);
+    if (latestResponseTime) query = query.lte("created_at", latestResponseTime);
+    const { data, error } = await query;
+    if (error) {
+      throw new Error(`Could not load requests for rated responses: ${error.message}`);
+    }
+    if (!data) {
+      throw new Error("Could not load requests for rated responses: the database returned no data.");
+    }
+    let requestIndex = 0;
+    while (responseIndex < targetMessages.length) {
+      const response = targetMessages[responseIndex];
+      while (
+        requestIndex < data.length &&
+        data[requestIndex].created_at > response.created_at
+      ) {
+        requestIndex += 1;
+      }
+      if (requestIndex === data.length) break;
+      requestByResponseId.set(response.id, data[requestIndex]);
+      responseIndex += 1;
+    }
+    if (data.length < requestPageSize) break;
   }
-  const requestByResponseId = new Map(
-    targetMessages.map((response) => [
-      response.id,
-      userMessages.find((message) => message.created_at <= response.created_at) ?? null,
-    ]),
-  );
-  const messagePriority = new Map(messageIds.map((messageId, index) => [messageId, index]));
-  const prioritizedFeedback = [...feedback].sort((first, second) => {
-    const priorityDifference =
-      (messagePriority.get(first.message_id) ?? Number.MAX_SAFE_INTEGER) -
-      (messagePriority.get(second.message_id) ?? Number.MAX_SAFE_INTEGER);
-    return priorityDifference || second.created_at.localeCompare(first.created_at);
-  });
-  return prioritizedFeedback.flatMap((item) => {
+  return feedback.flatMap((item) => {
     const content = contentById.get(`${item.message_id}:${item.version_number}`);
-    if (!content || (item.kind !== "like" && item.kind !== "dislike" && item.kind !== "report")) {
+    if (!content || !targetMessages.some((message) => message.id === item.message_id)) {
       return [];
     }
     return [{
+      feedbackId: item.id,
       messageId: item.message_id,
       rating: item.kind,
       response: content,
@@ -967,6 +1037,7 @@ export async function loadRecentAssistantFeedback(
       details: item.kind === "report" ? item.details : null,
       request: requestByResponseId.get(item.message_id)?.content ?? null,
       requestMessageId: requestByResponseId.get(item.message_id)?.id ?? null,
+      createdAt: item.created_at,
     }];
   });
 }

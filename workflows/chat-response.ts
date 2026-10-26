@@ -3,7 +3,7 @@ import {
   createEmbedding,
   executeChatDataTool,
   findRelevantContext,
-  loadRecentAssistantFeedback,
+  loadAllAssistantFeedback,
   loadChatMessagePage,
   loadInsightsForMessages,
   loadRecentInsights,
@@ -344,7 +344,39 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
       return;
     }
     try {
-      await saveMessageInsight(client, userMessage.id, insight, job.user_id);
+      const insightEmbeddingText = [
+        `Mood: ${insight.mood}`,
+        `Communication style: ${insight.communication_style}`,
+        `Situation: ${insight.situation}`,
+        `Topics: ${insight.topics.join(", ")}`,
+        `Support needs: ${insight.support_needs}`,
+        `Summary: ${insight.summary}`,
+      ]
+        .filter((part) => part.split(": ", 2)[1]?.trim())
+        .join("\n")
+        .slice(0, 6000);
+      let insightEmbedding: string | null = null;
+      try {
+        insightEmbedding = `[${(
+          await createEmbedding(
+            typedKeys[0].api_key,
+            insightEmbeddingText,
+            "RETRIEVAL_DOCUMENT",
+          )
+        ).join(",")}]`;
+      } catch (error) {
+        console.warn(
+          `Conversation insight embedding could not be created for message ${userMessage.id}.`,
+          error,
+        );
+      }
+      await saveMessageInsight(
+        client,
+        userMessage.id,
+        insight,
+        job.user_id,
+        insightEmbedding,
+      );
     } catch (error) {
       console.error(`Conversation insight could not be saved for message ${userMessage.id}.`, error);
     }
@@ -367,9 +399,11 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
         };
   let retrievedMessages: Awaited<ReturnType<typeof findRelevantContext>>["messages"] = [];
   let memories: Awaited<ReturnType<typeof findRelevantContext>>["memories"] = [];
+  let retrievedInsights: Awaited<ReturnType<typeof findRelevantContext>>["insights"] = [];
   if (contextResult.status === "fulfilled") {
     retrievedMessages = contextResult.value.messages;
     memories = contextResult.value.memories;
+    retrievedInsights = contextResult.value.insights;
   } else {
     warnings.push(
       `Semantic chat context could not be loaded: ${
@@ -486,44 +520,42 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
     ...retrievedMessages.map((item) => item.id),
     ...history.map((item) => item.id),
   ];
-  const assistantIds = [
-    ...retrievedMessages.filter((item) => item.role === "assistant").map((item) => item.id),
-    ...history.filter((item) => item.role === "assistant").map((item) => item.id),
-  ];
-  const [feedbackResult, insightsResult] = job.thinking_mode
-    ? await Promise.allSettled([
-        loadRecentAssistantFeedback(client, [...new Set(assistantIds)], 32, job.user_id),
-        loadInsightsForMessages(client, [...new Set(candidateMessageIds)], job.user_id, 20, true),
-      ])
-    : [
-        {
-          status: "fulfilled",
-          value: [] as Awaited<ReturnType<typeof loadRecentAssistantFeedback>>,
-        } as const,
-        {
-          status: "fulfilled",
-          value: [] as Awaited<ReturnType<typeof loadInsightsForMessages>>,
-        } as const,
-      ];
+  const [feedbackResult, insightsResult] = await Promise.allSettled([
+    loadAllAssistantFeedback(client, job.user_id),
+    loadInsightsForMessages(client, [...new Set(candidateMessageIds)], job.user_id, 20, true),
+  ]);
 
-  let feedback: Awaited<ReturnType<typeof loadRecentAssistantFeedback>> = [];
+  let feedback: Awaited<ReturnType<typeof loadAllAssistantFeedback>> = [];
   if (feedbackResult.status === "fulfilled") feedback = feedbackResult.value;
   else {
-    warnings.push(
-      `Saved response feedback could not be loaded: ${
+    throw new Error(
+      `Could not load all saved response feedback before generating a reply: ${
         feedbackResult.reason instanceof Error ? feedbackResult.reason.message : "Unknown error."
       }`,
     );
   }
 
   let insights: Awaited<ReturnType<typeof loadInsightsForMessages>> = [];
-  if (insightsResult.status === "fulfilled") insights = insightsResult.value;
+  if (insightsResult.status === "fulfilled") {
+    const insightsByMessageId = new Map<
+      string,
+      (typeof insightsResult.value)[number] | (typeof retrievedInsights)[number]
+    >();
+    for (const insight of retrievedInsights) {
+      insightsByMessageId.set(insight.message_id, insight);
+    }
+    for (const insight of insightsResult.value) {
+      if (!insightsByMessageId.has(insight.message_id)) insightsByMessageId.set(insight.message_id, insight);
+    }
+    insights = [...insightsByMessageId.values()];
+  }
   else {
     warnings.push(
       `Conversation insights could not be loaded: ${
         insightsResult.reason instanceof Error ? insightsResult.reason.message : "Unknown error."
       }`,
     );
+    insights = retrievedInsights;
   }
   if (feedbackResult.status === "fulfilled" && insightsResult.status === "fulfilled") {
     const candidateMessageIdSet = new Set(candidateMessageIds);

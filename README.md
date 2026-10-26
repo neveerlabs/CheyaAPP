@@ -41,7 +41,8 @@ preserves Gemini and TTS API keys as unassigned database records.
 ### One-time operator setup
 
 1. Run [`supabase/schema.sql`](./supabase/schema.sql) in the shared project's Supabase SQL Editor.
-   Rerun the complete script when updating an existing project.
+   Rerun the complete script when updating an existing project. This schema includes the vector
+   embedding column and service-only semantic retrieval function for conversation insights.
 2. In Supabase **Authentication → Sign In / Providers**, enable Google and GitHub. Create a Google
    OAuth web client and configure the Google provider in Supabase with its client ID and secret.
    Create a GitHub OAuth app and configure its client ID and secret in Supabase. Set the GitHub

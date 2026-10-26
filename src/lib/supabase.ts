@@ -289,6 +289,7 @@ export type MessageInsight = {
   topics: string[];
   support_needs: string;
   summary: string;
+  embedding: string | null;
   created_at: string;
 };
 
@@ -781,6 +782,7 @@ export type Database = {
           topics?: string[];
           support_needs?: string;
           summary?: string;
+          embedding?: string | null;
           created_at?: string;
         };
         Update: Partial<{
@@ -790,6 +792,7 @@ export type Database = {
           topics: string[];
           support_needs: string;
           summary: string;
+          embedding: string | null;
         }>;
         Relationships: never[];
       };
@@ -1102,6 +1105,24 @@ export type Database = {
           id: string;
           category: string;
           content: string;
+          similarity: number;
+        }>;
+      };
+      match_message_insights_for_user: {
+        Args: {
+          p_user_id: string;
+          query_embedding: string;
+          result_limit?: number;
+        };
+        Returns: Array<{
+          message_id: string;
+          mood: string;
+          communication_style: string;
+          situation: string;
+          topics: string[];
+          support_needs: string;
+          summary: string;
+          created_at: string;
           similarity: number;
         }>;
       };

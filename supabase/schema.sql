@@ -3397,6 +3397,7 @@ create table if not exists public.message_insights (
   topics text[] not null default '{}',
   support_needs text not null default '',
   summary text not null default '',
+  embedding extensions.vector(768),
   created_at timestamptz not null default now(),
   foreign key (user_id, message_id)
     references public.chat_messages (user_id, id)
@@ -3436,8 +3437,68 @@ begin
 end;
 $$;
 
+alter table public.message_insights
+  add column if not exists embedding extensions.vector(768);
+
 create index if not exists message_insights_user_created_idx
   on public.message_insights (user_id, created_at desc);
+
+create index if not exists message_insights_embedding_idx
+  on public.message_insights using hnsw (embedding extensions.vector_cosine_ops);
+
+create or replace function public.match_message_insights_for_user(
+  p_user_id uuid,
+  query_embedding extensions.vector(768),
+  result_limit integer default 6
+)
+returns table (
+  message_id uuid,
+  mood text,
+  communication_style text,
+  situation text,
+  topics text[],
+  support_needs text,
+  summary text,
+  created_at timestamptz,
+  similarity double precision
+)
+language plpgsql
+stable
+security definer
+set search_path = public, extensions, auth
+as $$
+begin
+  if auth.role() <> 'service_role' then
+    raise exception 'This retrieval function is reserved for the chat workflow.';
+  end if;
+
+  return query
+  select
+    insights.message_id,
+    insights.mood,
+    insights.communication_style,
+    insights.situation,
+    insights.topics,
+    insights.support_needs,
+    insights.summary,
+    insights.created_at,
+    1 - (insights.embedding <=> query_embedding) as similarity
+  from public.message_insights as insights
+  join public.chat_messages as messages
+    on messages.user_id = insights.user_id
+    and messages.id = insights.message_id
+  where insights.user_id = p_user_id
+    and insights.embedding is not null
+    and messages.is_active
+  order by insights.embedding <=> query_embedding
+  limit least(greatest(result_limit, 1), 20);
+end;
+$$;
+
+revoke all on function public.match_message_insights_for_user(uuid, extensions.vector, integer)
+  from public, anon, authenticated;
+grant execute on function public.match_message_insights_for_user(uuid, extensions.vector, integer)
+  to service_role;
 
 alter table public.message_insights enable row level security;
 
