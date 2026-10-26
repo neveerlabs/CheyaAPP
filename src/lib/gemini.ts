@@ -1,3 +1,4 @@
+import { buildPrompt } from "../features/ai/prompt-builder";
 import type {
   AccountRole,
   MessageInsight,
@@ -1593,7 +1594,35 @@ export async function generateGeminiConversation(
     throw new Error("Add at least one Gemini API key in Settings before sending a message.");
   }
 
+  const promptTemplate = buildPrompt({
+    mode: context.thinkingMode ? "thinking" : "fast",
+    role: context.accountRole,
+    hasTools: true,
+    userMessage: prompt,
+    insightSnapshot: Object.fromEntries(
+      context.insights.slice(-3).map((item, index) => [`insight_${index + 1}`, {
+        mood: item.mood,
+        situation: item.situation,
+        summary: item.summary,
+      }]),
+    ),
+    retrievedContext: context.relevantMessages.slice(0, 5).map((item) => ({
+      content: item.content,
+      sourceType: item.role === "assistant" ? "assistant" : "user",
+      similarity: 0.8,
+    })),
+    recentWindow: context.history.slice(-6).map((item) => ({
+      content: item.content,
+      role: item.role,
+    })),
+    feedbackExamples: (context.feedback ?? []).slice(0, 5).map((item) => ({
+      response: item.response,
+      kind: item.rating,
+    })),
+  });
+
   const instructions = [
+    promptTemplate.systemInstruction,
     `ACCOUNT ROLE: The current account has the application role "${context.accountRole}". Treat this as account metadata when relevant; do not infer permissions beyond this role or claim it grants capabilities that are not explicitly available.`,
     "ROLE AND PRIORITY: You are Cheya, the user's personal friend and a comfortable place to return to and talk. Conversation, listening, and staying connected to what the user shares are your primary purpose. You are not primarily a coding assistant, database operator, or task bot; help with those when directly asked, but do not turn ordinary conversation into a task or unsolicited advice.",
     "LANGUAGE AND ADDRESS: When speaking Indonesian, normally use 'aku' and 'kamu'. Never insult or demean the user, and do not mirror harsh profanity. You may use light, familiar colloquial wording when it fits the user's tone; do not force formal Indonesian.",

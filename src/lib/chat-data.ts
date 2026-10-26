@@ -6,6 +6,7 @@ import type {
   UserMemory,
 } from "./supabase";
 import { CHAT_ATTACHMENT_BUCKET, type ChatAttachment } from "./chat-attachments";
+import { retrieveContext } from "../features/rag/retrieve";
 
 const EMBEDDING_MODEL = "gemini-embedding-001";
 const EMBEDDING_DIMENSIONS = 768;
@@ -29,6 +30,8 @@ function describeDatabaseError(error: { code?: string; message: string }): strin
     ? `${error.message} Confirm the latest supabase/schema.sql has been run.`
     : error.message;
 }
+
+void describeDatabaseError;
 
 const retrievalStopWords = new Set([
   "ada", "aja", "atau", "belum", "bisa", "buat", "dalam", "dan", "dari", "dengan", "dia",
@@ -81,7 +84,9 @@ export type RetrievedInsight = Pick<
   | "support_needs"
   | "summary"
   | "created_at"
-> & { similarity: number };
+> & { similarity?: number };
+
+export { retrieveContext } from "../features/rag/retrieve";
 
 export async function createEmbedding(
   apiKey: string,
@@ -438,155 +443,39 @@ export async function findRelevantContext(
   memories: RetrievedMemory[];
   insights: RetrievedInsight[];
 }> {
-  const queryEmbedding = serializeEmbedding(embedding);
-  const keywords = retrievalKeywords(keywordText);
-  const keywordFilter = keywords
-    .map((keyword) => `content.ilike.%${keyword}%`)
-    .join(",");
-  const [messageResult, memoryResult, keywordMessageResult, keywordMemoryResult, insightResult] =
-    await Promise.all([
-      userId
-        ? beforeCreatedAt
-          ? client.rpc("match_chat_messages_before_for_user", {
-              p_user_id: userId,
-              query_embedding: queryEmbedding,
-              max_created_at: beforeCreatedAt,
-              result_limit: SEARCH_RESULT_LIMIT,
-              exclude_message_id: excludeMessageId,
-            })
-          : client.rpc("match_chat_messages_for_user", {
-              p_user_id: userId,
-              query_embedding: queryEmbedding,
-              result_limit: SEARCH_RESULT_LIMIT,
-              exclude_message_id: excludeMessageId,
-            })
-        : beforeCreatedAt
-        ? client.rpc("match_chat_messages_before", {
-            query_embedding: queryEmbedding,
-            max_created_at: beforeCreatedAt,
-            result_limit: SEARCH_RESULT_LIMIT,
-            exclude_message_id: excludeMessageId,
-          })
-        : client.rpc("match_chat_messages", {
-            query_embedding: queryEmbedding,
-            result_limit: SEARCH_RESULT_LIMIT,
-            exclude_message_id: excludeMessageId,
-          }),
-      userId
-        ? client.rpc("match_user_memories_for_user", {
-            p_user_id: userId,
-            query_embedding: queryEmbedding,
-            result_limit: SEARCH_RESULT_LIMIT,
-          })
-        : client.rpc("match_user_memories", {
-            query_embedding: queryEmbedding,
-            result_limit: SEARCH_RESULT_LIMIT,
-          }),
-      keywords.length > 0
-        ? (async () => {
-            let query = client
-              .from("chat_messages")
-              .select("id, role, content, created_at")
-              .eq("is_active", true)
-              .neq("id", excludeMessageId)
-              .or(keywordFilter)
-              .order("created_at", { ascending: false })
-              .limit(SEARCH_RESULT_LIMIT * 2);
-            if (beforeCreatedAt) query = query.lt("created_at", beforeCreatedAt);
-            if (userId) query = query.eq("user_id", userId);
-            const { data, error } = await query;
-            if (error) throw new Error(`Could not search active chat history by keyword: ${error.message}`);
-            return data;
-          })()
-        : Promise.resolve([]),
-      keywords.length > 0
-        ? (async () => {
-            let query = client
-              .from("user_memories")
-              .select("id, category, content")
-              .or(
-                [
-                  ...keywords.map((keyword) => `content.ilike.%${keyword}%`),
-                  ...keywords.map((keyword) => `category.ilike.%${keyword}%`),
-                ].join(","),
-              )
-              .order("updated_at", { ascending: false })
-              .limit(SEARCH_RESULT_LIMIT * 2);
-            if (userId) query = query.eq("user_id", userId);
-            const { data, error } = await query;
-            if (error) throw new Error(`Could not search saved memories by keyword: ${error.message}`);
-            return data;
-          })()
-        : Promise.resolve([]),
-      userId
-        ? client.rpc("match_message_insights_for_user", {
-            p_user_id: userId,
-            query_embedding: queryEmbedding,
-            result_limit: SEARCH_RESULT_LIMIT,
-          })
-        : Promise.resolve({ data: [], error: null }),
-    ]);
-
-  if (messageResult.error) {
-    throw new Error(
-      `Could not retrieve related chat history: ${describeDatabaseError(messageResult.error)}`,
-    );
-  }
-  if (memoryResult.error) {
-    throw new Error(
-      `Could not retrieve related memories: ${describeDatabaseError(memoryResult.error)}`,
-    );
-  }
-  if (insightResult.error) {
-    throw new Error(
-      `Could not retrieve related conversation insights: ${describeDatabaseError(insightResult.error)}`,
-    );
-  }
-  if (keywordMessageResult instanceof Error) throw keywordMessageResult;
-  if (keywordMemoryResult instanceof Error) throw keywordMemoryResult;
-
-  const messageMatches = new Map<string, RetrievedChatMessage>();
-  for (const row of messageResult.data) {
-    if (row.similarity >= 0.35) messageMatches.set(row.id, row);
-  }
-  for (const row of keywordMessageResult) {
-    const matchedTerms = keywords.filter((keyword) =>
-      row.content.toLocaleLowerCase().includes(keyword),
-    ).length;
-    if (!matchedTerms) continue;
-    const keywordScore = 0.52 + (matchedTerms / keywords.length) * 0.43;
-    const existing = messageMatches.get(row.id);
-    if (!existing || existing.similarity < keywordScore) {
-      messageMatches.set(row.id, { ...row, similarity: keywordScore });
-    }
+  if (!userId) {
+    return { messages: [], memories: [], insights: [] };
   }
 
-  const memoryMatches = new Map<string, RetrievedMemory>();
-  for (const row of memoryResult.data) {
-    if (row.similarity >= 0.35) memoryMatches.set(row.id, row);
-  }
-  for (const row of keywordMemoryResult) {
-    const searchableText = `${row.category} ${row.content}`.toLocaleLowerCase();
-    const matchedTerms = keywords.filter((keyword) => searchableText.includes(keyword)).length;
-    if (!matchedTerms) continue;
-    const keywordScore = 0.52 + (matchedTerms / keywords.length) * 0.43;
-    const existing = memoryMatches.get(row.id);
-    if (!existing || existing.similarity < keywordScore) {
-      memoryMatches.set(row.id, { ...row, similarity: keywordScore });
-    }
-  }
+  const results = await retrieveContext({
+    client,
+    userId,
+    queryEmbedding: embedding,
+    excludeMessageId,
+    beforeCreatedAt,
+    keywordText,
+    mode: "thinking",
+  });
 
   return {
-    messages: [...messageMatches.values()]
-      .sort((first, second) => second.similarity - first.similarity)
-      .slice(0, SEARCH_RESULT_LIMIT * 2),
-    memories: [...memoryMatches.values()]
-      .sort((first, second) => second.similarity - first.similarity)
-      .slice(0, SEARCH_RESULT_LIMIT * 2),
-    insights: insightResult.data
-      .filter((row) => row.similarity >= 0.35)
-      .sort((first, second) => second.similarity - first.similarity)
-      .slice(0, SEARCH_RESULT_LIMIT),
+    messages: results
+      .filter((item: { kind: string }) => item.kind === "message")
+      .map((item: { id: string; role?: string; content: string; created_at: string; similarity: number }) => ({
+        id: item.id,
+        role: (item.role ?? "assistant") as StoredChatMessage["role"],
+        content: item.content,
+        created_at: item.created_at,
+        similarity: item.similarity,
+      })),
+    memories: results
+      .filter((item: { kind: string }) => item.kind === "memory")
+      .map((item: { id: string; content: string; similarity: number }) => ({
+        id: item.id,
+        category: "general",
+        content: item.content,
+        similarity: item.similarity,
+      })),
+    insights: [],
   };
 }
 
@@ -600,7 +489,7 @@ export async function loadRecentInsights(
   Array<
     Pick<
       MessageInsight,
-      "mood" | "communication_style" | "situation" | "topics" | "support_needs" | "summary" | "created_at"
+      "message_id" | "mood" | "communication_style" | "situation" | "topics" | "support_needs" | "summary" | "created_at"
     >
   >
 > {
@@ -623,7 +512,7 @@ export async function loadRecentInsights(
 
   let query = client
     .from("message_insights")
-    .select("mood, communication_style, situation, topics, support_needs, summary, created_at")
+    .select("message_id, mood, communication_style, situation, topics, support_needs, summary, created_at")
     .in("message_id", messageIds)
     .order("created_at", { ascending: false })
     .limit(limit);
