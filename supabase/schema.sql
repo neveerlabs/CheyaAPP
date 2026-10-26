@@ -3712,6 +3712,13 @@ begin
     raise exception 'Rating must be like, dislike, or null.';
   end if;
 
+  perform pg_advisory_xact_lock(
+    hashtextextended(
+      auth.uid()::text || ':' || p_message_id::text || ':' || p_version_number::text,
+      0
+    )
+  );
+
   delete from public.message_feedback
   where user_id = auth.uid()
     and message_id = p_message_id
@@ -4326,7 +4333,6 @@ revoke all on function public.run_database_keepalive() from public, anon, authen
 grant execute on function public.run_database_keepalive() to service_role;
 
 create extension if not exists pg_trgm;
-create extension if not exists vector with schema extensions;
 
 create index if not exists chat_messages_content_trgm
   on public.chat_messages using gin (content gin_trgm_ops);
@@ -4347,7 +4353,7 @@ create index if not exists message_feedback_message_version
 create table if not exists public.user_insights (
   user_id uuid primary key references auth.users(id) on delete cascade,
   snapshot jsonb not null default '{}'::jsonb,
-  embedding vector(768),
+  embedding extensions.vector(768),
   updated_at timestamptz not null default now()
 );
 
@@ -4375,14 +4381,14 @@ create table if not exists public.rag_chunks (
   source_id uuid not null,
   user_id uuid references auth.users(id) on delete cascade,
   content text not null,
-  embedding vector(768),
+  embedding extensions.vector(768),
   weight numeric not null default 1.0,
   metadata jsonb default '{}'::jsonb,
   created_at timestamptz default now()
 );
 
 create index if not exists rag_chunks_embedding_idx
-  on public.rag_chunks using ivfflat (embedding vector_cosine_ops) with (lists = 100);
+  on public.rag_chunks using ivfflat (embedding extensions.vector_cosine_ops) with (lists = 100);
 
 alter table public.message_insights
   add column if not exists expires_at timestamptz;

@@ -1,5 +1,6 @@
 import {
   isValidElement,
+  memo,
   useEffect,
   useLayoutEffect,
   useRef,
@@ -393,7 +394,7 @@ const markdownComponents = {
   ),
 };
 
-export function AssistantMarkdown({
+export const AssistantMarkdown = memo(function AssistantMarkdown({
   content,
   userMessage = false,
   animate = false,
@@ -534,4 +535,4 @@ export function AssistantMarkdown({
       ))}
     </div>
   );
-}
+});

@@ -45,6 +45,7 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type ReactNode,
 } from "react";
 import cheyaLogo from "../assets/circle.png";
 import sendMessageSound from "../assets/sounds/send.mp3";
@@ -306,6 +307,116 @@ function formatMediaTime(seconds: number): string {
   return `${Math.floor(wholeSeconds / 60)}:${String(wholeSeconds % 60).padStart(2, "0")}`;
 }
 
+function formatRecordingElapsedTime(milliseconds: number): string {
+  const elapsed = Math.max(0, Math.floor(milliseconds));
+  const minutes = Math.floor(elapsed / 60_000);
+  const seconds = Math.floor((elapsed % 60_000) / 1_000);
+  const fractionalTick = Math.floor((elapsed % 1_000) / 100);
+  return `${minutes}:${String(seconds).padStart(2, "0")},${fractionalTick}`;
+}
+
+function VoiceRecordingTimer({
+  startedAt,
+  maxDurationMs,
+  timerRef,
+  onLimit,
+}: {
+  startedAt: number;
+  maxDurationMs: number;
+  timerRef: { current: ReturnType<typeof setInterval> | null };
+  onLimit: (maxDurationSeconds: number) => void;
+}) {
+  const [elapsedMs, setElapsedMs] = useState(() => Math.max(0, performance.now() - startedAt));
+  const onLimitRef = useRef(onLimit);
+  onLimitRef.current = onLimit;
+
+  useEffect(() => {
+    let limitReached = false;
+    const interval = setInterval(() => {
+      const elapsed = Math.max(0, performance.now() - startedAt);
+      setElapsedMs(elapsed);
+      if (!limitReached && elapsed >= maxDurationMs) {
+        limitReached = true;
+        onLimitRef.current(Math.floor(maxDurationMs / 1_000));
+      }
+    }, 50);
+    timerRef.current = interval;
+
+    return () => {
+      clearInterval(interval);
+      if (timerRef.current === interval) timerRef.current = null;
+    };
+  }, [maxDurationMs, startedAt, timerRef]);
+
+  return (
+    <span
+      role="status"
+      aria-label={`Recording voice message, ${formatRecordingElapsedTime(elapsedMs)}`}
+      className="inline-flex items-center text-[#596879]"
+    >
+      <span className="recording-timer-window tabular-nums">
+        <span className="recording-timer-roll" key={`minutes-${Math.floor(elapsedMs / 60_000)}`}>
+          {Math.floor(elapsedMs / 60_000)}
+        </span>
+      </span>
+      <span>:</span>
+      <span className="recording-timer-window tabular-nums">
+        <span
+          className="recording-timer-roll"
+          key={`seconds-${Math.floor((elapsedMs % 60_000) / 1_000)}`}
+        >
+          {String(Math.floor((elapsedMs % 60_000) / 1_000)).padStart(2, "0")}
+        </span>
+      </span>
+      <span>,</span>
+      <span className="recording-timer-tenth tabular-nums">
+        {Math.floor((elapsedMs % 1_000) / 100)}
+      </span>
+    </span>
+  );
+}
+
+function FastProcessingIndicator() {
+  const text = "Processing...";
+  const [visibleCharacters, setVisibleCharacters] = useState(text.length);
+  const [phase, setPhase] = useState<"holding" | "deleting" | "waiting" | "typing">("holding");
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => {
+      if (phase === "holding") {
+        setPhase("deleting");
+      } else if (phase === "deleting") {
+        if (visibleCharacters <= 1) {
+          setVisibleCharacters(0);
+          setPhase("waiting");
+        } else {
+          setVisibleCharacters((count) => count - 1);
+        }
+      } else if (phase === "waiting") {
+        setPhase("typing");
+      } else if (visibleCharacters >= text.length) {
+        setPhase("holding");
+      } else {
+        setVisibleCharacters((count) => count + 1);
+      }
+    }, phase === "holding" ? 3_000 : phase === "deleting" ? 90 : phase === "waiting" ? 90 : 24);
+
+    return () => window.clearTimeout(timeout);
+  }, [phase, text.length, visibleCharacters]);
+
+  return (
+    <p
+      aria-hidden="true"
+      className="m-0 inline-flex h-4 min-h-4 items-center gap-1.5 whitespace-nowrap leading-4"
+    >
+      <i style={{ fontStyle: "italic" }}>
+        {text.slice(0, visibleCharacters)}
+        {visibleCharacters === text.length && <span className="fast-processing-caret" />}
+      </i>
+    </p>
+  );
+}
+
 function getAudioWaveform(audio: AudioBuffer, barCount = 36): number[] {
   const bars = Array.from({ length: barCount }, () => 0);
   const samplesPerBar = Math.max(1, Math.floor(audio.length / barCount));
@@ -431,6 +542,16 @@ function encodeVoiceNoteWav(samples: Float32Array, sampleRate: number): Blob {
   }
 
   return new Blob([buffer], { type: "audio/wav" });
+}
+
+function normalizeVoiceNoteSamples(samples: Float32Array): Float32Array {
+  let peak = 0;
+  for (const sample of samples) peak = Math.max(peak, Math.abs(sample));
+  if (peak === 0) return samples;
+
+  const gain = Math.min(0.95 / peak, 12);
+  if (gain === 1) return samples;
+  return Float32Array.from(samples, (sample) => sample * gain);
 }
 
 function MediaPreview({
@@ -884,6 +1005,12 @@ const ChatMessageAudioNote = memo(function ChatMessageAudioNote({
   const pendingPlaybackRef = useRef(false);
   const audioNoteRef = useRef<HTMLDivElement>(null);
   const lastPositionSaveAtRef = useRef(0);
+  const seekingGestureRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    axis: "pending" | "horizontal" | "vertical";
+  } | null>(null);
 
   useEffect(() => {
     if (expired) return;
@@ -1073,6 +1200,21 @@ const ChatMessageAudioNote = memo(function ChatMessageAudioNote({
 
   const progress = duration > 0 ? currentTime / duration : 0;
 
+  function seekToClientX(clientX: number) {
+    const waveform = audioNoteRef.current?.querySelector<HTMLElement>(
+      "[data-chat-voice-note-waveform]",
+    );
+    const audio = audioRef.current;
+    if (!waveform || !audio || duration <= 0) return;
+    const bounds = waveform.getBoundingClientRect();
+    if (bounds.width <= 0) return;
+    const fraction = Math.min(1, Math.max(0, (clientX - bounds.left) / bounds.width));
+    audio.currentTime = fraction * duration;
+    setCurrentTime(audio.currentTime);
+    savePlaybackPosition(audio);
+    lastPositionSaveAtRef.current = audio.currentTime;
+  }
+
   return (
     <div
       ref={audioNoteRef}
@@ -1177,9 +1319,83 @@ const ChatMessageAudioNote = memo(function ChatMessageAudioNote({
       </button>
       <div className="min-w-0 flex-1">
         <div
-          role="img"
-          aria-label="Audio waveform"
-          className="flex h-7 translate-y-px items-center gap-[3px] overflow-hidden"
+          role="slider"
+          tabIndex={expired || isLoading || duration <= 0 ? -1 : 0}
+          aria-label="Voice message position"
+          aria-valuemin={0}
+          aria-valuemax={duration}
+          aria-valuenow={currentTime}
+          aria-valuetext={`${formatMediaTime(currentTime)} of ${formatMediaTime(duration)}`}
+          aria-disabled={expired || isLoading || duration <= 0}
+          data-chat-voice-note-waveform
+          onPointerDown={(event) => {
+            if (expired || isLoading || duration <= 0 || !event.isPrimary) return;
+            seekingGestureRef.current = {
+              pointerId: event.pointerId,
+              startX: event.clientX,
+              startY: event.clientY,
+              axis: "pending",
+            };
+            if (event.pointerType !== "touch") {
+              event.currentTarget.setPointerCapture(event.pointerId);
+            }
+          }}
+          onPointerMove={(event) => {
+            const gesture = seekingGestureRef.current;
+            if (!gesture || gesture.pointerId !== event.pointerId || gesture.axis === "vertical") return;
+            if (gesture.axis === "pending") {
+              const deltaX = event.clientX - gesture.startX;
+              const deltaY = event.clientY - gesture.startY;
+              if (Math.max(Math.abs(deltaX), Math.abs(deltaY)) < 8) return;
+              if (Math.abs(deltaX) <= Math.abs(deltaY)) {
+                gesture.axis = "vertical";
+                return;
+              }
+              gesture.axis = "horizontal";
+              if (!event.currentTarget.hasPointerCapture(event.pointerId)) {
+                event.currentTarget.setPointerCapture(event.pointerId);
+              }
+            }
+            event.preventDefault();
+            seekToClientX(event.clientX);
+          }}
+          onPointerUp={(event) => {
+            const gesture = seekingGestureRef.current;
+            if (!gesture || gesture.pointerId !== event.pointerId) return;
+            if (gesture.axis === "pending" || gesture.axis === "horizontal") {
+              seekToClientX(event.clientX);
+            }
+            seekingGestureRef.current = null;
+            if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+              event.currentTarget.releasePointerCapture(event.pointerId);
+            }
+          }}
+          onPointerCancel={(event) => {
+            if (seekingGestureRef.current?.pointerId !== event.pointerId) return;
+            seekingGestureRef.current = null;
+          }}
+          onLostPointerCapture={(event) => {
+            if (seekingGestureRef.current?.pointerId !== event.pointerId) return;
+            seekingGestureRef.current = null;
+          }}
+          onKeyDown={(event) => {
+            if (duration <= 0) return;
+            const step = event.shiftKey ? 10 : 5;
+            let targetTime: number | null = null;
+            if (event.key === "ArrowLeft") targetTime = currentTime - step;
+            if (event.key === "ArrowRight") targetTime = currentTime + step;
+            if (event.key === "Home") targetTime = 0;
+            if (event.key === "End") targetTime = duration;
+            if (targetTime === null) return;
+            event.preventDefault();
+            const audio = audioRef.current;
+            if (!audio) return;
+            audio.currentTime = Math.min(duration, Math.max(0, targetTime));
+            setCurrentTime(audio.currentTime);
+            savePlaybackPosition(audio);
+            lastPositionSaveAtRef.current = audio.currentTime;
+          }}
+          className="flex h-7 translate-y-px touch-pan-y cursor-pointer items-center gap-[3px] overflow-hidden rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-[#c39ae8] aria-disabled:cursor-not-allowed"
         >
           {waveform.map((height, index) => (
             <span
@@ -1199,6 +1415,99 @@ const ChatMessageAudioNote = memo(function ChatMessageAudioNote({
     </div>
   );
 });
+
+const MAX_COLLAPSED_USER_MESSAGE_LINES = 8;
+
+function ExpandableUserMessage({
+  children,
+  measurementKey,
+}: {
+  children: ReactNode;
+  measurementKey: string;
+}) {
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [isExpanded, setIsExpanded] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
+
+  useLayoutEffect(() => {
+    if (isExpanded) return;
+    const content = contentRef.current;
+    const parent = content?.parentElement;
+    if (!content || !parent) return;
+
+    const measure = () => {
+      const clone = content.cloneNode(true) as HTMLDivElement;
+      const style = window.getComputedStyle(content);
+      clone.setAttribute("aria-hidden", "true");
+      clone.style.position = "absolute";
+      clone.style.visibility = "hidden";
+      clone.style.pointerEvents = "none";
+      clone.style.inset = "0 auto auto 0";
+      clone.style.zIndex = "-1";
+      clone.style.display = "block";
+      clone.style.overflow = "visible";
+      clone.style.height = "auto";
+      clone.style.maxHeight = "none";
+      clone.style.width = `${content.clientWidth}px`;
+      clone.style.font = style.font;
+      clone.style.lineHeight = style.lineHeight;
+      clone.style.letterSpacing = style.letterSpacing;
+      clone.style.webkitLineClamp = "unset";
+      clone.style.webkitBoxOrient = "initial";
+      parent.appendChild(clone);
+      const naturalHeight = clone.getBoundingClientRect().height;
+      const lineHeight = Number.parseFloat(style.lineHeight);
+      clone.remove();
+      setHasMore(
+        Number.isFinite(lineHeight) &&
+          naturalHeight > lineHeight * MAX_COLLAPSED_USER_MESSAGE_LINES + 1,
+      );
+    };
+
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [isExpanded, measurementKey]);
+
+  return (
+    <div className="relative min-w-0">
+      <div
+        ref={contentRef}
+        className={isExpanded ? "min-w-0" : "min-w-0 overflow-hidden"}
+        style={
+          isExpanded
+            ? undefined
+            : {
+                display: "-webkit-box",
+                WebkitBoxOrient: "vertical",
+                WebkitLineClamp: MAX_COLLAPSED_USER_MESSAGE_LINES,
+              }
+        }
+      >
+        {children}
+      </div>
+      {hasMore && !isExpanded && (
+        <button
+          type="button"
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={(event) => {
+            event.stopPropagation();
+            setIsExpanded(true);
+          }}
+          className="absolute bottom-0 right-0 cursor-pointer border-0 p-0 pl-1 text-left font-bold text-white"
+          style={{
+            backgroundColor: "#28292e",
+            lineHeight: 1.35,
+            fontWeight: 700,
+          }}
+        >
+          See more...
+        </button>
+      )}
+    </div>
+  );
+}
 
 const ChatMessageAttachmentTile = memo(function ChatMessageAttachmentTile({
   attachment,
@@ -1714,6 +2023,7 @@ interface TtsPlayback {
   status: "loading" | "ready" | "playing" | "paused" | "ended" | "error";
   durationSeconds: number;
   elapsedSeconds: number;
+  waveformHeights?: number[];
   activeWordIndex?: number | null;
   browserVoiceName?: string;
   errorSummary?: string;
@@ -1771,9 +2081,20 @@ function formatSpeechTime(seconds: number): string {
   return `${Math.floor(wholeSeconds / 60)}:${String(wholeSeconds % 60).padStart(2, "0")}`;
 }
 
-function speechWaveHeight(text: string, index: number): number {
-  const character = text.charCodeAt((index * 7) % Math.max(text.length, 1)) || index * 13;
-  return 5 + ((character * (index + 11)) % 24);
+function createSpeechWaveformHeights(text: string, barCount = 36): number[] {
+  let seed = 0;
+  for (const character of text) seed = (seed * 31 + character.charCodeAt(0)) >>> 0;
+  return Array.from({ length: barCount }, () => {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    return 8 + Math.round((seed / 0xffffffff) * 18);
+  });
+}
+
+function updateSpeechWaveformProgress(waveform: HTMLDivElement, progress: number) {
+  const bars = waveform.querySelectorAll<HTMLElement>("[data-speech-wave-bar]");
+  bars.forEach((bar, index) => {
+    bar.classList.toggle("tts-wave-bar-played", index / bars.length <= progress);
+  });
 }
 
 async function decodeSpeechAudio(audio: Blob): Promise<AudioBuffer> {
@@ -1892,6 +2213,7 @@ function isPreparedAdminMessageResult(
 export function App() {
   const [pathname, setPathname] = useState(window.location.pathname);
   const pathnameRef = useRef(window.location.pathname);
+  const ratingSaveInFlightRef = useRef(new Set<string>());
   const [isLoginOpen, setIsLoginOpen] = useState(false);
   const [authClient, setAuthClient] = useState<AppSupabaseClient | null>(null);
   const [authUser, setAuthUser] = useState<{
@@ -1932,6 +2254,7 @@ export function App() {
   >({});
   const [messageVersions, setMessageVersions] = useState<Record<string, ChatMessageVersion[]>>({});
   const [selectedMessageVersions, setSelectedMessageVersions] = useState<Record<string, number>>({});
+  const chatBranchCacheRef = useRef(new Map<string, ChatMessage[]>());
   const [isRestoringMessageVersion, setIsRestoringMessageVersion] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
@@ -1945,6 +2268,8 @@ export function App() {
   const [expandedThinkingIds, setExpandedThinkingIds] = useState<Set<string>>(() => new Set());
   const [ratings, setRatings] = useState<Record<string, AssistantRating>>({});
   const [adminRelayRatings, setAdminRelayRatings] = useState<Record<string, AssistantRating>>({});
+  const [reportedVersions, setReportedVersions] = useState<Record<string, boolean>>({});
+  const [reportedAdminRelays, setReportedAdminRelays] = useState<Record<string, boolean>>({});
   const [regeneratingAdminRelayId, setRegeneratingAdminRelayId] = useState<string | null>(null);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [ttsPlayback, setTtsPlayback] = useState<TtsPlayback | null>(null);
@@ -1998,10 +2323,7 @@ export function App() {
   const [isPreparingAttachments, setIsPreparingAttachments] = useState(false);
   const [isCameraOpen, setIsCameraOpen] = useState(false);
   const [isRecordingVoice, setIsRecordingVoice] = useState(false);
-  const [voiceRecordingSeconds, setVoiceRecordingSeconds] = useState(0);
-  const [voiceRecordingWaveform, setVoiceRecordingWaveform] = useState<number[]>(
-    () => Array.from({ length: 36 }, () => 4),
-  );
+  const [isStartingVoiceRecording, setIsStartingVoiceRecording] = useState(false);
   const [cameraFacing, setCameraFacing] = useState<"environment" | "user">("environment");
   const [isCameraSwitchSupported, setIsCameraSwitchSupported] = useState(false);
   const [isCameraTorchSupported, setIsCameraTorchSupported] = useState(false);
@@ -2025,6 +2347,7 @@ export function App() {
   const conversationTouchStartYRef = useRef<number | null>(null);
   const chatFooterObserverRef = useRef<ResizeObserver | null>(null);
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
+  const ttsWaveformRef = useRef<HTMLDivElement | null>(null);
   const ttsWordTimelineRef = useRef<SpeechWordTimeline | null>(null);
   const ttsUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   const ttsAudioUrlRef = useRef("");
@@ -2046,11 +2369,11 @@ export function App() {
   const voiceRecorderRef = useRef<MediaRecorder | null>(null);
   const voiceRecordingStreamRef = useRef<MediaStream | null>(null);
   const voiceRecordingAudioContextRef = useRef<AudioContext | null>(null);
-  const voiceRecordingAnalyserRef = useRef<AnalyserNode | null>(null);
   const voiceRecordingChunksRef = useRef<Blob[]>([]);
-  const voiceRecordingStartAtRef = useRef(0);
+  const voiceRecordingStartAtRef = useRef<number | null>(null);
   const voiceRecordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const voiceRecordingWaveformTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const voiceRecordingStartInProgressRef = useRef(false);
+  const voiceRecordingMaxDurationSecondsRef = useRef(0);
   const voiceRecordingCancelledRef = useRef(false);
   const autoSendVoiceMessageIdRef = useRef<string | null>(null);
   const localVoicePreviewUrlsRef = useRef(new Map<string, string>());
@@ -2107,6 +2430,8 @@ export function App() {
     }
   }, [messages]);
   const pendingChatSubmissionsRef = useRef(new Map<string, ChatSubmissionPayload>());
+  const pendingSentMessageSoundIdsRef = useRef(new Set<string>());
+  const playedSentMessageSoundIdsRef = useRef(new Set<string>());
   const chatSubmissionRetryAttemptsRef = useRef(new Map<string, number>());
   const chatSubmissionNextRetryAtRef = useRef(new Map<string, number>());
   const retryingChatSubmissionsRef = useRef(new Set<string>());
@@ -2916,6 +3241,9 @@ export function App() {
       if (ttsTokenRef.current !== token) return;
 
       let wordTimeline: SpeechWordTimeline | null = null;
+      const waveformHeights = decodedAudio
+        ? getAudioWaveform(decodedAudio, 27)
+        : createSpeechWaveformHeights(text, 27);
       if (decodedAudio && actualDuration <= 300) {
         wordTimeline = createSpeechWordTimeline(decodedAudio, text);
         if (!wordTimeline) {
@@ -3015,6 +3343,7 @@ export function App() {
         status: "ready",
         durationSeconds: actualDuration,
         elapsedSeconds: 0,
+        waveformHeights,
         errorSummary: errors.length ? summarizeSpeechError(errors.join("\n\n")) : undefined,
         errorDetails: errors.length ? errors.join("\n\n") : undefined,
       });
@@ -3092,6 +3421,8 @@ export function App() {
     let frameId = 0;
     const updateActiveWord = () => {
       if (!audio.paused && !audio.ended && audio.duration > 0) {
+        const progress = audio.currentTime / audio.duration;
+        if (ttsWaveformRef.current) updateSpeechWaveformProgress(ttsWaveformRef.current, progress);
         const activeWordIndex = ttsWordTimelineRef.current
           ? speechWordIndexAtAudioTime(ttsWordTimelineRef.current, audio.currentTime)
           : speechWordIndexAtProgress(
@@ -3110,6 +3441,24 @@ export function App() {
     frameId = window.requestAnimationFrame(updateActiveWord);
     return () => window.cancelAnimationFrame(frameId);
   }, [ttsPlayback?.engine, ttsPlayback?.messageId, ttsPlayback?.status, ttsPlayback?.text]);
+
+  useLayoutEffect(() => {
+    if (!ttsPlayback || ttsPlayback.status === "playing") return;
+    const progress =
+      ttsPlayback.status === "ended"
+        ? 1
+        : ttsPlayback.durationSeconds > 0
+          ? ttsPlayback.elapsedSeconds / ttsPlayback.durationSeconds
+          : 0;
+    if (ttsWaveformRef.current) {
+      updateSpeechWaveformProgress(ttsWaveformRef.current, progress);
+    }
+  }, [
+    ttsPlayback?.messageId ?? null,
+    ttsPlayback?.status ?? null,
+    ttsPlayback?.elapsedSeconds ?? null,
+    ttsPlayback?.durationSeconds ?? null,
+  ]);
 
   useEffect(() => {
     if (pathname.startsWith("/settings")) closeTts();
@@ -3176,6 +3525,7 @@ export function App() {
       ]);
       const assistantMessages = page.messages.filter((message) => message.role === "assistant");
       let loadedRatings: Record<string, AssistantRating> = {};
+      let loadedReports: Record<string, boolean> = {};
       if (assistantMessages.length > 0) {
         const { data, error } = await client
           .from("message_feedback")
@@ -3195,11 +3545,26 @@ export function App() {
               : [],
           ),
         );
+        const { data: reports, error: reportsError } = await client
+          .from("message_feedback")
+          .select("message_id, version_number")
+          .in(
+            "message_id",
+            assistantMessages.map((message) => message.id),
+          )
+          .eq("kind", "report");
+        if (reportsError) {
+          throw new Error(`Could not load saved response reports: ${reportsError.message}`);
+        }
+        loadedReports = Object.fromEntries(
+          reports.map((item) => [`${item.message_id}:${item.version_number}`, true]),
+        );
       }
       const adminRelayMessageIds = [
         ...new Set(page.messages.flatMap((message) => message.admin_message_id ?? [])),
       ];
       let loadedAdminRelayRatings: Record<string, AssistantRating> = {};
+      let loadedAdminRelayReports: Record<string, boolean> = {};
       if (adminRelayMessageIds.length > 0) {
         const { data, error } = await client
           .from("admin_message_feedback")
@@ -3214,6 +3579,17 @@ export function App() {
               ? [[item.admin_message_id, item.kind]]
               : [],
           ),
+        );
+        const { data: reports, error: reportsError } = await client
+          .from("admin_message_feedback")
+          .select("admin_message_id")
+          .in("admin_message_id", adminRelayMessageIds)
+          .eq("kind", "report");
+        if (reportsError) {
+          throw new Error(`Could not load saved relay reports: ${reportsError.message}`);
+        }
+        loadedAdminRelayReports = Object.fromEntries(
+          reports.map((item) => [item.admin_message_id, true]),
         );
       }
 
@@ -3239,6 +3615,8 @@ export function App() {
       }));
       setRatings((current) => ({ ...current, ...loadedRatings }));
       setAdminRelayRatings((current) => ({ ...current, ...loadedAdminRelayRatings }));
+      setReportedVersions((current) => ({ ...current, ...loadedReports }));
+      setReportedAdminRelays((current) => ({ ...current, ...loadedAdminRelayReports }));
       setMessages((current) => {
         const currentIds = new Set(current.map((message) => message.id));
         const olderMessages = page.messages
@@ -3366,9 +3744,8 @@ export function App() {
       localVoicePreviewUrlsRef.current.clear();
       voiceRecordingCancelledRef.current = true;
       if (voiceRecordingTimerRef.current) clearInterval(voiceRecordingTimerRef.current);
-      if (voiceRecordingWaveformTimerRef.current) {
-        clearInterval(voiceRecordingWaveformTimerRef.current);
-      }
+      voiceRecordingTimerRef.current = null;
+      voiceRecordingStartAtRef.current = null;
       voiceRecorderRef.current?.stop();
       voiceRecordingStreamRef.current?.getTracks().forEach((track) => track.stop());
       void voiceRecordingAudioContextRef.current?.close().catch((error: unknown) => {
@@ -3394,6 +3771,20 @@ export function App() {
 
   function displayedVersionNumber(chatMessage: ChatMessage): number {
     return selectedMessageVersions[chatMessage.id] ?? chatMessage.versionNumber;
+  }
+
+  function cacheChatBranch(branchMessages: ChatMessage[]) {
+    for (const message of branchMessages) {
+      chatBranchCacheRef.current.set(
+        `${message.id}:${message.versionNumber}`,
+        branchMessages,
+      );
+    }
+    while (chatBranchCacheRef.current.size > 500) {
+      const oldestKey = chatBranchCacheRef.current.keys().next().value;
+      if (!oldestKey) break;
+      chatBranchCacheRef.current.delete(oldestKey);
+    }
   }
 
   function messageVersionsForDisplay(chatMessage: ChatMessage): ChatMessageVersion[] {
@@ -3476,10 +3867,24 @@ export function App() {
 
     if (authClient) {
       const restoreGeneration = ++versionRestoreGenerationRef.current;
+      const previousMessages = messages;
+      const previousSelections = selectedMessageVersions;
+      cacheChatBranch(previousMessages);
+      const cachedBranch = chatBranchCacheRef.current.get(
+        `${chatMessage.id}:${nextVersion.version_number}`,
+      );
       isRestoringMessageVersionRef.current = true;
       setIsRestoringMessageVersion(true);
       setSendError("");
       setTypingAssistant(null);
+      if (cachedBranch) {
+        setMessages(cachedBranch);
+        setSelectedMessageVersions(
+          Object.fromEntries(
+            cachedBranch.map((message) => [message.id, message.versionNumber]),
+          ),
+        );
+      }
       try {
         const {
           restoreChatBranch,
@@ -3495,35 +3900,33 @@ export function App() {
         if (branch.length === 0) {
           throw new Error("No saved conversation branch was returned for this message version.");
         }
-        setMessages(
-          (current) => {
-            const existingAttachments = new Map(
-              current.map((message) => [message.id, message.attachments ?? []]),
-            );
-            return branch.map(
-              ({
-                id,
-                role,
-                content,
-                created_at,
-                version_number,
-                thinking_summary,
-                is_reminder,
-                admin_message_id,
-              }) => ({
-                id,
-                role,
-                text: content,
-                createdAt: created_at,
-                versionNumber: version_number,
-                thinkingSummary: thinking_summary,
-                adminMessageId: admin_message_id,
-                isReminder: is_reminder,
-                attachments: existingAttachments.get(id) ?? [],
-              }),
-            );
-          },
+        const existingAttachments = new Map(
+          messagesRef.current.map((message) => [message.id, message.attachments ?? []]),
         );
+        const restoredMessages = branch.map(
+          ({
+            id,
+            role,
+            content,
+            created_at,
+            version_number,
+            thinking_summary,
+            is_reminder,
+            admin_message_id,
+          }) => ({
+            id,
+            role,
+            text: content,
+            createdAt: created_at,
+            versionNumber: version_number,
+            thinkingSummary: thinking_summary,
+            adminMessageId: admin_message_id,
+            isReminder: is_reminder,
+            attachments: existingAttachments.get(id) ?? [],
+          }),
+        );
+        cacheChatBranch(restoredMessages);
+        setMessages(restoredMessages);
         branch.forEach((item) => hiddenChatMessageIdsRef.current.delete(item.id));
         setSelectedMessageVersions(
           Object.fromEntries(branch.map((item) => [item.id, item.version_number])),
@@ -3550,12 +3953,14 @@ export function App() {
           );
         }
         if (attachmentsResult.status === "fulfilled") {
-          setMessages((current) =>
-            current.map((message) => ({
+          setMessages((current) => {
+            const updatedMessages = current.map((message) => ({
               ...message,
               attachments: attachmentsResult.value[message.id] ?? [],
-            })),
-          );
+            }));
+            cacheChatBranch(updatedMessages);
+            return updatedMessages;
+          });
         } else {
           loadErrors.push(
             attachmentsResult.reason instanceof Error
@@ -3566,6 +3971,10 @@ export function App() {
         if (loadErrors.length > 0) setSendError(loadErrors.join("\n"));
       } catch (error) {
         if (versionRestoreGenerationRef.current === restoreGeneration) {
+          if (cachedBranch) {
+            setMessages(previousMessages);
+            setSelectedMessageVersions(previousSelections);
+          }
           setSendError(
             error instanceof Error ? error.message : "Could not restore this conversation branch.",
           );
@@ -4097,7 +4506,9 @@ export function App() {
           loadedVersions,
           loadedAttachments,
           loadedRatings,
+          loadedReports,
           loadedAdminRelayRatings,
+          loadedAdminRelayReports,
         ] =
           await Promise.all([
           authClient
@@ -4140,6 +4551,20 @@ export function App() {
             return ratings;
           })(),
           (async () => {
+            if (assistantMessages.length === 0) return {};
+            const { data: feedback, error } = await authClient
+              .from("message_feedback")
+              .select("message_id, version_number")
+              .in("message_id", assistantMessages.map((item) => item.id))
+              .eq("kind", "report");
+            if (error) {
+              throw new Error(`Could not load saved response reports. ${error.message}`);
+            }
+            return Object.fromEntries(
+              feedback.map((item) => [`${item.message_id}:${item.version_number}`, true]),
+            ) as Record<string, boolean>;
+          })(),
+          (async () => {
             if (adminRelayMessageIds.length === 0) return {};
             const { data: feedback, error } = await authClient
               .from("admin_message_feedback")
@@ -4155,6 +4580,20 @@ export function App() {
                   : [],
               ),
             ) as Record<string, AssistantRating>;
+          })(),
+          (async () => {
+            if (adminRelayMessageIds.length === 0) return {};
+            const { data: feedback, error } = await authClient
+              .from("admin_message_feedback")
+              .select("admin_message_id")
+              .in("admin_message_id", adminRelayMessageIds)
+              .eq("kind", "report");
+            if (error) {
+              throw new Error(`Could not load saved relay reports. ${error.message}`);
+            }
+            return Object.fromEntries(
+              feedback.map((item) => [item.admin_message_id, true]),
+            ) as Record<string, boolean>;
           })(),
           ]);
         if (keyResult.error) throw keyResult.error;
@@ -4205,6 +4644,8 @@ export function App() {
           );
           setRatings(loadedRatings);
           setAdminRelayRatings(loadedAdminRelayRatings);
+          setReportedVersions(loadedReports);
+          setReportedAdminRelays(loadedAdminRelayReports);
           setMessageVersions(loadedVersions);
           setSelectedMessageVersions(
             Object.fromEntries(savedMessages.map((item) => [item.id, item.version_number])),
@@ -4620,6 +5061,7 @@ export function App() {
             attachments: attachments[id] ?? [],
           }),
         );
+        cacheChatBranch(serverMessages);
         for (const job of jobsResult.data) {
           if (
             (job.assistant_message_id !== null &&
@@ -4650,12 +5092,25 @@ export function App() {
         );
 
         setMessages((current) => {
+          const reconciledServerMessages = serverMessages.map((serverMessage) => {
+            const localMessage = current.find((message) => message.id === serverMessage.id);
+            if (!localMessage?.attachments?.length) return serverMessage;
+            const attachmentsById = new Map(
+              (serverMessage.attachments ?? []).map((attachment) => [attachment.id, attachment]),
+            );
+            for (const attachment of localMessage.attachments) {
+              if (!attachmentsById.has(attachment.id)) {
+                attachmentsById.set(attachment.id, attachment);
+              }
+            }
+            return { ...serverMessage, attachments: [...attachmentsById.values()] };
+          });
           const pendingMessages = current.filter(
             (message) =>
               pendingOptimisticMessageIdsRef.current.has(message.id) &&
               !persistedIds.has(message.id),
           );
-          return [...serverMessages, ...pendingMessages]
+          return [...reconciledServerMessages, ...pendingMessages]
             .filter((message) => !hiddenChatMessageIdsRef.current.has(message.id))
             .sort(
               (left, right) =>
@@ -4846,6 +5301,24 @@ export function App() {
       `account-live-${authUser.id}`,
       (initialChannel) => {
         let channel = initialChannel;
+        channel = channel.on(
+          "postgres_changes",
+          {
+            event: "INSERT",
+            schema: "public",
+            table: "chat_messages",
+            filter: `user_id=eq.${authUser.id}`,
+          },
+          (payload) => {
+            const insertedMessageId = (payload.new as { id?: unknown }).id;
+            if (
+              typeof insertedMessageId === "string" &&
+              pendingSentMessageSoundIdsRef.current.has(insertedMessageId)
+            ) {
+              playSentMessageSoundOnce(insertedMessageId);
+            }
+          },
+        );
         for (const table of tables) {
           channel = channel.on(
             "postgres_changes",
@@ -6297,13 +6770,10 @@ export function App() {
       clearInterval(voiceRecordingTimerRef.current);
       voiceRecordingTimerRef.current = null;
     }
-    if (voiceRecordingWaveformTimerRef.current) {
-      clearInterval(voiceRecordingWaveformTimerRef.current);
-      voiceRecordingWaveformTimerRef.current = null;
-    }
+    voiceRecordingStartAtRef.current = null;
+    voiceRecordingMaxDurationSecondsRef.current = 0;
     voiceRecordingStreamRef.current?.getTracks().forEach((track) => track.stop());
     voiceRecordingStreamRef.current = null;
-    voiceRecordingAnalyserRef.current = null;
     const audioContext = voiceRecordingAudioContextRef.current;
     voiceRecordingAudioContextRef.current = null;
     try {
@@ -6311,13 +6781,15 @@ export function App() {
     } finally {
       voiceRecorderRef.current = null;
       setIsRecordingVoice(false);
-      setVoiceRecordingSeconds(0);
-      setVoiceRecordingWaveform(Array.from({ length: 36 }, () => 4));
+      setIsStartingVoiceRecording(false);
     }
   }
 
   async function finishVoiceRecording() {
-    const elapsedSeconds = Math.floor((Date.now() - voiceRecordingStartAtRef.current) / 1000);
+    const recordingStartedAt = voiceRecordingStartAtRef.current;
+    const elapsedSeconds = recordingStartedAt === null
+      ? 0
+      : Math.floor((performance.now() - recordingStartedAt) / 1000);
     const chunks = voiceRecordingChunksRef.current;
     voiceRecordingChunksRef.current = [];
     const recorder = voiceRecorderRef.current;
@@ -6346,13 +6818,22 @@ export function App() {
       const decoder = new AudioContext();
       try {
         const decoded = await decoder.decodeAudioData(await recording.arrayBuffer());
-        const monoSamples = new Float32Array(decoded.length);
+        let loudestChannel = 0;
+        let loudestChannelRms = 0;
         for (let channel = 0; channel < decoded.numberOfChannels; channel += 1) {
           const channelSamples = decoded.getChannelData(channel);
-          for (let index = 0; index < decoded.length; index += 1) {
-            monoSamples[index] += channelSamples[index] / decoded.numberOfChannels;
+          let channelEnergy = 0;
+          for (const sample of channelSamples) {
+            channelEnergy += sample * sample;
+          }
+          const channelRms = Math.sqrt(channelEnergy / channelSamples.length);
+          if (channelRms > loudestChannelRms) {
+            loudestChannel = channel;
+            loudestChannelRms = channelRms;
           }
         }
+        // Averaging out-of-phase stereo channels can cancel the voice almost entirely.
+        const monoSamples = normalizeVoiceNoteSamples(decoded.getChannelData(loudestChannel));
         blob = encodeVoiceNoteWav(monoSamples, decoded.sampleRate);
       } finally {
         await decoder.close();
@@ -6407,7 +6888,12 @@ export function App() {
   }
 
   async function startVoiceRecording() {
-    if (isRecordingVoice || isAssistantBusy || isAttachmentUploadPending) return;
+    if (
+      isRecordingVoice ||
+      voiceRecordingStartInProgressRef.current ||
+      isAssistantBusy ||
+      isAttachmentUploadPending
+    ) return;
     if (!authUser) {
       setSendError("Sign in before recording a voice message.");
       return;
@@ -6427,13 +6913,42 @@ export function App() {
       return;
     }
 
+    voiceRecordingStartInProgressRef.current = true;
+    voiceRecordingCancelledRef.current = false;
+    setIsStartingVoiceRecording(true);
+    setSendError("");
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const audioContext = new AudioContext();
-      const source = audioContext.createMediaStreamSource(stream);
-      const analyser = audioContext.createAnalyser();
-      analyser.fftSize = 512;
-      source.connect(analyser);
+      voiceRecordingAudioContextRef.current = audioContext;
+      let audioContextResumeError: unknown = null;
+      const audioContextResume = audioContext.resume().then(
+        () => undefined,
+        (error: unknown) => {
+          audioContextResumeError = error;
+        },
+      );
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: { ideal: 1 },
+          echoCancellation: { ideal: false },
+          noiseSuppression: { ideal: false },
+          autoGainControl: { ideal: false },
+        },
+      });
+      voiceRecordingStreamRef.current = stream;
+      if (voiceRecordingCancelledRef.current) {
+        await releaseVoiceRecording();
+        return;
+      }
+      await audioContextResume;
+      if (voiceRecordingCancelledRef.current) {
+        await releaseVoiceRecording();
+        return;
+      }
+      if (audioContextResumeError) throw audioContextResumeError;
+      voiceRecordingMaxDurationSecondsRef.current = Math.floor(
+        MAX_CHAT_ATTACHMENT_SOURCE_BYTES / (audioContext.sampleRate * 2),
+      );
       const supportedMimeType = ["audio/webm;codecs=opus", "audio/mp4"].find((mimeType) =>
         MediaRecorder.isTypeSupported(mimeType),
       );
@@ -6444,63 +6959,55 @@ export function App() {
         if (event.data.size > 0) voiceRecordingChunksRef.current.push(event.data);
       };
       recorder.onstop = () => void finishVoiceRecording();
-      voiceRecordingStreamRef.current = stream;
-      voiceRecordingAudioContextRef.current = audioContext;
-      voiceRecordingAnalyserRef.current = analyser;
       voiceRecordingChunksRef.current = [];
       voiceRecorderRef.current = recorder;
       voiceRecordingCancelledRef.current = false;
-      voiceRecordingStartAtRef.current = Date.now();
-      await audioContext.resume();
-      recorder.start(250);
-      setIsRecordingVoice(true);
-      setSendError("");
-      voiceRecordingTimerRef.current = setInterval(() => {
-        const elapsedSeconds = Math.floor((Date.now() - voiceRecordingStartAtRef.current) / 1000);
-        setVoiceRecordingSeconds(elapsedSeconds);
-        const maxRecordingSeconds = Math.floor(
-          MAX_CHAT_ATTACHMENT_SOURCE_BYTES / (audioContext.sampleRate * 2),
-        );
-        if (elapsedSeconds >= maxRecordingSeconds) {
-          stopVoiceRecording(true);
-          setSendError(
-            `Voice recordings are limited to ${formatMediaTime(maxRecordingSeconds)}. Please record a shorter message.`,
-          );
+      recorder.onstart = () => {
+        if (
+          voiceRecorderRef.current !== recorder ||
+          voiceRecordingCancelledRef.current
+        ) return;
+        if (voiceRecordingTimerRef.current) {
+          clearInterval(voiceRecordingTimerRef.current);
+          voiceRecordingTimerRef.current = null;
         }
-      }, 250);
-      voiceRecordingWaveformTimerRef.current = setInterval(() => {
-        const currentAnalyser = voiceRecordingAnalyserRef.current;
-        if (!currentAnalyser) return;
-        const samples = new Float32Array(currentAnalyser.fftSize);
-        currentAnalyser.getFloatTimeDomainData(samples);
-        let energy = 0;
-        for (const sample of samples) energy += sample * sample;
-        const rms = Math.sqrt(energy / samples.length);
-        const height = Math.max(4, Math.min(30, Math.round(4 + Math.sqrt(rms) * 52)));
-        setVoiceRecordingWaveform((current) => [...current.slice(1), height]);
-      }, 60);
+        voiceRecordingStartAtRef.current = performance.now();
+        setIsRecordingVoice(true);
+        setIsStartingVoiceRecording(false);
+        setSendError("");
+      };
+      recorder.start(250);
     } catch (error) {
       voiceRecordingChunksRef.current = [];
       await releaseVoiceRecording().catch((releaseError: unknown) => {
         console.warn("Could not clean up a failed voice recording.", releaseError);
       });
-      setSendError(
-        error instanceof DOMException && error.name === "NotAllowedError"
-          ? "Microphone access was blocked. Allow microphone access for this site in your browser settings, then try again."
-          : error instanceof DOMException && error.name === "NotFoundError"
-            ? "No microphone was found on this device."
-            : error instanceof DOMException && error.name === "NotReadableError"
-              ? "The microphone is busy or unavailable. Close other apps using it, then try again."
-              : error instanceof Error
-                ? `Could not start voice recording: ${error.message}`
-                : "Could not start voice recording. Check microphone permission and try again.",
-      );
+      if (!voiceRecordingCancelledRef.current) {
+        setSendError(
+          error instanceof DOMException && error.name === "NotAllowedError"
+            ? "Microphone access was blocked. Allow microphone access for this site in your browser settings, then try again."
+            : error instanceof DOMException && error.name === "NotFoundError"
+              ? "No microphone was found on this device."
+              : error instanceof DOMException && error.name === "NotReadableError"
+                ? "The microphone is busy or unavailable. Close other apps using it, then try again."
+                : error instanceof Error
+                  ? `Could not start voice recording: ${error.message}`
+                  : "Could not start voice recording. Check microphone permission and try again.",
+        );
+      }
+    } finally {
+      voiceRecordingStartInProgressRef.current = false;
     }
   }
 
   function stopVoiceRecording(cancel = false) {
     const recorder = voiceRecorderRef.current;
     voiceRecordingCancelledRef.current = cancel;
+    if (cancel) setIsStartingVoiceRecording(false);
+    if (voiceRecordingTimerRef.current) {
+      clearInterval(voiceRecordingTimerRef.current);
+      voiceRecordingTimerRef.current = null;
+    }
     if (cancel) {
       voiceRecordingChunksRef.current = [];
       if (recorder && recorder.state !== "inactive") {
@@ -6833,6 +7340,17 @@ export function App() {
     return { jobId: result.jobId, messageId: result.messageId };
   }
 
+  function playSentMessageSoundOnce(messageId: string) {
+    pendingSentMessageSoundIdsRef.current.delete(messageId);
+    if (playedSentMessageSoundIdsRef.current.has(messageId)) return;
+    playedSentMessageSoundIdsRef.current.add(messageId);
+    if (playedSentMessageSoundIdsRef.current.size > 100) {
+      const oldestMessageId = playedSentMessageSoundIdsRef.current.values().next().value;
+      if (oldestMessageId) playedSentMessageSoundIdsRef.current.delete(oldestMessageId);
+    }
+    playChatSound(sendMessageSound);
+  }
+
   function markChatSubmissionAccepted(
     requestId: string,
     messageId: string,
@@ -6869,6 +7387,23 @@ export function App() {
             : item,
         );
       }
+      if (serverMessageExists && optimisticMessageExists) {
+        const optimisticMessage = current.find((item) => item.id === requestId);
+        return current
+          .filter((item) => item.id !== requestId)
+          .map((item) => {
+            if (item.id !== messageId || !optimisticMessage?.attachments?.length) return item;
+            const attachmentsById = new Map(
+              (item.attachments ?? []).map((attachment) => [attachment.id, attachment]),
+            );
+            for (const attachment of optimisticMessage.attachments) {
+              if (!attachmentsById.has(attachment.id)) {
+                attachmentsById.set(attachment.id, attachment);
+              }
+            }
+            return { ...item, attachments: [...attachmentsById.values()] };
+          });
+      }
       return current.flatMap((item) => {
         if (item.id !== requestId) return [item];
         if (serverMessageExists) return [];
@@ -6886,7 +7421,10 @@ export function App() {
         ];
       });
     });
-    playChatSound(sendMessageSound);
+    playSentMessageSoundOnce(requestId);
+    if (messageId !== requestId) {
+      pendingSentMessageSoundIdsRef.current.delete(messageId);
+    }
   }
 
   async function retryChatSubmission(requestId: string, force = true) {
@@ -7025,6 +7563,7 @@ export function App() {
       ),
     };
     pendingOptimisticMessageIdsRef.current.add(clientRequestId);
+    pendingSentMessageSoundIdsRef.current.add(clientRequestId);
     pendingChatSubmissionsRef.current.set(clientRequestId, submissionPayload);
     setMessages((current) => {
       const existingIndex = current.findIndex((message) => message.id === clientRequestId);
@@ -7147,6 +7686,9 @@ export function App() {
     rating: AssistantRating,
   ) {
     const ratingKey = `${messageId}:${versionNumber}`;
+    const requestKey = `message:${ratingKey}`;
+    if (ratingSaveInFlightRef.current.has(requestKey)) return;
+    ratingSaveInFlightRef.current.add(requestKey);
     const previousRating = ratings[ratingKey] ?? null;
     const nextRating = previousRating === rating ? null : rating;
     setRatings((current) => {
@@ -7168,6 +7710,8 @@ export function App() {
         return updated;
       });
       setSendError(error instanceof Error ? error.message : "Could not save feedback.");
+    } finally {
+      ratingSaveInFlightRef.current.delete(requestKey);
     }
   }
 
@@ -7208,6 +7752,9 @@ export function App() {
     adminMessageId: string,
     rating: AssistantRating,
   ) {
+    const requestKey = `relay:${adminMessageId}`;
+    if (ratingSaveInFlightRef.current.has(requestKey)) return;
+    ratingSaveInFlightRef.current.add(requestKey);
     const previousRating = adminRelayRatings[adminMessageId] ?? null;
     const nextRating = previousRating === rating ? null : rating;
     setAdminRelayRatings((current) => {
@@ -7227,6 +7774,8 @@ export function App() {
         return next;
       });
       setSendError(error instanceof Error ? error.message : "Could not save relay feedback.");
+    } finally {
+      ratingSaveInFlightRef.current.delete(requestKey);
     }
   }
 
@@ -7310,14 +7859,19 @@ export function App() {
     setReportError("");
     try {
       if (reportTarget.adminMessageId) {
+        const adminMessageId = reportTarget.adminMessageId;
         await postAdminRelayAction({
           action: "report",
-          adminMessageId: reportTarget.adminMessageId,
+          adminMessageId,
           details,
         });
         setReportTarget(null);
         reportDetailsRef.current = "";
         setReportError("");
+        setReportedAdminRelays((current) => ({
+          ...current,
+          [adminMessageId]: true,
+        }));
         showActionToast("Relay feedback report saved");
         return;
       }
@@ -7338,6 +7892,10 @@ export function App() {
       setReportTarget(null);
       reportDetailsRef.current = "";
       setReportError("");
+      setReportedVersions((current) => ({
+        ...current,
+        [`${reportTarget.id}:${reportTarget.versionNumber}`]: true,
+      }));
       showActionToast("Report submitted.");
     } catch (error) {
       setReportError(error instanceof Error ? error.message : "Could not save this report.");
@@ -8556,7 +9114,7 @@ export function App() {
             Drop files or media to attach
           </div>
         )}
-        <header className="absolute inset-x-0 top-0 z-20 flex h-[64px] select-none items-center justify-between gap-2 bg-transparent px-2 py-1">
+        <header className="chat-room-header absolute inset-x-0 top-0 z-20 flex h-[64px] select-none items-center justify-between gap-2 bg-transparent px-2 py-1">
           <div className="flex h-12 min-w-0 flex-1 items-center gap-2 rounded-full border border-[#e8e9ec] bg-white py-1 pl-1 pr-2">
             <img
               src={cheyaLogo}
@@ -8954,11 +9512,14 @@ export function App() {
                         <span>{formatSpeechTime(ttsPlayback.durationSeconds)}</span>
                       </div>
                       <div
+                        ref={ttsWaveformRef}
                         role="img"
                         aria-label="Speech waveform"
-                        className="flex h-7 min-w-0 flex-1 items-center justify-between gap-[3px] overflow-hidden px-1.5"
+                        className="flex h-7 min-w-0 flex-1 items-center gap-[3px] overflow-hidden px-1.5"
                       >
-                        {Array.from({ length: 28 }, (_, index) => {
+                        {(ttsPlayback.waveformHeights ??
+                          createSpeechWaveformHeights(ttsPlayback.text, 27)
+                        ).map((height, index, heights) => {
                           const progress =
                             ttsPlayback.status === "ended"
                               ? 1
@@ -8968,10 +9529,11 @@ export function App() {
                           return (
                             <span
                               key={index}
-                              className={`tts-wave-bar ${
-                                (index + 0.5) / 28 <= progress ? "tts-wave-bar-played" : ""
+                              data-speech-wave-bar
+                              className={`tts-wave-bar flex-1 ${
+                                index / heights.length <= progress ? "tts-wave-bar-played" : ""
                               }`}
-                              style={{ height: `${speechWaveHeight(ttsPlayback.text, index)}px` }}
+                              style={{ height: `${height}px` }}
                             />
                           );
                         })}
@@ -9268,14 +9830,19 @@ export function App() {
                         lineHeight: 1.35,
                       }}
                     >
-                      <Suspense fallback={null}>
-                        <AssistantMarkdown content={visibleText} userMessage />
-                      </Suspense>
-                      <LinkPreviews
-                        content={visibleText}
-                        client={authClient}
-                        userMessage
-                      />
+                      <ExpandableUserMessage
+                        key={`${chatMessage.id}:${visibleText}`}
+                        measurementKey={`${chatMessage.id}:${visibleText}`}
+                      >
+                        <Suspense fallback={null}>
+                          <AssistantMarkdown content={visibleText} userMessage />
+                        </Suspense>
+                        <LinkPreviews
+                          content={visibleText}
+                          client={authClient}
+                          userMessage
+                        />
+                      </ExpandableUserMessage>
                       </div>}
                     </div>
                     {!isSending && <div
@@ -9355,7 +9922,7 @@ export function App() {
                   className="w-full min-w-0 text-[#27282d]"
                 >
                   {showAssistantText && visibleThinkingSummary && (
-                    <div className="mb-2">
+                    <div className="mb-1">
                       <button
                         type="button"
                         aria-expanded={expandedThinkingIds.has(ratingKey)}
@@ -9402,13 +9969,22 @@ export function App() {
                               ? ttsPlayback.activeWordIndex ?? null
                               : null
                           }
-                          onTypewriterProgress={() => {
-                            if (followLatestRef.current) scrollConversationToLatest("auto");
-                          }}
-                          onTypewriterComplete={() =>
-                            setTypingAssistant((current) =>
-                              current?.id === chatMessage.id ? null : current,
-                            )
+                          onTypewriterProgress={
+                            animateAssistant
+                              ? () => {
+                                  if (followLatestRef.current) {
+                                    scrollConversationToLatest("auto");
+                                  }
+                                }
+                              : undefined
+                          }
+                          onTypewriterComplete={
+                            animateAssistant
+                              ? () =>
+                                  setTypingAssistant((current) =>
+                                    current?.id === chatMessage.id ? null : current,
+                                  )
+                              : undefined
                           }
                         />
                       </Suspense>
@@ -9466,11 +10042,29 @@ export function App() {
                         (chatMessage.adminMessageId
                           ? adminRelayRatings[chatMessage.adminMessageId]
                           : ratings[ratingKey]) === "like"
-                          ? "text-[#2088bf]"
+                          ? "text-[#292a30]"
                           : "text-[#777a82]"
                       }`}
                     >
-                      <ThumbsUp aria-hidden="true" className="size-4" />
+                      <span aria-hidden="true" className="relative size-4">
+                        <ThumbsUp
+                          className="absolute inset-0 size-full"
+                          stroke="none"
+                          fill={
+                            (chatMessage.adminMessageId
+                              ? adminRelayRatings[chatMessage.adminMessageId]
+                              : ratings[ratingKey]) === "like"
+                              ? "#60a5fa"
+                              : "none"
+                          }
+                        />
+                        <ThumbsUp
+                          className="absolute inset-0 size-full"
+                          fill="none"
+                          stroke="#777a82"
+                          strokeWidth={2}
+                        />
+                      </span>
                     </button>
                     <button
                       type="button"
@@ -9489,11 +10083,29 @@ export function App() {
                         (chatMessage.adminMessageId
                           ? adminRelayRatings[chatMessage.adminMessageId]
                           : ratings[ratingKey]) === "dislike"
-                          ? "text-[#bd4a4a]"
+                          ? "text-[#292a30]"
                           : "text-[#777a82]"
                       }`}
                     >
-                      <ThumbsDown aria-hidden="true" className="size-4" />
+                      <span aria-hidden="true" className="relative size-4">
+                        <ThumbsDown
+                          className="absolute inset-0 size-full"
+                          stroke="none"
+                          fill={
+                            (chatMessage.adminMessageId
+                              ? adminRelayRatings[chatMessage.adminMessageId]
+                              : ratings[ratingKey]) === "dislike"
+                              ? "#f87171"
+                              : "none"
+                          }
+                        />
+                        <ThumbsDown
+                          className="absolute inset-0 size-full"
+                          fill="none"
+                          stroke="#777a82"
+                          strokeWidth={2}
+                        />
+                      </span>
                     </button>
                     <button
                       type="button"
@@ -9504,12 +10116,17 @@ export function App() {
                       {copiedMessageId === chatMessage.id ? (
                         <Check aria-hidden="true" className="size-4 text-[#398650]" />
                       ) : (
-                        <Copy aria-hidden="true" className="size-4" />
+                        <Copy aria-hidden="true" className="size-4 stroke-[#777a82]" />
                       )}
                     </button>
                     <button
                       type="button"
                       aria-label={chatMessage.adminMessageId ? "Report admin relay" : "Report response"}
+                      aria-pressed={
+                        chatMessage.adminMessageId
+                          ? reportedAdminRelays[chatMessage.adminMessageId] === true
+                          : reportedVersions[ratingKey] === true
+                      }
                       onClick={() => {
                         setReportTarget({
                           id: chatMessage.id,
@@ -9522,9 +10139,25 @@ export function App() {
                         setReportError("");
                         setSendError("");
                       }}
-                      className="flex size-8 items-center justify-center rounded-lg text-[#777a82] transition hover:bg-[#f1f2f4]"
+                      className={`flex size-8 items-center justify-center rounded-lg transition hover:bg-[#f1f2f4] ${
+                        (chatMessage.adminMessageId
+                          ? reportedAdminRelays[chatMessage.adminMessageId]
+                          : reportedVersions[ratingKey])
+                          ? "text-[#777a82]"
+                          : "text-[#777a82]"
+                      }`}
                     >
-                      <TriangleAlert aria-hidden="true" className="size-4" />
+                      <TriangleAlert
+                        aria-hidden="true"
+                        className="size-4 stroke-[#777a82]"
+                        fill={
+                          (chatMessage.adminMessageId
+                            ? reportedAdminRelays[chatMessage.adminMessageId]
+                            : reportedVersions[ratingKey])
+                            ? "#facc15"
+                            : "none"
+                        }
+                      />
                     </button>
                     {!isVoiceNote && (
                       <button
@@ -9553,7 +10186,14 @@ export function App() {
                             : "text-[#777a82]"
                         }`}
                       >
-                        <Volume2 aria-hidden="true" className="size-4" />
+                        <Volume2
+                          aria-hidden="true"
+                          className={`size-4 ${
+                            ttsPlayback?.messageId === chatMessage.id
+                              ? "stroke-[#2088bf]"
+                              : "stroke-[#777a82]"
+                          }`}
+                        />
                       </button>
                     )}
                     {!chatMessage.isReminder &&
@@ -9571,7 +10211,7 @@ export function App() {
                         }
                         className="ml-auto flex size-8 items-center justify-center rounded-lg text-[#777a82] transition hover:bg-[#f1f2f4] disabled:opacity-50"
                       >
-                        <RotateCw aria-hidden="true" className="size-4" />
+                        <RotateCw aria-hidden="true" className="size-4 stroke-[#777a82]" />
                       </button>
                     )}
                   </div>
@@ -9582,6 +10222,7 @@ export function App() {
               <div
                 role="status"
                 aria-live="polite"
+                aria-label="Processing"
                 className={`w-full min-w-0 text-xs text-[#747780] ${
                   activeChatJob?.thinking_mode ?? thinkingModeRef.current
                     ? "space-y-1.5 rounded-2xl border border-[#ece9f5] bg-[#faf9fd] px-3.5 py-3"
@@ -9597,7 +10238,7 @@ export function App() {
                       "Reviewing the request…"}
                   </p>
                 ) : (
-                  <p><i>Processing...</i></p>
+                  <FastProcessingIndicator />
                 )}
               </div>
             )}
@@ -9783,32 +10424,8 @@ export function App() {
                 })}
               </div>
             )}
-            <div className="flex min-h-11 items-start px-3 pb-2 pt-1">
-              {isRecordingVoice ? (
-                <div
-                  role="status"
-                  aria-label="Recording voice message"
-                  className="flex min-h-11 w-full items-center gap-3 px-1 text-sm text-[#34363b]"
-                >
-                  <span className="size-2.5 animate-pulse rounded-full bg-red-500" />
-                  <div
-                    role="img"
-                    aria-label="Live voice waveform"
-                    className="flex h-9 min-w-0 flex-1 items-center justify-center gap-[3px] overflow-hidden"
-                  >
-                    {voiceRecordingWaveform.map((height, index) => (
-                      <span
-                        key={index}
-                        className="w-[3px] shrink-0 rounded-full bg-[#7651a2] transition-[height] duration-150"
-                        style={{ height: `${height}px` }}
-                      />
-                    ))}
-                  </div>
-                  <span className="ml-auto tabular-nums text-[#777a82]">
-                    {formatMediaTime(voiceRecordingSeconds)}
-                  </span>
-                </div>
-              ) : (
+            {!isRecordingVoice && (
+              <div className="flex min-h-11 items-start px-3 pb-2 pt-1">
                 <ChatMessageInput
                   inputRef={messageInputRef}
                   defaultValue={messageDraftRef.current}
@@ -9825,13 +10442,62 @@ export function App() {
                     hasGeminiApiKey ? "Ask anything..." : "Add a Gemini API key in Settings first"
                   }
                 />
-              )}
-            </div>
+              </div>
+            )}
 
-            <div className="-mx-1 flex items-center justify-between gap-2 px-1 pb-1">
-              {isRecordingVoice ? (
-                null
-              ) : (
+            {isStartingVoiceRecording ||
+            (isRecordingVoice && voiceRecordingStartAtRef.current !== null) ? (
+              <div
+                role="group"
+                aria-label="Voice message recording controls"
+                className="grid h-10 grid-cols-[1fr_auto_1fr] items-center gap-2 px-2 pr-0"
+              >
+                <div className="flex min-w-0 items-center gap-2 text-sm text-[#34363b]">
+                  {isStartingVoiceRecording ? (
+                    <>
+                      <LoaderCircle
+                        aria-hidden="true"
+                        className="size-4 shrink-0 animate-spin text-[#596879]"
+                      />
+                      <span className="text-[#596879]">Preparing…</span>
+                    </>
+                  ) : voiceRecordingStartAtRef.current !== null ? (
+                    <>
+                      <span className="size-2.5 shrink-0 animate-pulse rounded-full bg-red-500" />
+                      <VoiceRecordingTimer
+                        startedAt={voiceRecordingStartAtRef.current}
+                        maxDurationMs={voiceRecordingMaxDurationSecondsRef.current * 1_000}
+                        timerRef={voiceRecordingTimerRef}
+                        onLimit={(maxDurationSeconds) => {
+                          stopVoiceRecording(true);
+                          setSendError(
+                            `Voice recordings are limited to ${formatMediaTime(maxDurationSeconds)}. Please record a shorter message.`,
+                          );
+                        }}
+                      />
+                    </>
+                  ) : null}
+                </div>
+                <button
+                  type="button"
+                  aria-label="Cancel voice recording"
+                  onClick={() => stopVoiceRecording(true)}
+                  className="rounded-full px-3 py-1.5 text-sm font-medium text-[#596879] transition hover:bg-[#f1f2f4] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  aria-label="Send voice message"
+                  disabled={isStartingVoiceRecording}
+                  onClick={() => stopVoiceRecording()}
+                  className="ml-auto flex size-9 shrink-0 items-center justify-center rounded-full border border-[#17181b] bg-[#17181b] text-white transition-colors hover:bg-[#34363b] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] disabled:cursor-not-allowed disabled:opacity-50 sm:size-10"
+                >
+                  <Send aria-hidden="true" className="size-[18px]" strokeWidth={1.8} />
+                </button>
+              </div>
+            ) : (
+              <div className="-mx-1 flex items-center justify-between gap-2 px-1 pb-1">
                 <ChatMediaMenu
                   disabled={
                     !hasGeminiApiKey ||
@@ -9842,36 +10508,14 @@ export function App() {
                   onPickPhoto={() => fileInputRef.current?.click()}
                   onPickFiles={() => filesInputRef.current?.click()}
                 />
-              )}
-              <div className="flex items-center gap-1">
-                {!isRecordingVoice && (
+                <div className="flex items-center gap-1">
                   <ThinkingModeToggle
                     disabled={!hasGeminiApiKey}
                     onToggle={(enabled) => {
                       thinkingModeRef.current = enabled;
                     }}
                   />
-                )}
-                {isRecordingVoice ? (
-                  <>
-                    <button
-                      type="button"
-                      aria-label="Cancel voice recording"
-                      onClick={() => stopVoiceRecording(true)}
-                      className="flex size-9 shrink-0 items-center justify-center rounded-full border border-[#e5e6e9] bg-white text-[#34363b] hover:bg-[#f7f8fa] sm:size-10"
-                    >
-                      <X aria-hidden="true" className="size-[18px]" />
-                    </button>
-                    <button
-                      type="button"
-                      aria-label="Send voice message"
-                      onClick={() => stopVoiceRecording()}
-                      className="flex size-9 shrink-0 items-center justify-center rounded-full border border-red-600 bg-red-600 text-white hover:bg-red-700 sm:size-10"
-                    >
-                      <span aria-hidden="true" className="size-3.5 rounded-sm bg-current" />
-                    </button>
-                  </>
-                ) : isAssistantBusy ? (
+                  {isAssistantBusy ? (
                   <>
                     <button
                       type="button"
@@ -9957,9 +10601,10 @@ export function App() {
                       )}
                     </button>
                     </>
-                )}
+                  )}
+                </div>
               </div>
-            </div>
+            )}
           </form>
         </footer>
       </section>
@@ -9994,8 +10639,17 @@ export function App() {
               />
             ) : (
               <div
-                className="max-h-40 overflow-hidden rounded-2xl bg-[#28292e] px-4 py-3 text-sm leading-5 text-white line-clamp-6 shadow-2xl"
-                style={{ fontSize: Math.round(13 * chatFontScale), lineHeight: 1.4 }}
+                className="select-none rounded-2xl bg-[#28292e] px-4 py-3 text-sm text-white shadow-2xl"
+                style={{
+                  display: "-webkit-box",
+                  fontSize: Math.round(13 * chatFontScale),
+                  lineHeight: 1.4,
+                  overflow: "hidden",
+                  WebkitBoxOrient: "vertical",
+                  WebkitLineClamp: 7,
+                  WebkitUserSelect: "none",
+                  WebkitTouchCallout: "none",
+                }}
               >
                 {selectedUserMessageText}
               </div>

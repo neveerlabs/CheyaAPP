@@ -44,6 +44,32 @@
   background: transparent;
 }
 
+.chat-room-header {
+  isolation: isolate;
+}
+
+.chat-room-header::before {
+  position: absolute;
+  z-index: -1;
+  inset: 0 0 8px;
+  pointer-events: none;
+  content: "";
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    #000 0%,
+    #000 48%,
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    #000 0%,
+    #000 48%,
+    transparent 100%
+  );
+}
+
 .tts-word-selection {
   position: absolute;
   z-index: 0;
@@ -95,6 +121,39 @@ body {
 
 .media-seek-feedback-forward {
   animation-name: media-seek-feedback-forward;
+}
+
+.recording-timer-window {
+  display: inline-grid;
+  height: 1.25rem;
+  line-height: 1.25rem;
+  overflow: hidden;
+  vertical-align: bottom;
+}
+
+.recording-timer-roll {
+  display: block;
+  grid-area: 1 / 1;
+  line-height: inherit;
+  white-space: nowrap;
+  animation: recording-timer-drop 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.recording-timer-tenth {
+  display: inline-block;
+  animation: none;
+}
+
+@keyframes recording-timer-drop {
+  from {
+    opacity: 0;
+    transform: translateY(-100%);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 @keyframes media-seek-feedback-back {
@@ -330,10 +389,9 @@ select,
 }
 
 .tts-wave-bar {
-  width: 4px;
-  min-width: 4px;
   border-radius: 9999px;
   background: rgb(167 123 208 / 45%);
+  max-width: 5px;
 }
 
 .tts-wave-bar-played {
@@ -363,6 +421,22 @@ select,
 
 .chat-quick-panel {
   contain: layout;
+}
+
+.fast-processing-caret {
+  display: inline-block;
+  width: 1px;
+  height: 0.9em;
+  margin-left: 1px;
+  vertical-align: -0.08em;
+  background: currentColor;
+  animation: fast-processing-caret-blink 800ms steps(2, start) infinite;
+}
+
+@keyframes fast-processing-caret-blink {
+  to {
+    visibility: hidden;
+  }
 }
 
 @keyframes chat-attachment-upload-fill {
@@ -445,4 +519,13 @@ select,
   .media-seek-feedback-forward {
     animation-duration: 1ms;
   }
+
+  .recording-timer-roll {
+    animation-duration: 1ms;
+  }
+
+  .fast-processing-caret {
+    animation: none;
+  }
+
 }

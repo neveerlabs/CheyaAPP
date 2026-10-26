@@ -1,5 +1,5 @@
 import { ExternalLink, Link2, LoaderCircle } from "lucide-react";
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import type { AppSupabaseClient } from "../lib/supabase";
 
 interface PagePreview {
@@ -226,7 +226,7 @@ function LinkPreview({
   );
 }
 
-export function LinkPreviews({
+export const LinkPreviews = memo(function LinkPreviews({
   content,
   client,
   userMessage = false,
@@ -247,4 +247,4 @@ export function LinkPreviews({
       ))}
     </div>
   );
-}
+});
