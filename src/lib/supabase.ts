@@ -1070,6 +1070,7 @@ export type Database = {
           query_embedding: string;
           result_limit?: number;
           exclude_message_id?: string | null;
+          result_offset?: number;
         };
         Returns: Array<{
           id: string;
@@ -1086,6 +1087,7 @@ export type Database = {
           max_created_at: string;
           result_limit?: number;
           exclude_message_id?: string | null;
+          result_offset?: number;
         };
         Returns: Array<{
           id: string;
@@ -1100,6 +1102,7 @@ export type Database = {
           p_user_id: string;
           query_embedding: string;
           result_limit?: number;
+          result_offset?: number;
         };
         Returns: Array<{
           id: string;
@@ -1113,6 +1116,7 @@ export type Database = {
           p_user_id: string;
           query_embedding: string;
           result_limit?: number;
+          result_offset?: number;
         };
         Returns: Array<{
           message_id: string;

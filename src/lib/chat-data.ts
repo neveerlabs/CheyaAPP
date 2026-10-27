@@ -239,11 +239,10 @@ export async function saveChatMessage(
 export async function createChatJob(
   client: AppSupabaseClient,
   content: string,
-  thinkingMode: boolean,
 ): Promise<{ jobId: string; messageId: string }> {
   const { data, error } = await client.rpc("create_chat_job", {
     p_content: content,
-    p_thinking_mode: thinkingMode,
+    p_thinking_mode: false,
   });
   if (error) {
     throw new Error(`Could not queue your message: ${error.message}`);
@@ -454,7 +453,6 @@ export async function findRelevantContext(
     excludeMessageId,
     beforeCreatedAt,
     keywordText,
-    mode: "thinking",
   });
 
   return {
@@ -475,7 +473,19 @@ export async function findRelevantContext(
         content: item.content,
         similarity: item.similarity,
       })),
-    insights: [],
+    insights: results
+      .filter(
+        (item): item is typeof item & {
+          kind: "insight";
+          insight: NonNullable<typeof item.insight>;
+        } => item.kind === "insight" && item.insight !== undefined,
+      )
+      .map((item) => ({
+        message_id: item.id,
+        ...item.insight,
+        created_at: item.created_at,
+        similarity: item.similarity,
+      })),
   };
 }
 
@@ -786,6 +796,7 @@ export async function loadMessageFeedback(
 export async function loadAllAssistantFeedback(
   client: AppSupabaseClient,
   userId: string,
+  relevantAssistantMessageIds?: string[],
 ): Promise<
   Array<{
     feedbackId: string;
@@ -799,6 +810,12 @@ export async function loadAllAssistantFeedback(
     createdAt: string;
   }>
 > {
+  const selectedMessageIds =
+    relevantAssistantMessageIds === undefined
+      ? undefined
+      : [...new Set(relevantAssistantMessageIds)];
+  if (selectedMessageIds?.length === 0) return [];
+
   const feedback: Array<{
     id: string;
     message_id: string;
@@ -808,20 +825,32 @@ export async function loadAllAssistantFeedback(
     created_at: string;
   }> = [];
   const feedbackPageSize = 500;
-  for (let offset = 0; ; offset += feedbackPageSize) {
-    const { data, error } = await client
-      .from("message_feedback")
-      .select("id, message_id, version_number, kind, details, created_at")
-      .eq("user_id", userId)
-      .in("kind", ["like", "dislike", "report"])
-      .order("created_at", { ascending: false })
-      .range(offset, offset + feedbackPageSize - 1);
-    if (error) {
-      throw new Error(`Could not load saved response feedback: ${error.message}`);
+  const messageIdGroups = selectedMessageIds
+    ? Array.from(
+        { length: Math.ceil(selectedMessageIds.length / 100) },
+        (_, index) => selectedMessageIds.slice(index * 100, (index + 1) * 100),
+      )
+    : [undefined];
+  for (const messageIds of messageIdGroups) {
+    for (let offset = 0; ; offset += feedbackPageSize) {
+      let query = client
+        .from("message_feedback")
+        .select("id, message_id, version_number, kind, details, created_at")
+        .eq("user_id", userId)
+        .in("kind", ["like", "dislike", "report"])
+        .order("created_at", { ascending: false })
+        .range(offset, offset + feedbackPageSize - 1);
+      if (messageIds) query = query.in("message_id", messageIds);
+      const { data, error } = await query;
+      if (error) {
+        throw new Error(`Could not load saved response feedback: ${error.message}`);
+      }
+      if (!data) {
+        throw new Error("Could not load saved response feedback: the database returned no data.");
+      }
+      feedback.push(...data);
+      if (data.length < feedbackPageSize) break;
     }
-    if (!data) throw new Error("Could not load saved response feedback: the database returned no data.");
-    feedback.push(...data);
-    if (data.length < feedbackPageSize) break;
   }
   if (feedback.length === 0) return [];
   const messageIds = [...new Set(feedback.map((item) => item.message_id))];

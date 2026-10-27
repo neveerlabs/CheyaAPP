@@ -10,13 +10,12 @@ import {
   releaseStoredChatAttachment,
   saveChatBranch,
   saveMessageInsight,
+  saveUserMemory,
 } from "../src/lib/chat-data";
 import { start } from "workflow/api";
 import {
   analyzeGeminiMessage,
   generateGeminiConversation,
-  generateThinkingSummary,
-  GeminiFailoverError,
   prepareGeminiAttachments,
   transcribeGeminiVoiceNote,
   type GeminiAttachmentReference,
@@ -142,14 +141,12 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
   }
 
   const updateProgress = async (progress: string) => {
-    if (job.thinking_mode) {
-      await updateJob(jobId, job.user_id, { progress });
-    }
+    await updateJob(jobId, job.user_id, { progress });
   };
 
   await updateJob(jobId, job.user_id, {
     status: "processing",
-    progress: job.thinking_mode ? "Loading your chat history and settings…" : "Processing...",
+    progress: "Processing...",
     error: null,
   });
 
@@ -303,36 +300,71 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
   }
 
   await updateProgress("Checking the active conversation and matching relevant personal context…");
-  const historyLimit = job.thinking_mode ? 20 : 6;
+  const historyLimit = 20;
   const history = (await loadChatMessagePage(client, {
     limit: historyLimit,
     userId: job.user_id,
   })).messages
     .filter((item) => item.id !== userMessage.id)
-    .slice(job.thinking_mode ? -12 : -6);
-  const priorInsightsPromise = job.thinking_mode
-    ? loadRecentInsights(client, 12, userMessage.id, userMessage.created_at, job.user_id).then(
-        (insights) => ({ insights, error: null }),
-        (error: unknown) => ({ insights: [], error }),
-      )
-    : Promise.resolve({ insights: [], error: null });
-  let insightAnalysisPromise: Promise<
-    | { ok: true; result: Awaited<ReturnType<typeof analyzeGeminiMessage>> | null }
-    | { ok: false; error: unknown }
-  > = Promise.resolve({ ok: true, result: null });
+    .slice(-12);
+  const priorInsightsPromise = loadRecentInsights(
+    client,
+    12,
+    userMessage.id,
+    userMessage.created_at,
+    job.user_id,
+  ).then(
+    (insights) => ({ insights, error: null }),
+    (error: unknown) => ({ insights: [], error }),
+  );
   const saveInsightAnalysis = async () => {
-    if (!job.thinking_mode) return;
     const priorInsights = await priorInsightsPromise;
     if (priorInsights.error) {
       console.error("Could not load prior insights for conversation analysis.", priorInsights.error);
     }
-    const analysis = await insightAnalysisPromise;
-    if (!analysis.ok) {
-      console.error("Conversation insight analysis could not be completed.", analysis.error);
+    let analysis: Awaited<ReturnType<typeof analyzeGeminiMessage>>;
+    try {
+      analysis = await analyzeGeminiMessage(
+        typedKeys,
+        userMessageContent,
+        0,
+        history.map(({ role, content, created_at }) => ({ role, content, created_at })),
+        userMessage.created_at,
+        priorInsights.insights,
+        currentAudioAttachments,
+        async (attachment) => {
+          const { data, error } = await client.storage
+            .from(CHAT_ATTACHMENT_BUCKET)
+            .download(attachment.storagePath);
+          if (error) {
+            throw new Error(
+              `Could not read "${attachment.fileName}" for conversation analysis: ${error.message}`,
+            );
+          }
+          return data;
+        },
+      );
+    } catch (error) {
+      console.error("Conversation insight analysis could not be completed.", error);
       return;
     }
-    if (!analysis.result) return;
-    const insight = analysis.result.insight;
+    attempts.push(...analysis.attempts);
+    if (analysis.memory) {
+      try {
+        await saveUserMemory(
+          client,
+          typedKeys[analysis.keyIndex].api_key,
+          analysis.memory.content,
+          analysis.memory.category,
+          job.user_id,
+          userMessage.id,
+        );
+      } catch (error) {
+        console.error(`Could not save durable memory for message ${userMessage.id}.`, error);
+      }
+    }
+    if (!analysis.saveInsight) return;
+    const insight = analysis.insight;
     if (
       !insight.summary.trim() &&
       !insight.mood.trim() &&
@@ -484,44 +516,19 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
   const currentAudioAttachments = attachmentsForModel.filter((attachment) =>
     attachment.mimeType.startsWith("audio/"),
   );
-  if (
-    job.thinking_mode &&
-    (userMessageContent !== "Please review the attached files." || currentAudioAttachments.length > 0)
-  ) {
-    insightAnalysisPromise = priorInsightsPromise
-      .then(({ insights }) =>
-        analyzeGeminiMessage(
-              typedKeys,
-              userMessageContent,
-              0,
-              history.map(({ role, content, created_at }) => ({ role, content, created_at })),
-              userMessage.created_at,
-              insights,
-              currentAudioAttachments,
-              async (attachment) => {
-                const { data, error } = await client.storage
-                  .from(CHAT_ATTACHMENT_BUCKET)
-                  .download(attachment.storagePath);
-                if (error) {
-                  throw new Error(
-                    `Could not read "${attachment.fileName}" for conversation analysis: ${error.message}`,
-                  );
-                }
-                return data;
-              },
-        ),
-      )
-      .then(
-        (result) => ({ ok: true as const, result }),
-        (error: unknown) => ({ ok: false as const, error }),
-      );
-  }
   const candidateMessageIds = [
     ...retrievedMessages.map((item) => item.id),
     ...history.map((item) => item.id),
   ];
+  const relevantAssistantMessageIds = [
+    ...new Set(
+      [...retrievedMessages, ...history]
+        .filter((item) => item.role === "assistant")
+        .map((item) => item.id),
+    ),
+  ];
   const [feedbackResult, insightsResult] = await Promise.allSettled([
-    loadAllAssistantFeedback(client, job.user_id),
+    loadAllAssistantFeedback(client, job.user_id, relevantAssistantMessageIds),
     loadInsightsForMessages(client, [...new Set(candidateMessageIds)], job.user_id, 20, true),
   ]);
 
@@ -597,13 +604,12 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
     {
       accountRole: accountProfile.role,
       webSearchEnabled: profile?.web_search_enabled !== false,
-      thinkingMode: job.thinking_mode,
       allowSilence: true,
       currentMessageAt: userMessage.created_at,
       history: history.map(({ role, content, created_at }) => ({ role, content, created_at })),
       relevantMessages,
       memories,
-      insights: insights.slice(0, 12),
+      insights,
       feedback,
       barcodeReadings: barcodeContext,
       attachments: attachmentsForModel,
@@ -692,7 +698,6 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
   warnings.push(...result.toolErrors.map((detail) => `A tool reported an error: ${detail}`));
 
   if (result.silent) {
-    await saveInsightAnalysis();
     for (const attempt of attempts) {
       try {
         await saveApiStatus(client, attempt, job.user_id);
@@ -728,49 +733,16 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
     if (completionError) {
       throw new Error(`Could not complete the silent chat job: ${completionError.message}`);
     }
+    await saveInsightAnalysis();
     return;
   }
 
-  let thinkingSummary: string | null = null;
-  if (job.thinking_mode) {
-    try {
-      const summary = await generateThinkingSummary(
-        typedKeys,
-        userMessageContent,
-        result.text,
-        {
-          currentMessageAt: userMessage.created_at,
-          history: history.map(({ role, content, created_at }) => ({
-            role,
-            content,
-            created_at,
-          })),
-          relevantMessages,
-          memories,
-          insights,
-          feedback,
-        },
-        result.keyIndex,
-      );
-      thinkingSummary = summary.summary;
-      attempts.push(...summary.attempts);
-    } catch (error) {
-      if (error instanceof GeminiFailoverError) attempts.push(...error.attempts);
-      warnings.push(
-        `The answer is ready, but its Thinking summary could not be created: ${
-          error instanceof Error ? error.message : "Unknown Gemini error."
-        }`,
-      );
-    }
-  }
-
-  await saveInsightAnalysis();
   await updateProgress("Saving Cheya's response…");
   const { data: savedResponses, error: completeError } = await client.rpc("complete_chat_job", {
     p_job_id: jobId,
     p_content: result.text,
     p_embedding: null,
-    p_thinking_summary: thinkingSummary,
+    p_thinking_summary: null,
     p_admin_message_id: adminMessageId,
   });
   if (completeError) throw new Error(`Could not save Cheya's response: ${completeError.message}`);
@@ -807,6 +779,8 @@ async function processChatJob(jobId: string, barcodeReadings: AiBarcodeReading[]
       }`,
     );
   }
+
+  await saveInsightAnalysis();
 
   if (voiceNoteRequested) {
     await updateProgress("Preparing Cheya's voice note…");

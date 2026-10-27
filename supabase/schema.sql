@@ -3208,11 +3208,13 @@ begin
 end;
 $$;
 
+drop function if exists public.match_chat_messages_for_user(uuid, extensions.vector, integer, uuid);
 create or replace function public.match_chat_messages_for_user(
   p_user_id uuid,
   query_embedding extensions.vector(768),
-  result_limit integer default 8,
-  exclude_message_id uuid default null
+  result_limit integer default 100,
+  exclude_message_id uuid default null,
+  result_offset integer default 0
 )
 returns table (
   id uuid,
@@ -3244,16 +3246,21 @@ begin
     and messages.embedding is not null
     and messages.id is distinct from exclude_message_id
   order by messages.embedding <=> query_embedding
-  limit least(greatest(result_limit, 1), 20);
+  limit least(greatest(result_limit, 1), 100)
+  offset greatest(result_offset, 0);
 end;
 $$;
 
+drop function if exists public.match_chat_messages_before_for_user(
+  uuid, extensions.vector, timestamptz, integer, uuid
+);
 create or replace function public.match_chat_messages_before_for_user(
   p_user_id uuid,
   query_embedding extensions.vector(768),
   max_created_at timestamptz,
-  result_limit integer default 8,
-  exclude_message_id uuid default null
+  result_limit integer default 100,
+  exclude_message_id uuid default null,
+  result_offset integer default 0
 )
 returns table (
   id uuid,
@@ -3286,14 +3293,17 @@ begin
     and messages.created_at < max_created_at
     and messages.id is distinct from exclude_message_id
   order by messages.embedding <=> query_embedding
-  limit least(greatest(result_limit, 1), 20);
+  limit least(greatest(result_limit, 1), 100)
+  offset greatest(result_offset, 0);
 end;
 $$;
 
+drop function if exists public.match_user_memories_for_user(uuid, extensions.vector, integer);
 create or replace function public.match_user_memories_for_user(
   p_user_id uuid,
   query_embedding extensions.vector(768),
-  result_limit integer default 6
+  result_limit integer default 100,
+  result_offset integer default 0
 )
 returns table (
   id uuid,
@@ -3321,7 +3331,8 @@ begin
   where memories.user_id = p_user_id
     and memories.embedding is not null
   order by memories.embedding <=> query_embedding
-  limit least(greatest(result_limit, 1), 20);
+  limit least(greatest(result_limit, 1), 100)
+  offset greatest(result_offset, 0);
 end;
 $$;
 
@@ -3335,17 +3346,17 @@ revoke all on function public.complete_chat_job(uuid, text, extensions.vector, t
   from public, anon, authenticated;
 grant execute on function public.complete_chat_job(uuid, text, extensions.vector, text, uuid)
   to service_role;
-revoke all on function public.match_chat_messages_for_user(uuid, extensions.vector, integer, uuid)
+revoke all on function public.match_chat_messages_for_user(uuid, extensions.vector, integer, uuid, integer)
   from public, anon, authenticated;
-grant execute on function public.match_chat_messages_for_user(uuid, extensions.vector, integer, uuid)
+grant execute on function public.match_chat_messages_for_user(uuid, extensions.vector, integer, uuid, integer)
   to service_role;
-revoke all on function public.match_chat_messages_before_for_user(uuid, extensions.vector, timestamptz, integer, uuid)
+revoke all on function public.match_chat_messages_before_for_user(uuid, extensions.vector, timestamptz, integer, uuid, integer)
   from public, anon, authenticated;
-grant execute on function public.match_chat_messages_before_for_user(uuid, extensions.vector, timestamptz, integer, uuid)
+grant execute on function public.match_chat_messages_before_for_user(uuid, extensions.vector, timestamptz, integer, uuid, integer)
   to service_role;
-revoke all on function public.match_user_memories_for_user(uuid, extensions.vector, integer)
+revoke all on function public.match_user_memories_for_user(uuid, extensions.vector, integer, integer)
   from public, anon, authenticated;
-grant execute on function public.match_user_memories_for_user(uuid, extensions.vector, integer)
+grant execute on function public.match_user_memories_for_user(uuid, extensions.vector, integer, integer)
   to service_role;
 
 revoke all on function public.restore_chat_branch(uuid, integer) from public, anon;
@@ -3446,10 +3457,12 @@ create index if not exists message_insights_user_created_idx
 create index if not exists message_insights_embedding_idx
   on public.message_insights using hnsw (embedding extensions.vector_cosine_ops);
 
+drop function if exists public.match_message_insights_for_user(uuid, extensions.vector, integer);
 create or replace function public.match_message_insights_for_user(
   p_user_id uuid,
   query_embedding extensions.vector(768),
-  result_limit integer default 6
+  result_limit integer default 100,
+  result_offset integer default 0
 )
 returns table (
   message_id uuid,
@@ -3491,13 +3504,14 @@ begin
     and insights.embedding is not null
     and messages.is_active
   order by insights.embedding <=> query_embedding
-  limit least(greatest(result_limit, 1), 20);
+  limit least(greatest(result_limit, 1), 100)
+  offset greatest(result_offset, 0);
 end;
 $$;
 
-revoke all on function public.match_message_insights_for_user(uuid, extensions.vector, integer)
+revoke all on function public.match_message_insights_for_user(uuid, extensions.vector, integer, integer)
   from public, anon, authenticated;
-grant execute on function public.match_message_insights_for_user(uuid, extensions.vector, integer)
+grant execute on function public.match_message_insights_for_user(uuid, extensions.vector, integer, integer)
   to service_role;
 
 alter table public.message_insights enable row level security;

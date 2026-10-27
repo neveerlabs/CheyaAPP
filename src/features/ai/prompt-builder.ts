@@ -10,25 +10,13 @@ export const FAST_MODE = {
   retrievalMode: "fast",
   includeInsightSnapshot: true,
   maxFeedbackExamples: 0,
-  maxOutputTokens: 512,
+  maxOutputTokens: 1500,
   stream: true,
   retryOnTransient: false,
   thinkingBudget: 0,
 } as const;
 
-export const THINKING_MODE = {
-  model: "gemini-2.5-flash",
-  maxSteps: 6,
-  historyWindow: 6,
-  retrievalCount: 8,
-  retrievalMode: "full",
-  includeInsightSnapshot: true,
-  maxFeedbackExamples: 5,
-  maxOutputTokens: 4096,
-  stream: true,
-  retryOnTransient: true,
-  thinkingBudget: 8192,
-} as const;
+export const THINKING_MODE = FAST_MODE;
 
 const persona = `Kamu adalah Cheya, teman chat yang hangat, akrab, dan santai. Bicaralah seperti orang yang udah kenal lama sama user, bukan asisten formal atau customer service. Gaya ngomongnya casual, ramah, sering pakai bahasa Indonesia sehari-hari yang natural—kadang ada "eh", "ya", "gitu", "deh", "nih", "wkwk", tapi jangan lebay atau berlebihan. Kalau user lagi cerita, jawab dengan empati yang terasa manusiawi, singkat tapi nyambung. Jangan kaku, jangan robotik, dan jangan keliatan sedang membaca prompt.`;
 
@@ -45,7 +33,7 @@ const formatting = `Aturan format respons:
 
 const tooling = (role: string): string => `Mode akun: ${role}. Gunakan tools dengan cara yang wajar dan tidak berlebihan:
 - stay_silent: pakai saat user menutup percakapan, jawab singkat tanpa mau lanjut, atau cuma nyapa/menutup chat.
-- choose_voice_note: pakai kalau user meminta voice note, catatan suara, atau kamu merasa balasan yang cocok adalah voice note.
+- choose_voice_note: pakai hanya kalau user meminta voice note atau balasan suara.
 - search_product_help: pakai hanya untuk pertanyaan yang terkait fitur aplikasi, cara pakai, atau bantuan produk CheyaAPP.
 Jangan pakai tools untuk hal biasa; gunakan hanya saat benar-benar relevan. Jika user tidak jelas meminta tool, jangan memaksa.`;
 
@@ -58,7 +46,6 @@ const capTextList = (items: Array<{ content: string; role?: string }>, limit = 5
   items.slice(0, limit);
 
 export function buildPrompt({
-  mode = "fast",
   role = "assistant",
   hasTools = false,
   userMessage,
@@ -67,7 +54,7 @@ export function buildPrompt({
   recentWindow,
   feedbackExamples,
 }: PromptBuildOptions = {}): PromptBuildResult {
-  const config = mode === "fast" ? FAST_MODE : THINKING_MODE;
+  const config = FAST_MODE;
   const snapshotText =
     insightSnapshot && typeof insightSnapshot === "object" && Object.keys(insightSnapshot).length > 0
       ? `Snapshot user: ${JSON.stringify(insightSnapshot)}`
@@ -75,12 +62,11 @@ export function buildPrompt({
 
   const retrievedText =
     (retrievedContext ?? [])
-      .slice(0, mode === "fast" ? 3 : 5)
-      .map((entry) => `- ${trimContent(entry.content, 500)}`)
+      .map((entry) => `- ${entry.content}`)
       .join("\n") || "";
 
   const recentText =
-    capTextList(recentWindow ?? [], mode === "fast" ? 4 : 6)
+    capTextList(recentWindow ?? [], 4)
       .map((entry) => `- ${entry.role ?? "chat"}: ${trimContent(entry.content, 1200)}`)
       .join("\n") || "";
 

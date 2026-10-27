@@ -5,7 +5,6 @@ import {
   ArrowRight,
   BadgeCheck,
   Bell,
-  Brain,
   Bug,
   Camera,
   Check,
@@ -82,7 +81,6 @@ import {
   type AiBarcodeReading,
 } from "./lib/chat-barcode";
 import {
-  generateThinkingSummary,
   generateGeminiConversation,
   normalizeUserFacingMarkdown,
   prepareGeminiAttachments,
@@ -129,7 +127,6 @@ import {
   DEFAULT_GENERAL_SETTINGS,
   type AdminMessageRequest,
   type AppSupabaseClient,
-  type ChatMessageJob,
   type ChatMessageVersion,
 } from "./lib/supabase";
 import type { ChatAttachment } from "./lib/chat-attachments";
@@ -1650,7 +1647,7 @@ const ChatMessageInput = memo(function ChatMessageInput({
     const input = inputRef.current;
     if (!input || !defaultValue) return;
     input.style.height = "auto";
-    input.style.height = `${Math.min(Math.max(input.scrollHeight, 44), 88)}px`;
+    input.style.height = `${Math.min(Math.max(input.scrollHeight, 40), 88)}px`;
   }, [defaultValue, inputRef]);
 
   return (
@@ -1689,7 +1686,7 @@ const ChatMessageInput = memo(function ChatMessageInput({
         onSubmitMessage();
       }}
       style={{ fontSize }}
-      className="h-11 min-h-11 max-h-[88px] min-w-0 flex-1 resize-none overflow-y-auto bg-transparent py-2 text-base leading-6 text-[#25262a] caret-[#229fe3] outline-none placeholder:text-[#a2a3a7] selection:bg-[#bfe6f7] selection:text-[#25262a] [-webkit-user-select:text]"
+      className="h-10 min-h-10 max-h-[88px] min-w-0 flex-1 resize-none overflow-y-auto bg-transparent py-2 text-base leading-6 text-[#25262a] caret-[#229fe3] outline-none placeholder:text-[#a2a3a7] selection:bg-[#bfe6f7] selection:text-[#25262a] [-webkit-user-select:text]"
     />
   );
 });
@@ -1708,7 +1705,7 @@ const ChatMediaMenu = memo(function ChatMediaMenu({
   const [isOpen, setIsOpen] = useState(false);
 
   return (
-    <div className="relative">
+    <div className="relative -ml-2">
       <button
         type="button"
         aria-label="Add media"
@@ -1776,41 +1773,6 @@ const ChatMediaMenu = memo(function ChatMediaMenu({
   );
 });
 
-const ThinkingModeToggle = memo(function ThinkingModeToggle({
-  disabled,
-  onToggle,
-}: {
-  disabled: boolean;
-  onToggle: (enabled: boolean) => void;
-}) {
-  const [enabled, setEnabled] = useState(false);
-  const title = enabled ? "Turn off thinking summary" : "Turn on thinking summary";
-
-  return (
-    <button
-      type="button"
-      aria-label="Think"
-      aria-pressed={enabled}
-      title={title}
-      disabled={disabled}
-      onPointerDown={(event) => event.preventDefault()}
-      onClick={() => {
-        const next = !enabled;
-        setEnabled(next);
-        onToggle(next);
-      }}
-      className={`flex h-9 items-center gap-2 rounded-full border px-3 text-sm font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] disabled:cursor-not-allowed sm:h-10 sm:px-3.5 ${
-        enabled
-          ? "border-[#b9dff2] bg-[#edf8fd] text-[#1678a8]"
-          : "border-[#e5e6e9] bg-white text-[#34363b] hover:bg-[#f7f8fa]"
-      }`}
-    >
-      <Brain aria-hidden="true" className="size-[18px]" strokeWidth={1.8} />
-      <span>Thinking</span>
-    </button>
-  );
-});
-
 const headerActions = [
   { label: "Report a problem", icon: Bug },
   { label: "Settings", icon: Settings },
@@ -1830,7 +1792,6 @@ interface ChatMessage {
 interface ChatSubmissionPayload {
   clientRequestId: string;
   content: string;
-  thinkingMode: boolean;
   attachmentIds: string[];
   barcodeReadings: AiBarcodeReading[];
 }
@@ -2248,7 +2209,6 @@ export function App() {
   const [isEnablingPush, setIsEnablingPush] = useState(false);
   const [historyLoadError, setHistoryLoadError] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [chatJobs, setChatJobs] = useState<ChatMessageJob[]>([]);
   const [failedChatSubmissions, setFailedChatSubmissions] = useState<
     Record<string, FailedChatSubmission>
   >({});
@@ -2444,7 +2404,6 @@ export function App() {
   const knownAdminRequestIdsRef = useRef<Set<string> | null>(null);
   const messageInputRef = useRef<HTMLTextAreaElement>(null);
   const nextApiIndexRef = useRef(0);
-  const thinkingModeRef = useRef(false);
   const attachmentViewRequestRef = useRef(0);
   const cancelledAttachmentsRef = useRef(new Set<string>());
   const deleteConfirmationResolverRef = useRef<((approved: boolean) => void) | null>(null);
@@ -2460,20 +2419,6 @@ export function App() {
     messages
       .slice(pendingAssistantAnchorIndex + 1)
       .some((message) => message.role === "assistant");
-  const activeChatJob =
-    chatJobs.find(
-      (job) =>
-        job.message_id === pendingAssistantAnchorRef.current &&
-        !hasAssistantReplyAfterAnchor &&
-        (job.status === "queued" || job.status === "processing"),
-    ) ??
-    chatJobs.find(
-      (job) =>
-        job.status === "completed" &&
-        job.message_id === pendingAssistantAnchorRef.current &&
-        job.assistant_message_id !== null &&
-        !messages.some((message) => message.id === job.assistant_message_id),
-    );
   const isAwaitingAssistantResponse =
     pendingAssistantAnchorIndex >= 0 &&
     !hasAssistantReplyAfterAnchor;
@@ -3684,7 +3629,7 @@ export function App() {
 
   function resizeMessageInput(input: HTMLTextAreaElement) {
     input.style.height = "auto";
-    input.style.height = `${Math.min(Math.max(input.scrollHeight, 44), 88)}px`;
+    input.style.height = `${Math.min(Math.max(input.scrollHeight, 40), 88)}px`;
   }
 
   function handleMessageDraftInput(value: string, input: HTMLTextAreaElement) {
@@ -4305,7 +4250,6 @@ export function App() {
         setIsAuthLoading(false);
         setIsLoadingHistory(false);
         setMessages([]);
-        setChatJobs([]);
         setHasGeminiApiKey(false);
         return;
       }
@@ -4443,7 +4387,6 @@ export function App() {
       setSelectedMessageVersions({});
       setRatings({});
       setHasGeminiApiKey(false);
-      setChatJobs([]);
       setIsSending(false);
       return;
     }
@@ -4600,7 +4543,6 @@ export function App() {
         if (jobsResult.error) throw jobsResult.error;
         if (isMounted) {
           setHasGeminiApiKey(keyResult.data.length > 0);
-          setChatJobs(jobsResult.data);
           const latestUserMessageId = [...savedMessages]
             .reverse()
             .find((message) => message.role === "user")?.id;
@@ -4855,7 +4797,6 @@ export function App() {
     let chatSyncRequested = false;
     let isRefreshingJobStatus = false;
     let jobStatusRefreshRequested = false;
-    let previousJobState = "";
     let jobStatusPoll: number | null = null;
     let generalSettingsRefreshFrame: number | null = null;
     let isRefreshingGeneralSettings = false;
@@ -5135,10 +5076,6 @@ export function App() {
           ...loadedAdminRelayRatings,
         }));
         setHasGeminiApiKey(keysResult.data.length > 0);
-        previousJobState = JSON.stringify(
-          jobsResult.data.map((job) => [job.id, job.status, job.progress, job.error, job.updated_at]),
-        );
-        setChatJobs(jobsResult.data);
         const activeAnchorIndex = messagesRef.current.findIndex(
           (message) => message.id === pendingAssistantAnchorRef.current,
         );
@@ -5256,13 +5193,6 @@ export function App() {
             !messagesRef.current.some((message) => message.id === job.assistant_message_id),
         );
         const isChatStillInProgress = hasPendingJob || completedReplyAwaitingDisplay;
-        const jobState = JSON.stringify(
-          data.map((job) => [job.id, job.status, job.progress, job.error, job.updated_at]),
-        );
-        if (jobState !== previousJobState) {
-          previousJobState = jobState;
-          setChatJobs(data);
-        }
         setJobStatusPolling(isChatStillInProgress);
         setIsSending(isChatStillInProgress || directReplyProcessingRef.current);
         if (
@@ -6514,14 +6444,23 @@ export function App() {
         continue;
       }
 
-      if (file.size < 1 || file.size > MAX_CHAT_ATTACHMENT_SOURCE_BYTES) {
+      const mimeType = resolveChatAttachmentMimeType(file);
+      if (file.size < 1) {
         rejectedCount += 1;
         rejectionReasons.push(
-          `Files must be no larger than ${formatChatAttachmentSize(MAX_CHAT_ATTACHMENT_SOURCE_BYTES)} before processing.`,
+          `"${file.name}" is empty and cannot be attached.`,
         );
         continue;
       }
-      const mimeType = resolveChatAttachmentMimeType(file);
+      if (file.size > MAX_CHAT_ATTACHMENT_SOURCE_BYTES) {
+        rejectedCount += 1;
+        rejectionReasons.push(
+          mimeType?.startsWith("video/")
+            ? `"${file.name}" is larger than ${formatChatAttachmentSize(MAX_CHAT_ATTACHMENT_SOURCE_BYTES)} and cannot be attached. Choose a smaller video.`
+            : `Files must be no larger than ${formatChatAttachmentSize(MAX_CHAT_ATTACHMENT_SOURCE_BYTES)} before processing.`,
+        );
+        continue;
+      }
       if (!mimeType) {
         rejectedCount += 1;
         rejectionReasons.push(
@@ -6667,6 +6606,10 @@ export function App() {
     } else if (acceptedFiles.length === 0) {
       setSendError("");
     }
+  }
+
+  function openPhotoPicker() {
+    fileInputRef.current?.click();
   }
 
   function openCamera() {
@@ -7295,7 +7238,6 @@ export function App() {
       },
         body: JSON.stringify({
           content: payload.content,
-          thinkingMode: payload.thinkingMode,
           attachmentIds: payload.attachmentIds,
           barcodeReadings: payload.barcodeReadings,
           clientRequestId: payload.clientRequestId,
@@ -7462,7 +7404,7 @@ export function App() {
       const accepted = await submitChatRequest(payload);
       markChatSubmissionAccepted(requestId, accepted.messageId, []);
       directReplyProcessingRef.current = false;
-      setThinkingSteps(payload.thinkingMode ? ["Membaca pesan dan konteks percakapan…"] : []);
+      setThinkingSteps([]);
     } catch (error) {
       const attempts = (chatSubmissionRetryAttemptsRef.current.get(requestId) ?? 0) + 1;
       chatSubmissionRetryAttemptsRef.current.set(requestId, attempts);
@@ -7534,7 +7476,6 @@ export function App() {
     directReplyProcessingRef.current = true;
     followLatestRef.current = true;
     shouldScrollToLatestRef.current = true;
-    const showThinking = thinkingModeRef.current;
     let jobAccepted = false;
     const clientRequestId = voiceMessageId ?? crypto.randomUUID();
     const submittedAttachments = attachedMedia;
@@ -7547,7 +7488,6 @@ export function App() {
     const submissionPayload: ChatSubmissionPayload = {
       clientRequestId,
       content: messageContent,
-      thinkingMode: showThinking,
       attachmentIds: submittedAttachments.map((attachment) => attachment.id),
       barcodeReadings: [],
     };
@@ -7632,7 +7572,7 @@ export function App() {
           );
         });
       }
-      setThinkingSteps(showThinking ? ["Membaca pesan dan konteks percakapan…"] : []);
+      setThinkingSteps([]);
     } catch (error) {
       if (!jobAccepted) {
         const retryable =
@@ -7992,9 +7932,6 @@ export function App() {
           ),
         ),
       );
-      setChatJobs((current) =>
-        current.filter((job) => !removedIds.has(job.message_id)),
-      );
       setActiveUserActions(null);
       setDeleteChatTarget(null);
       if (draftCleanupError) {
@@ -8060,7 +7997,6 @@ export function App() {
       const currentAssistantIndex = current.findIndex((item) => item.id === messageId);
       return currentAssistantIndex < 0 ? current : current.slice(0, currentAssistantIndex + 1);
     });
-    const showThinking = thinkingModeRef.current;
     setThinkingSteps(["Checking the conversation and relevant context…"]);
     let responseSaved = false;
     try {
@@ -8274,7 +8210,6 @@ export function App() {
         {
           accountRole: authUser?.role ?? "user",
           webSearchEnabled: profile?.web_search_enabled !== false,
-          thinkingMode: showThinking,
           regenerateForVariation: !editedSource,
           currentMessageAt: sourceMessage.createdAt,
           history: history.map(({ role, text, createdAt }) => ({
@@ -8431,41 +8366,6 @@ export function App() {
       regenerationWarnings.push(
         ...result.toolErrors.map((detail) => `A tool reported an error: ${detail}`),
       );
-      let thinkingSummary: string | null = null;
-      if (showThinking) {
-        try {
-          const summary = await generateThinkingSummary(
-            keys,
-            sourceText,
-            result.text,
-            {
-              currentMessageAt: sourceMessage.createdAt,
-              history: history.map(({ role, text, createdAt }) => ({
-                role,
-                content: text,
-                created_at: createdAt,
-              })),
-              relevantMessages: relevantContext.messages,
-              memories: relevantContext.memories,
-              insights: combinedInsights,
-              replacedResponse: {
-                content: previousAnswer,
-                feedback: previousFeedback.rating,
-                reports: previousFeedback.reports,
-              },
-            },
-            result.keyIndex,
-          );
-          thinkingSummary = summary.summary;
-          result.attempts.push(...summary.attempts);
-        } catch (error) {
-          regenerationWarnings.push(
-            `The answer is ready, but its Thinking mode explanation could not be created: ${
-              error instanceof Error ? error.message : "Unknown Gemini error."
-            }`,
-          );
-        }
-      }
       let embedding: number[] | null = null;
       try {
         embedding = await createEmbedding(
@@ -8484,7 +8384,7 @@ export function App() {
         messageId,
         result.text,
         embedding,
-        thinkingSummary,
+        null,
         "regenerate",
         !editedSource,
         undefined,
@@ -10223,23 +10123,9 @@ export function App() {
                 role="status"
                 aria-live="polite"
                 aria-label="Processing"
-                className={`w-full min-w-0 text-xs text-[#747780] ${
-                  activeChatJob?.thinking_mode ?? thinkingModeRef.current
-                    ? "space-y-1.5 rounded-2xl border border-[#ece9f5] bg-[#faf9fd] px-3.5 py-3"
-                    : "flex justify-start px-1 py-1"
-                }`}
+                className="flex w-full min-w-0 justify-start px-1 py-1 text-xs text-[#747780]"
               >
-                {activeChatJob?.thinking_mode ?? thinkingModeRef.current ? (
-                  <p className="font-medium text-[#4b4e55]">
-                    {typingAssistant
-                      ? "Cheya is writing the reply…"
-                      : activeChatJob?.progress ||
-                      thinkingSteps[thinkingSteps.length - 1] ||
-                      "Reviewing the request…"}
-                  </p>
-                ) : (
-                  <FastProcessingIndicator />
-                )}
+                <FastProcessingIndicator />
               </div>
             )}
             {!hasGeminiApiKey && !isLoadingHistory && (
@@ -10424,8 +10310,18 @@ export function App() {
                 })}
               </div>
             )}
-            {!isRecordingVoice && (
-              <div className="flex min-h-11 items-start px-3 pb-2 pt-1">
+            {!isStartingVoiceRecording && !isRecordingVoice && (
+              <div className="flex min-h-10 items-center gap-1 px-2">
+                <ChatMediaMenu
+                  disabled={
+                    !hasGeminiApiKey ||
+                    isRestoringDraftAttachments ||
+                    isPreparingAttachments
+                  }
+                  onOpenCamera={openCamera}
+                  onPickPhoto={() => void openPhotoPicker()}
+                  onPickFiles={() => filesInputRef.current?.click()}
+                />
                 <ChatMessageInput
                   inputRef={messageInputRef}
                   defaultValue={messageDraftRef.current}
@@ -10442,79 +10338,7 @@ export function App() {
                     hasGeminiApiKey ? "Ask anything..." : "Add a Gemini API key in Settings first"
                   }
                 />
-              </div>
-            )}
-
-            {isStartingVoiceRecording ||
-            (isRecordingVoice && voiceRecordingStartAtRef.current !== null) ? (
-              <div
-                role="group"
-                aria-label="Voice message recording controls"
-                className="grid h-10 grid-cols-[1fr_auto_1fr] items-center gap-2 px-2 pr-0"
-              >
-                <div className="flex min-w-0 items-center gap-2 text-sm text-[#34363b]">
-                  {isStartingVoiceRecording ? (
-                    <>
-                      <LoaderCircle
-                        aria-hidden="true"
-                        className="size-4 shrink-0 animate-spin text-[#596879]"
-                      />
-                      <span className="text-[#596879]">Preparing…</span>
-                    </>
-                  ) : voiceRecordingStartAtRef.current !== null ? (
-                    <>
-                      <span className="size-2.5 shrink-0 animate-pulse rounded-full bg-red-500" />
-                      <VoiceRecordingTimer
-                        startedAt={voiceRecordingStartAtRef.current}
-                        maxDurationMs={voiceRecordingMaxDurationSecondsRef.current * 1_000}
-                        timerRef={voiceRecordingTimerRef}
-                        onLimit={(maxDurationSeconds) => {
-                          stopVoiceRecording(true);
-                          setSendError(
-                            `Voice recordings are limited to ${formatMediaTime(maxDurationSeconds)}. Please record a shorter message.`,
-                          );
-                        }}
-                      />
-                    </>
-                  ) : null}
-                </div>
-                <button
-                  type="button"
-                  aria-label="Cancel voice recording"
-                  onClick={() => stopVoiceRecording(true)}
-                  className="rounded-full px-3 py-1.5 text-sm font-medium text-[#596879] transition hover:bg-[#f1f2f4] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  aria-label="Send voice message"
-                  disabled={isStartingVoiceRecording}
-                  onClick={() => stopVoiceRecording()}
-                  className="ml-auto flex size-9 shrink-0 items-center justify-center rounded-full border border-[#17181b] bg-[#17181b] text-white transition-colors hover:bg-[#34363b] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] disabled:cursor-not-allowed disabled:opacity-50 sm:size-10"
-                >
-                  <Send aria-hidden="true" className="size-[18px]" strokeWidth={1.8} />
-                </button>
-              </div>
-            ) : (
-              <div className="-mx-1 flex items-center justify-between gap-2 px-1 pb-1">
-                <ChatMediaMenu
-                  disabled={
-                    !hasGeminiApiKey ||
-                    isRestoringDraftAttachments ||
-                    isPreparingAttachments
-                  }
-                  onOpenCamera={openCamera}
-                  onPickPhoto={() => fileInputRef.current?.click()}
-                  onPickFiles={() => filesInputRef.current?.click()}
-                />
-                <div className="flex items-center gap-1">
-                  <ThinkingModeToggle
-                    disabled={!hasGeminiApiKey}
-                    onToggle={(enabled) => {
-                      thinkingModeRef.current = enabled;
-                    }}
-                  />
+                <div className="-mr-1 flex items-center gap-1">
                   {isAssistantBusy ? (
                   <>
                     <button
@@ -10605,6 +10429,59 @@ export function App() {
                 </div>
               </div>
             )}
+
+            {isStartingVoiceRecording ||
+            (isRecordingVoice && voiceRecordingStartAtRef.current !== null) ? (
+              <div
+                role="group"
+                aria-label="Voice message recording controls"
+                className="grid h-10 grid-cols-[1fr_auto_1fr] items-center gap-2 px-2"
+              >
+                <div className="flex min-w-0 items-center gap-2 text-sm text-[#34363b]">
+                  {isStartingVoiceRecording ? (
+                    <>
+                      <LoaderCircle
+                        aria-hidden="true"
+                        className="size-4 shrink-0 animate-spin text-[#596879]"
+                      />
+                      <span className="text-[#596879]">Preparing…</span>
+                    </>
+                  ) : voiceRecordingStartAtRef.current !== null ? (
+                    <>
+                      <span className="size-2.5 shrink-0 animate-pulse rounded-full bg-red-500" />
+                      <VoiceRecordingTimer
+                        startedAt={voiceRecordingStartAtRef.current}
+                        maxDurationMs={voiceRecordingMaxDurationSecondsRef.current * 1_000}
+                        timerRef={voiceRecordingTimerRef}
+                        onLimit={(maxDurationSeconds) => {
+                          stopVoiceRecording(true);
+                          setSendError(
+                            `Voice recordings are limited to ${formatMediaTime(maxDurationSeconds)}. Please record a shorter message.`,
+                          );
+                        }}
+                      />
+                    </>
+                  ) : null}
+                </div>
+                <button
+                  type="button"
+                  aria-label="Cancel voice recording"
+                  onClick={() => stopVoiceRecording(true)}
+                  className="rounded-full px-3 py-1.5 text-sm font-medium text-[#596879] transition hover:bg-[#f1f2f4] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3]"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  aria-label="Send voice message"
+                  disabled={isStartingVoiceRecording}
+                  onClick={() => stopVoiceRecording()}
+                  className="ml-auto flex size-9 shrink-0 items-center justify-center rounded-full border border-[#17181b] bg-[#17181b] text-white transition-colors hover:bg-[#34363b] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#229fe3] disabled:cursor-not-allowed disabled:opacity-50 sm:size-10"
+                >
+                  <Send aria-hidden="true" className="size-[18px]" strokeWidth={1.8} />
+                </button>
+              </div>
+            ) : null}
           </form>
         </footer>
       </section>

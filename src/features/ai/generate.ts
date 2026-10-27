@@ -9,11 +9,11 @@ export function generateGeminiConversation(
   _index: number,
   _personalization?: unknown,
   _context?: unknown,
-  mode: Mode = "fast",
+  _mode: Mode = "fast",
 ) {
-  const config = mode === "fast" ? FAST_MODE : THINKING_MODE;
+  const config = FAST_MODE;
   const built = buildPrompt({
-    mode,
+    mode: "fast",
     userMessage: _prompt,
     hasTools: Boolean(_context),
   });
@@ -21,6 +21,6 @@ export function generateGeminiConversation(
   return {
     ...built,
     config,
-    mode,
+    mode: "fast",
   };
 }

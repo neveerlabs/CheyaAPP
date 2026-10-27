@@ -130,7 +130,7 @@ export default defineEventHandler(async (event) => {
 
   const { data: jobs, error: jobError } = await requestClient.rpc("create_chat_job_with_attachments", {
     p_content: content || "Please review the attached files.",
-    p_thinking_mode: body.thinkingMode === true,
+    p_thinking_mode: false,
     p_attachment_ids: attachmentIds,
     p_client_request_id: body.clientRequestId,
   });
